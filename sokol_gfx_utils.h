@@ -94,6 +94,16 @@ SOKOL_GFX_UTILS_API_DECL void sg_gpu_pass_timings_shutdown(void);
 /* Enable or disable recording. Unsupported backends remain disabled. */
 SOKOL_GFX_UTILS_API_DECL void sg_gpu_pass_timings_set_enabled(bool enabled);
 
+/*
+    Metal integration: call once per pass, immediately before creating its
+    command encoder, while Sokol's current command buffer is active. descriptor
+    is a borrowed MTLRenderPassDescriptor* or MTLComputePassDescriptor*.
+    These attach timestamp counters without relying on patched Sokol fields.
+    Disabled recording and non-Metal backends leave the descriptor unchanged.
+*/
+SOKOL_GFX_UTILS_API_DECL void sg_gpu_pass_timings_mtl_prepare_render_pass(const sg_pass* pass, const void* descriptor);
+SOKOL_GFX_UTILS_API_DECL void sg_gpu_pass_timings_mtl_prepare_compute_pass(const sg_pass* pass, const void* descriptor);
+
 /* Returns true when the active backend supports asynchronous GPU timestamps. */
 SOKOL_GFX_UTILS_API_DECL bool sg_gpu_pass_timings_supported(void);
 
@@ -866,8 +876,6 @@ SOKOL_API_IMPL bool sg_gpu_pass_timings_setup(void) {
 
 SOKOL_API_IMPL void sg_gpu_pass_timings_shutdown(void) {
 #if defined(SOKOL_METAL)
-    _sg.mtl.render_pass_descriptor_hook = NULL;
-    _sg.mtl.compute_pass_descriptor_hook = NULL;
     _sgu_mtl_gpu_timing_shutdown();
 #endif
     memset(&_sgu_gpu_pass_timing_state, 0, sizeof(_sgu_gpu_pass_timing_state));
@@ -876,11 +884,27 @@ SOKOL_API_IMPL void sg_gpu_pass_timings_shutdown(void) {
 SOKOL_API_IMPL void sg_gpu_pass_timings_set_enabled(bool enabled) {
     _sgu_gpu_pass_timing_state.enabled =
         _sgu_gpu_pass_timing_state.setup && _sgu_gpu_pass_timing_state.supported && enabled;
+}
+
+SOKOL_API_IMPL void sg_gpu_pass_timings_mtl_prepare_render_pass(const sg_pass* pass, const void* descriptor) {
 #if defined(SOKOL_METAL)
-    const bool sample_passes = _sgu_gpu_pass_timing_state.enabled &&
-        _sgu_mtl_gpu_timing_state.timestamp_counter_set != nil;
-    _sg.mtl.render_pass_descriptor_hook = sample_passes ? _sgu_mtl_gpu_timing_render_descriptor : NULL;
-    _sg.mtl.compute_pass_descriptor_hook = sample_passes ? _sgu_mtl_gpu_timing_compute_descriptor : NULL;
+    if (_sgu_gpu_pass_timing_state.enabled && pass && !pass->compute && descriptor) {
+        _sgu_mtl_gpu_timing_render_descriptor(pass, (__bridge MTLRenderPassDescriptor*)descriptor);
+    }
+#else
+    (void)pass;
+    (void)descriptor;
+#endif
+}
+
+SOKOL_API_IMPL void sg_gpu_pass_timings_mtl_prepare_compute_pass(const sg_pass* pass, const void* descriptor) {
+#if defined(SOKOL_METAL)
+    if (_sgu_gpu_pass_timing_state.enabled && pass && pass->compute && descriptor) {
+        _sgu_mtl_gpu_timing_compute_descriptor(pass, (__bridge MTLComputePassDescriptor*)descriptor);
+    }
+#else
+    (void)pass;
+    (void)descriptor;
 #endif
 }
 
