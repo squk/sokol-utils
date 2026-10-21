@@ -48,6 +48,8 @@ SOKOL_APP_UTILS_API_DECL void sapp_set_mouse_position(float x, float y);
 /* get the last mouse position reported by Sokol's event pipeline in
    framebuffer pixels relative to the window's content area */
 SOKOL_APP_UTILS_API_DECL void sapp_get_mouse_position(float *x, float *y);
+/* call from a MOUSE_SCROLL callback; false on non-macOS platforms */
+SOKOL_APP_UTILS_API_DECL bool sapp_current_scroll_is_trackpad(void);
 /* returns the width of a display by index in pixels */
 SOKOL_APP_UTILS_API_DECL int sapp_display_width(int index);
 /* returns the height of a display by index in pixels */
@@ -1083,6 +1085,18 @@ SOKOL_API_IMPL void sapp_get_mouse_position(float *x, float *y) {
     *x = _sapp.mouse.x;
   if (y)
     *y = _sapp.mouse.y;
+}
+
+SOKOL_API_IMPL bool sapp_current_scroll_is_trackpad(void) {
+#if defined(_SAPP_MACOS)
+  NSEvent* event = NSApp.currentEvent;
+  return event && (event.type == NSEventTypeScrollWheel) &&
+      event.hasPreciseScrollingDeltas &&
+      ((event.phase != NSEventPhaseNone) ||
+       (event.momentumPhase != NSEventPhaseNone));
+#else
+  return false;
+#endif
 }
 
 SOKOL_API_IMPL bool sapp_window_focused(void) {
