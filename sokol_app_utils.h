@@ -34,6 +34,15 @@
 extern "C" {
 #endif
 
+/* Enables macOS pinch events delivered through the normal event callback.
+   These use SAPP_EVENTTYPE_INVALID; check sapp_current_event_is_magnify()
+   before treating that value as an unknown event. The accessors are valid
+   only during that callback. Disable before application cleanup. Other
+   platforms leave this disabled and return false/zero. */
+SOKOL_APP_UTILS_API_DECL void sapp_enable_magnify_events(bool enabled);
+SOKOL_APP_UTILS_API_DECL bool sapp_current_event_is_magnify(void);
+SOKOL_APP_UTILS_API_DECL float sapp_current_event_magnification(void);
+
 /* set the window position (only on desktop platforms) */
 SOKOL_APP_UTILS_API_DECL void sapp_set_window_position(int x, int y);
 /* set the window size (content area) (only on desktop platforms) */
@@ -1243,3 +1252,62 @@ SOKOL_API_IMPL int sapp_get_swap_interval(void) {
 }
 
 #endif /* SOKOL_APP_UTILS_IMPL */
+
+#if defined(SOKOL_APP_UTILS_IMPL)
+#if defined(_SAPP_MACOS)
+static id _sapp_utils_magnify_monitor;
+static bool _sapp_utils_in_magnify;
+static float _sapp_utils_magnification;
+#endif
+
+SOKOL_API_IMPL void sapp_enable_magnify_events(bool enabled) {
+#if defined(_SAPP_MACOS)
+    if (_sapp_utils_magnify_monitor) {
+        [NSEvent removeMonitor:_sapp_utils_magnify_monitor];
+#if !__has_feature(objc_arc)
+        [_sapp_utils_magnify_monitor release];
+#endif
+        _sapp_utils_magnify_monitor = nil;
+    }
+    if (!enabled) return;
+    _sapp_utils_magnify_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskMagnify
+        handler:^NSEvent*(NSEvent* event) {
+            if (event.window != _sapp.macos.window || !_sapp_events_enabled()) return event;
+            _sapp_gl_make_current();
+            _sapp_macos_mouse_update_from_nsevent(event, true);
+            _sapp_init_event(SAPP_EVENTTYPE_INVALID);
+            _sapp.event.modifiers = _sapp_macos_mods(event);
+            const bool previous_active = _sapp_utils_in_magnify;
+            const float previous_delta = _sapp_utils_magnification;
+            _sapp_utils_in_magnify = true;
+            _sapp_utils_magnification = (float)event.magnification;
+            _sapp_call_event(&_sapp.event);
+            _sapp_utils_in_magnify = previous_active;
+            _sapp_utils_magnification = previous_delta;
+            return nil;
+        }];
+#if !__has_feature(objc_arc)
+    [_sapp_utils_magnify_monitor retain];
+#endif
+#else
+    (void)enabled;
+#endif
+}
+
+SOKOL_API_IMPL bool sapp_current_event_is_magnify(void) {
+#if defined(_SAPP_MACOS)
+    return _sapp_utils_in_magnify;
+#else
+    return false;
+#endif
+}
+
+SOKOL_API_IMPL float sapp_current_event_magnification(void) {
+#if defined(_SAPP_MACOS)
+    return _sapp_utils_in_magnify ? _sapp_utils_magnification : 0.0f;
+#else
+    return 0.0f;
+#endif
+}
+
+#endif

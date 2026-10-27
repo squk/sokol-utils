@@ -34,6 +34,22 @@
 extern "C" {
 #endif
 
+/* Indirect commands live in storage buffers created by this factory. The
+   caller owns the returned sg_buffer and destroys it with sg_destroy_buffer.
+   Transient, unsealed, injected and staging buffers are not accepted. */
+SOKOL_GFX_UTILS_API_DECL sg_buffer sg_make_indirect_buffer(const sg_buffer_desc* desc);
+SOKOL_GFX_UTILS_API_DECL bool sg_indirect_supported(void);
+/* Call outside a render pass after GPU writes or copies that produce command
+   arguments. Dispatch also inserts this barrier within a compute pass. */
+SOKOL_GFX_UTILS_API_DECL void sg_indirect_barrier(void);
+/* Offsets are four-byte aligned. Draw arguments are four uint32_t values:
+   count, instance count, first vertex, first instance. Indexed draws insert
+   int32_t base_vertex before first instance. Dispatch uses three uint32_t
+   group counts. Apply the pipeline, bindings and uniforms before these calls.
+   Argument buffers must come from sg_make_indirect_buffer. */
+SOKOL_GFX_UTILS_API_DECL void sg_draw_indirect(sg_buffer args, int offset);
+SOKOL_GFX_UTILS_API_DECL void sg_dispatch_indirect(sg_buffer args, int offset);
+
 /*
     sg_readback_request
     Create a request to read back the pixels of an image.
@@ -138,6 +154,257 @@ SOKOL_GFX_UTILS_API_DECL int sg_gpu_pass_timings_poll(sg_gpu_pass_timing* timing
         #define _SOKOL_PRIVATE static
     #endif
 #endif
+
+#if defined(_SOKOL_GL_HAS_COMPUTE)
+#ifndef GL_COMMAND_BARRIER_BIT
+#define GL_COMMAND_BARRIER_BIT 0x00000040
+#define GL_DRAW_INDIRECT_BUFFER 0x8F3F
+#define GL_DISPATCH_INDIRECT_BUFFER 0x90EE
+#endif
+#if defined(_SOKOL_USE_WIN32_GL_LOADER)
+typedef void (GL_APIENTRY* _sgu_draw_arrays_indirect_fn)(GLenum, const void*);
+typedef void (GL_APIENTRY* _sgu_draw_elements_indirect_fn)(GLenum, GLenum, const void*);
+typedef void (GL_APIENTRY* _sgu_dispatch_indirect_fn)(GLintptr);
+static _sgu_draw_arrays_indirect_fn _sgu_draw_arrays_indirect;
+static _sgu_draw_elements_indirect_fn _sgu_draw_elements_indirect;
+static _sgu_dispatch_indirect_fn _sgu_dispatch_indirect;
+#else
+#define _sgu_draw_arrays_indirect glDrawArraysIndirect
+#define _sgu_draw_elements_indirect glDrawElementsIndirect
+#define _sgu_dispatch_indirect glDispatchComputeIndirect
+#endif
+#endif
+
+#if defined(SOKOL_VULKAN)
+_SOKOL_PRIVATE sg_resource_state _sgu_vk_create_indirect_buffer(_sg_buffer_t* buf, const sg_buffer_desc* desc) {
+    SOKOL_ASSERT(_sg.vk.dev);
+    SOKOL_ASSERT(buf && desc);
+    SOKOL_ASSERT(buf->cmn.size > 0);
+    SOKOL_ASSERT(0 == buf->vk.buf);
+    SOKOL_ASSERT(0 == buf->vk.mem);
+    SOKOL_ASSERT(0 == buf->vk.dev_addr);
+    VkResult res;
+    // FIXME: inject external buffer
+
+    // NOTE: unlike images, the initial access mask for buffers is their
+    // default access, this is because buffers are immediately ready for
+    // any read type (unless images, which have an UNDEFINED initial image layout)
+    buf->vk.cur_access = _sg_vk_default_buffer_access_mask(buf);
+
+    _SG_STRUCT(VkBufferCreateInfo, create_info);
+    create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    create_info.size = (VkDeviceSize)buf->cmn.size;
+    create_info.usage = _sg_vk_buffer_usage(&buf->cmn.usage) | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    res = vkCreateBuffer(_sg.vk.dev, &create_info, 0, &buf->vk.buf);
+    if (res != VK_SUCCESS) {
+        _SG_ERROR(VULKAN_CREATE_BUFFER_FAILED);
+        return SG_RESOURCESTATE_FAILED;
+    }
+    SOKOL_ASSERT(buf->vk.buf);
+    _sg_vk_set_object_label(VK_OBJECT_TYPE_BUFFER, (uint64_t)buf->vk.buf, desc->label);
+
+    if (!_sg_vk_mem_alloc_buffer_device_memory(buf)) {
+        return SG_RESOURCESTATE_FAILED;
+    }
+    SOKOL_ASSERT(buf->vk.mem);
+    res = vkBindBufferMemory(_sg.vk.dev, buf->vk.buf, buf->vk.mem, 0);
+    if (res != VK_SUCCESS) {
+        _SG_ERROR(VULKAN_BIND_BUFFER_MEMORY_FAILED);
+        return SG_RESOURCESTATE_FAILED;
+    }
+    if (buf->cmn.usage.storage_buffer) {
+        _SG_STRUCT(VkBufferDeviceAddressInfo, addr_info);
+        addr_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        addr_info.buffer = buf->vk.buf;
+        buf->vk.dev_addr = vkGetBufferDeviceAddress(_sg.vk.dev, &addr_info);
+        SOKOL_ASSERT(buf->vk.dev_addr);
+    }
+    if (desc->data.ptr) {
+        _sg_vk_staging_copy_buffer_data(buf, &desc->data, 0, 0, desc->data.size, false);
+    }
+    return SG_RESOURCESTATE_VALID;
+}
+
+#endif
+
+SOKOL_API_IMPL bool sg_indirect_supported(void) {
+    if (!sg_isvalid() || !sg_query_features().compute) return false;
+    #if defined(_SOKOL_ANY_GL) && !defined(_SOKOL_GL_HAS_COMPUTE)
+    return false;
+    #else
+    #if defined(_SOKOL_USE_WIN32_GL_LOADER)
+    _sg_wglGetProcAddress get_proc = (_sg_wglGetProcAddress)GetProcAddress(_sg.gl.opengl32_dll, "wglGetProcAddress");
+    if (!get_proc) return false;
+    _sgu_draw_arrays_indirect = (_sgu_draw_arrays_indirect_fn)_sg_gl_getprocaddr("glDrawArraysIndirect", get_proc);
+    _sgu_draw_elements_indirect = (_sgu_draw_elements_indirect_fn)_sg_gl_getprocaddr("glDrawElementsIndirect", get_proc);
+    _sgu_dispatch_indirect = (_sgu_dispatch_indirect_fn)_sg_gl_getprocaddr("glDispatchComputeIndirect", get_proc);
+    return _sgu_draw_arrays_indirect && _sgu_draw_elements_indirect && _sgu_dispatch_indirect;
+    #else
+    return true;
+    #endif
+    #endif
+}
+
+SOKOL_API_IMPL sg_buffer sg_make_indirect_buffer(const sg_buffer_desc* desc) {
+    sg_buffer invalid = { SG_INVALID_ID };
+    if (!desc || !sg_indirect_supported() || _sg.cur_pass.in_pass) return invalid;
+    sg_buffer_desc d = sg_query_buffer_defaults(desc);
+    if (!d.usage.storage_buffer || d.usage.write_transient || d.usage.write_unsealed ||
+        d.usage.staging_buffer || d.usage.staging_index_buffer || d.gl_buffer ||
+        d.mtl_buffer || d.d3d11_buffer || d.wgpu_buffer || !d.size || d.size > INT32_MAX ||
+        (d.size & 3) || (d.data.ptr && d.data.size != d.size)) return invalid;
+    #if defined(SOKOL_VULKAN)
+    sg_buffer result = sg_alloc_buffer();
+    _sg_buffer_t* buf = _sg_lookup_buffer(result.id);
+    if (!buf) return result;
+    _sg_buffer_common_init(&buf->cmn, &d);
+    buf->slot.state = _sgu_vk_create_indirect_buffer(buf, &d);
+    _sg_resource_stats_inc(buffers.inited);
+    _SG_TRACE_ARGS(init_buffer, result, &d);
+    return result;
+    #elif defined(SOKOL_D3D11)
+    _SG_STRUCT(D3D11_BUFFER_DESC, native_desc);
+    native_desc.ByteWidth = (UINT)d.size;
+    native_desc.Usage = D3D11_USAGE_DEFAULT;
+    native_desc.BindFlags = _sg_d3d11_buffer_bind_flags(&d.usage);
+    native_desc.MiscFlags = _sg_d3d11_buffer_misc_flags(&d.usage) | D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
+    _SG_STRUCT(D3D11_SUBRESOURCE_DATA, initial);
+    initial.pSysMem = d.data.ptr;
+    ID3D11Buffer* native = 0;
+    HRESULT hr = _sg_d3d11_CreateBuffer(_sg.d3d11.dev, &native_desc, d.data.ptr ? &initial : 0, &native);
+    if (FAILED(hr) || !native) return invalid;
+    d.d3d11_buffer = native;
+    d.data.ptr = 0; d.data.size = 0;
+    sg_buffer result = sg_make_buffer(&d);
+    _sg_d3d11_Release(native);
+    return result;
+    #elif defined(SOKOL_WGPU)
+    _SG_STRUCT(WGPUBufferDescriptor, native_desc);
+    native_desc.size = d.size;
+    native_desc.usage = _sg_wgpu_buffer_usage(&d.usage) | WGPUBufferUsage_Indirect;
+    native_desc.mappedAtCreation = d.data.ptr != 0;
+    WGPUBuffer native = wgpuDeviceCreateBuffer(_sg.wgpu.dev, &native_desc);
+    if (!native) return invalid;
+    if (d.data.ptr) {
+        void* mapped = wgpuBufferGetMappedRange(native, 0, d.size);
+        if (!mapped) { wgpuBufferRelease(native); return invalid; }
+        memcpy(mapped, d.data.ptr, d.size);
+        wgpuBufferUnmap(native);
+    }
+    d.wgpu_buffer = native;
+    d.data.ptr = 0; d.data.size = 0;
+    sg_buffer result = sg_make_buffer(&d);
+    wgpuBufferRelease(native);
+    return result;
+    #else
+    return sg_make_buffer(&d);
+    #endif
+}
+
+SOKOL_API_IMPL void sg_indirect_barrier(void) {
+    if (!sg_indirect_supported()) return;
+    if (_sg.cur_pass.in_pass && !_sg.cur_pass.is_compute) return;
+    #if defined(SOKOL_VULKAN)
+    _sg_vk_acquire_frame_command_buffers();
+    if (!_sg.vk.frame.cmd_buf) return;
+    _SG_STRUCT(VkMemoryBarrier2, barrier);
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    _SG_STRUCT(VkDependencyInfo, dependency);
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(_sg.vk.frame.cmd_buf, &dependency);
+    #elif defined(_SOKOL_GL_HAS_COMPUTE)
+    glMemoryBarrier(GL_COMMAND_BARRIER_BIT);
+    #endif
+}
+
+_SOKOL_PRIVATE _sg_buffer_t* _sgu_indirect_args(sg_buffer args, int offset, int size, bool compute) {
+    if (!sg_indirect_supported() || !_sg.cur_pass.valid || !_sg.cur_pass.in_pass ||
+        _sg.cur_pass.is_compute != compute || !_sg.next_draw_valid || offset < 0 || (offset & 3)) return 0;
+    _sg_buffer_t* buf = _sg_lookup_buffer(args.id);
+    if (!buf || buf->slot.state != SG_RESOURCESTATE_VALID || !buf->cmn.usage.storage_buffer ||
+        size > buf->cmn.size || offset > buf->cmn.size - size) return 0;
+    #if defined(SOKOL_DEBUG)
+    if (!(compute ? _sg_validate_dispatch(1, 1, 1) : _sg_validate_draw(0, 1, 1))) return 0;
+    #endif
+    return buf;
+}
+
+SOKOL_API_IMPL void sg_draw_indirect(sg_buffer args, int offset) {
+    _sg_buffer_t* buf = _sgu_indirect_args(args, offset, _sg.use_indexed_draw ? 20 : 16, false);
+    if (!buf) return;
+    #if defined(SOKOL_METAL)
+    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+    id<MTLBuffer> native = _sg_mtl_id(buf->mtl.buf[buf->cmn.active_slot]);
+    if (_sg.use_indexed_draw) {
+        const _sg_buffer_t* ib = _sg_buffer_ref_ptr(&_sg.mtl.cache.cur_ibuf);
+        [_sg.mtl.render_cmd_encoder drawIndexedPrimitives:pip->mtl.prim_type
+            indexType:pip->mtl.index_type indexBuffer:_sg_mtl_id(ib->mtl.buf[ib->cmn.active_slot])
+            indexBufferOffset:(NSUInteger)_sg.mtl.cache.cur_ibuf_offset
+            indirectBuffer:native indirectBufferOffset:(NSUInteger)offset];
+    } else {
+        [_sg.mtl.render_cmd_encoder drawPrimitives:pip->mtl.prim_type
+            indirectBuffer:native indirectBufferOffset:(NSUInteger)offset];
+    }
+    #elif defined(SOKOL_VULKAN)
+    VkCommandBuffer cmd = _sg.vk.frame.cmd_buf;
+    if (_sg.vk.uniforms.dirty && !_sg_vk_bind_uniform_descriptor_set(cmd)) return;
+    if (_sg.use_indexed_draw) vkCmdDrawIndexedIndirect(cmd, buf->vk.buf, (VkDeviceSize)offset, 1, 0);
+    else vkCmdDrawIndirect(cmd, buf->vk.buf, (VkDeviceSize)offset, 1, 0);
+    #elif defined(SOKOL_D3D11)
+    #if defined(__cplusplus)
+    if (_sg.use_indexed_draw) _sg.d3d11.ctx->DrawIndexedInstancedIndirect(buf->d3d11.buf, (UINT)offset);
+    else _sg.d3d11.ctx->DrawInstancedIndirect(buf->d3d11.buf, (UINT)offset);
+    #else
+    if (_sg.use_indexed_draw) _sg.d3d11.ctx->lpVtbl->DrawIndexedInstancedIndirect(_sg.d3d11.ctx, buf->d3d11.buf, (UINT)offset);
+    else _sg.d3d11.ctx->lpVtbl->DrawInstancedIndirect(_sg.d3d11.ctx, buf->d3d11.buf, (UINT)offset);
+    #endif
+    #elif defined(SOKOL_WGPU)
+    if (_sg.wgpu.uniform.dirty) _sg_wgpu_uniform_system_set_bindgroup();
+    if (_sg.use_indexed_draw) wgpuRenderPassEncoderDrawIndexedIndirect(_sg.wgpu.rpass_enc, buf->wgpu.buf, (uint64_t)offset);
+    else wgpuRenderPassEncoderDrawIndirect(_sg.wgpu.rpass_enc, buf->wgpu.buf, (uint64_t)offset);
+    #elif defined(_SOKOL_GL_HAS_COMPUTE)
+    glMemoryBarrier(GL_COMMAND_BARRIER_BIT);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, buf->gl.buf[buf->cmn.active_slot]);
+    if (_sg.use_indexed_draw) _sgu_draw_elements_indirect(_sg.gl.cache.cur_primitive_type, _sg.gl.cache.cur_index_type, (const void*)(intptr_t)offset);
+    else _sgu_draw_arrays_indirect(_sg.gl.cache.cur_primitive_type, (const void*)(intptr_t)offset);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+    #endif
+}
+
+SOKOL_API_IMPL void sg_dispatch_indirect(sg_buffer args, int offset) {
+    _sg_buffer_t* buf = _sgu_indirect_args(args, offset, 12, true);
+    if (!buf) return;
+    sg_indirect_barrier();
+    #if defined(SOKOL_METAL)
+    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+    [_sg.mtl.compute_cmd_encoder dispatchThreadgroupsWithIndirectBuffer:_sg_mtl_id(buf->mtl.buf[buf->cmn.active_slot])
+        indirectBufferOffset:(NSUInteger)offset threadsPerThreadgroup:pip->mtl.threads_per_threadgroup];
+    #elif defined(SOKOL_VULKAN)
+    VkCommandBuffer cmd = _sg.vk.frame.cmd_buf;
+    if (_sg.vk.uniforms.dirty && !_sg_vk_bind_uniform_descriptor_set(cmd)) return;
+    vkCmdDispatchIndirect(cmd, buf->vk.buf, (VkDeviceSize)offset);
+    #elif defined(SOKOL_D3D11)
+    #if defined(__cplusplus)
+    _sg.d3d11.ctx->DispatchIndirect(buf->d3d11.buf, (UINT)offset);
+    #else
+    _sg.d3d11.ctx->lpVtbl->DispatchIndirect(_sg.d3d11.ctx, buf->d3d11.buf, (UINT)offset);
+    #endif
+    #elif defined(SOKOL_WGPU)
+    if (_sg.wgpu.uniform.dirty) _sg_wgpu_uniform_system_set_bindgroup();
+    wgpuComputePassEncoderDispatchWorkgroupsIndirect(_sg.wgpu.cpass_enc, buf->wgpu.buf, (uint64_t)offset);
+    #elif defined(_SOKOL_GL_HAS_COMPUTE)
+    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, buf->gl.buf[buf->cmn.active_slot]);
+    _sgu_dispatch_indirect((GLintptr)offset);
+    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+    #endif
+}
 
 typedef struct {
     bool setup;
