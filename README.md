@@ -4,7 +4,7 @@ Extension utilities for the [sokol](https://github.com/floooh/sokol) headers.
 
 Currently, this repository contains:
 - `sokol_app_utils.h`: Additional functionality for `sokol_app.h`.
-- `sokol_gfx_utils.h`: Additional functionality for `sokol_gfx.h` (readback and Metal-only GPU pass timing support).
+- `sokol_gfx_utils.h`: Additional functionality for `sokol_gfx.h` (readback, indirect commands, and GPU pass timings).
 
 ## Usage
 
@@ -97,12 +97,32 @@ bool sg_gpu_pass_timings_supported(void);
 int sg_gpu_pass_timings_poll(sg_gpu_pass_timing* timings, int max_timings);
 ```
 
-GPU pass timings are Metal-only for now. Call setup before installing
-other trace hooks, enable recording as needed, and poll for the oldest completed
-frame without blocking the GPU. Provide space for `SG_GPU_PASS_TIMING_MAX_PASSES
-+ 1` results: `Frame` is measured independently from the whole command buffer,
-followed by labeled passes measured with stage-boundary counter attachments.
-Render timings combine vertex/fragment intervals, excluding gaps and counting
-their overlap once. Pass timings can overlap and must not be summed as frame time. Invalid or empty
-counter intervals are omitted. Devices without stage counters return only the
-`Frame` timing. Call shutdown after `sg_shutdown` has drained in-flight work.
+GPU timing uses the same public API on Metal, Vulkan, and D3D11. Call setup
+with a valid Sokol graphics context, before installing other trace hooks.
+Call the timing functions on Sokol's render thread.
+Define `SOKOL_TRACE_HOOKS` in the implementation. Unsupported backends or
+unavailable timestamp queries make setup return `false`.
+
+Enable recording as needed and poll for the oldest completed frame. Polling
+never waits for the GPU or flushes pending commands. Provide space for
+`SG_GPU_PASS_TIMING_MAX_PASSES + 1` results. Query storage stays bounded;
+recording drops samples when readback falls behind. Call shutdown after
+`sg_shutdown` has drained in-flight work, while the native device still exists.
+
+The `Frame` result, when available, comes first. It measures the whole Metal
+command buffer, the Vulkan
+render command buffer, or the interval from D3D11's first pass through commit.
+Vulkan staging uploads use a separate command buffer and are excluded.
+Remaining results describe labeled render or compute passes. Passes can overlap;
+do not sum them to infer frame time. D3D11 rejects disjoint clock samples.
+Vulkan checks the submission fence before reading query availability, so a
+reused query pool cannot return the previous frame's timestamps as new data.
+
+Backend integration stays inside the utility implementation and its native
+adapter; it adds no public backend-specific API. Metal's adapter attaches stage
+counters to the render or compute encoder descriptor before encoder creation.
+Render durations combine vertex and fragment intervals, excluding gaps and
+counting overlap once. Devices without stage counters report only `Frame`.
+Vulkan's adapter brackets Sokol's render command buffer and resets query pools
+only after Sokol has finished the slot's earlier work. The adapter must share
+the utility implementation's translation unit to call its private helpers.

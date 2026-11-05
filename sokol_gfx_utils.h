@@ -86,8 +86,10 @@ SOKOL_GFX_UTILS_API_DECL void sg_readback_destroy(void* request);
 
 /*
     Asynchronous GPU durations for labeled sg_pass bodies, plus a "Frame"
-    result for the entire command buffer. Metal stage-boundary counters are
-    optional; unsupported devices report only "Frame". Render timings measure
+    result for the frame. Vulkan measures the render command buffer (staging
+    uploads use a separate command buffer); D3D11 measures from the first pass
+    through commit. Metal measures the command buffer. Metal stage-boundary
+    counters are optional; unsupported devices report only "Frame". Render timings measure
     the union of vertex/fragment stage intervals, excluding the scheduling gap
     between stages. Different passes may overlap: their sum is not frame time.
     Results are reported only after the command buffer has completed.
@@ -101,7 +103,8 @@ typedef struct sg_gpu_pass_timing {
     double milliseconds;
 } sg_gpu_pass_timing;
 
-/* Install pass tracing before other sg_trace_hooks users are initialized. */
+/* Requires a valid sg context and SOKOL_TRACE_HOOKS in the implementation.
+   Install timing before other sg_trace_hooks users are initialized. */
 SOKOL_GFX_UTILS_API_DECL bool sg_gpu_pass_timings_setup(void);
 
 /* Release timing resources after sg_shutdown has drained in-flight work. */
@@ -109,16 +112,6 @@ SOKOL_GFX_UTILS_API_DECL void sg_gpu_pass_timings_shutdown(void);
 
 /* Enable or disable recording. Unsupported backends remain disabled. */
 SOKOL_GFX_UTILS_API_DECL void sg_gpu_pass_timings_set_enabled(bool enabled);
-
-/*
-    Metal integration: call once per pass, immediately before creating its
-    command encoder, while Sokol's current command buffer is active. descriptor
-    is a borrowed MTLRenderPassDescriptor* or MTLComputePassDescriptor*.
-    These attach timestamp counters without relying on patched Sokol fields.
-    Disabled recording and non-Metal backends leave the descriptor unchanged.
-*/
-SOKOL_GFX_UTILS_API_DECL void sg_gpu_pass_timings_mtl_prepare_render_pass(const sg_pass* pass, const void* descriptor);
-SOKOL_GFX_UTILS_API_DECL void sg_gpu_pass_timings_mtl_prepare_compute_pass(const sg_pass* pass, const void* descriptor);
 
 /* Returns true when the active backend supports asynchronous GPU timestamps. */
 SOKOL_GFX_UTILS_API_DECL bool sg_gpu_pass_timings_supported(void);
@@ -580,6 +573,7 @@ _SOKOL_PRIVATE _sgu_mtl_gpu_pass_t* _sgu_mtl_gpu_timing_attach(void) {
 }
 
 _SOKOL_PRIVATE void _sgu_mtl_gpu_timing_render_descriptor(const sg_pass* pass, MTLRenderPassDescriptor* descriptor) {
+    if (!_sgu_gpu_pass_timing_state.enabled || !pass || pass->compute || !descriptor) return;
     if (@available(macOS 11.0, iOS 14.0, *)) {
         _sgu_mtl_gpu_timing_begin_pass(pass);
         const _sgu_mtl_gpu_pass_t* timing = _sgu_mtl_gpu_timing_attach();
@@ -594,6 +588,7 @@ _SOKOL_PRIVATE void _sgu_mtl_gpu_timing_render_descriptor(const sg_pass* pass, M
 }
 
 _SOKOL_PRIVATE void _sgu_mtl_gpu_timing_compute_descriptor(const sg_pass* pass, MTLComputePassDescriptor* descriptor) {
+    if (!_sgu_gpu_pass_timing_state.enabled || !pass || !pass->compute || !descriptor) return;
     if (@available(macOS 11.0, iOS 14.0, *)) {
         _sgu_mtl_gpu_timing_begin_pass(pass);
         const _sgu_mtl_gpu_pass_t* timing = _sgu_mtl_gpu_timing_attach();
@@ -740,11 +735,332 @@ _SOKOL_PRIVATE void _sgu_mtl_gpu_timing_shutdown(void) {
 
 #endif /* SOKOL_METAL */
 
+/*--- GPU Pass Timings: Vulkan ---------------------------------------------*/
+#if defined(SOKOL_VULKAN)
+
+typedef struct {
+    VkQueryPool pool;
+    VkFence fence;
+    uint64_t frame_index;
+    uint32_t pass_count;
+    int active_pass;
+    bool pending;
+    bool recording;
+    char labels[SG_GPU_PASS_TIMING_MAX_PASSES][SG_GPU_PASS_TIMING_LABEL_SIZE];
+} _sgu_vk_gpu_timing_frame_t;
+
+static struct {
+    VkDevice device;
+    double milliseconds_per_tick;
+    uint64_t timestamp_mask;
+    int current_slot;
+    _sgu_vk_gpu_timing_frame_t frames[SG_NUM_INFLIGHT_FRAMES];
+} _sgu_vk_gpu_timing;
+
+_SOKOL_PRIVATE void _sgu_vk_gpu_timing_shutdown(void) {
+    for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; ++i) {
+        if (_sgu_vk_gpu_timing.frames[i].pool) {
+            vkDestroyQueryPool(_sgu_vk_gpu_timing.device, _sgu_vk_gpu_timing.frames[i].pool, NULL);
+        }
+    }
+    memset(&_sgu_vk_gpu_timing, 0, sizeof(_sgu_vk_gpu_timing));
+    _sgu_vk_gpu_timing.current_slot = -1;
+}
+
+_SOKOL_PRIVATE bool _sgu_vk_gpu_timing_initialize(void) {
+    uint32_t count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(_sg.vk.phys_dev, &count, NULL);
+    if (_sg.vk.queue_family_index >= count) return false;
+    VkQueueFamilyProperties* queues = (VkQueueFamilyProperties*)malloc(sizeof(*queues) * count);
+    if (!queues) return false;
+    vkGetPhysicalDeviceQueueFamilyProperties(_sg.vk.phys_dev, &count, queues);
+    const uint32_t bits = queues[_sg.vk.queue_family_index].timestampValidBits;
+    free(queues);
+    if (!bits) return false;
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(_sg.vk.phys_dev, &properties);
+    if (!(properties.limits.timestampPeriod > 0)) return false;
+    _sgu_vk_gpu_timing.device = _sg.vk.dev;
+    _sgu_vk_gpu_timing.milliseconds_per_tick = properties.limits.timestampPeriod * 0.000001;
+    _sgu_vk_gpu_timing.timestamp_mask = bits >= 64 ? UINT64_MAX : (UINT64_C(1) << bits) - 1;
+    _sgu_vk_gpu_timing.current_slot = -1;
+    for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; ++i) {
+        VkQueryPoolCreateInfo desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        desc.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        desc.queryCount = 2 + SG_GPU_PASS_TIMING_MAX_PASSES * 2;
+        if (vkCreateQueryPool(_sg.vk.dev, &desc, NULL, &_sgu_vk_gpu_timing.frames[i].pool) != VK_SUCCESS) {
+            _sgu_vk_gpu_timing_shutdown();
+            return false;
+        }
+        _sgu_vk_gpu_timing.frames[i].active_pass = -1;
+    }
+    return true;
+}
+
+_SOKOL_PRIVATE void _sgu_vk_gpu_timing_begin_commands(VkCommandBuffer commands) {
+    if (!_sgu_gpu_pass_timing_state.enabled || commands != _sg.vk.frame.cmd_buf) return;
+    const int slot = (int)_sg.vk.frame_slot;
+    _sgu_vk_gpu_timing_frame_t* frame = &_sgu_vk_gpu_timing.frames[slot];
+    // Sokol has already waited for this frame slot before beginning its command
+    // buffer. Drop unconsumed readings; the pool is now safe to reset and reuse.
+    frame->pending = false;
+    frame->fence = _sg.vk.frame.slot[slot].fence;
+    frame->recording = true;
+    frame->frame_index = _sg.frame_index;
+    frame->pass_count = 0;
+    frame->active_pass = -1;
+    _sgu_vk_gpu_timing.current_slot = slot;
+    vkCmdResetQueryPool(commands, frame->pool, 0, 2 + SG_GPU_PASS_TIMING_MAX_PASSES * 2);
+    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame->pool, 0);
+}
+
+_SOKOL_PRIVATE void _sgu_vk_gpu_timing_end_commands(VkCommandBuffer commands) {
+    const int slot = _sgu_vk_gpu_timing.current_slot;
+    if (slot < 0 || commands != _sg.vk.frame.cmd_buf) return;
+    _sgu_vk_gpu_timing_frame_t* frame = &_sgu_vk_gpu_timing.frames[slot];
+    if (!frame->recording) return;
+    vkCmdWriteTimestamp(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, frame->pool, 1);
+    frame->recording = false;
+    frame->pending = true;
+    _sgu_vk_gpu_timing.current_slot = -1;
+}
+
+_SOKOL_PRIVATE void _sgu_vk_gpu_timing_begin_pass(const sg_pass* pass) {
+    if (!_sgu_gpu_pass_timing_state.enabled) return;
+    // This is the same acquisition the backend makes before rendering. The
+    // adapter starts frame timing after vkBeginCommandBuffer succeeds.
+    _sg_vk_acquire_frame_command_buffers();
+    const int slot = _sgu_vk_gpu_timing.current_slot;
+    if (slot < 0 || !_sg.vk.frame.cmd_buf) return;
+    _sgu_vk_gpu_timing_frame_t* frame = &_sgu_vk_gpu_timing.frames[slot];
+    frame->active_pass = -1;
+    if (frame->pass_count >= SG_GPU_PASS_TIMING_MAX_PASSES) return;
+    const uint32_t index = frame->pass_count++;
+    const char* label = pass->label ? pass->label : (pass->compute ? "compute" : "render");
+    strncpy(frame->labels[index], label, SG_GPU_PASS_TIMING_LABEL_SIZE - 1);
+    frame->labels[index][SG_GPU_PASS_TIMING_LABEL_SIZE - 1] = 0;
+    frame->active_pass = (int)index;
+    vkCmdWriteTimestamp(_sg.vk.frame.cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame->pool, 2 + index * 2);
+}
+
+_SOKOL_PRIVATE void _sgu_vk_gpu_timing_end_pass(void) {
+    const int slot = _sgu_vk_gpu_timing.current_slot;
+    if (slot < 0) return;
+    _sgu_vk_gpu_timing_frame_t* frame = &_sgu_vk_gpu_timing.frames[slot];
+    if (frame->active_pass < 0) return;
+    vkCmdWriteTimestamp(_sg.vk.frame.cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        frame->pool, 3 + (uint32_t)frame->active_pass * 2);
+    frame->active_pass = -1;
+}
+
+_SOKOL_PRIVATE int _sgu_vk_gpu_timing_poll(sg_gpu_pass_timing* timings, int max_timings) {
+    _sgu_vk_gpu_timing_frame_t* oldest = NULL;
+    for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; ++i) {
+        _sgu_vk_gpu_timing_frame_t* frame = &_sgu_vk_gpu_timing.frames[i];
+        if (frame->pending && (!oldest || frame->frame_index < oldest->frame_index)) oldest = frame;
+    }
+    if (!oldest) return 0;
+    // A GPU-side reset may not have executed yet, leaving the previous use's
+    // availability bits set. Check this submission's fence before reading them.
+    VkResult completion = vkGetFenceStatus(_sgu_vk_gpu_timing.device, oldest->fence);
+    if (completion == VK_NOT_READY) return 0;
+    if (completion != VK_SUCCESS) { oldest->pending = false; return 0; }
+    // WITH_AVAILABILITY never waits. No query pool is freed while work is in
+    // flight; pools live until shutdown and follow Sokol's frame-slot fences.
+    uint64_t results[2 + SG_GPU_PASS_TIMING_MAX_PASSES * 2][2];
+    const uint32_t queries = 2 + oldest->pass_count * 2;
+    VkResult status = vkGetQueryPoolResults(_sgu_vk_gpu_timing.device, oldest->pool, 0, queries,
+        queries * sizeof(results[0]), results, sizeof(results[0]), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (status == VK_NOT_READY) return 0;
+    if (status != VK_SUCCESS) { oldest->pending = false; return 0; }
+    for (uint32_t i = 0; i < queries; ++i) if (!results[i][1]) return 0;
+    int count = 0;
+    for (uint32_t i = 0; i <= oldest->pass_count && count < max_timings; ++i) {
+        const uint32_t start = i * 2;
+        sg_gpu_pass_timing* timing = &timings[count++];
+        const char* label = i == 0 ? "Frame" : oldest->labels[i - 1];
+        strncpy(timing->label, label, SG_GPU_PASS_TIMING_LABEL_SIZE - 1);
+        timing->label[SG_GPU_PASS_TIMING_LABEL_SIZE - 1] = 0;
+        timing->frame_index = oldest->frame_index;
+        const uint64_t ticks = (results[start + 1][0] - results[start][0]) & _sgu_vk_gpu_timing.timestamp_mask;
+        timing->milliseconds = (double)ticks * _sgu_vk_gpu_timing.milliseconds_per_tick;
+    }
+    oldest->pending = false;
+    return count;
+}
+#endif /* SOKOL_VULKAN */
+
+/*--- GPU Pass Timings: D3D11 ----------------------------------------------*/
+#if defined(SOKOL_D3D11)
+#define _SGU_D3D11_GPU_TIMING_FRAMES (4)
+typedef struct {
+    ID3D11Query* disjoint;
+    ID3D11Query* queries[2 + SG_GPU_PASS_TIMING_MAX_PASSES * 2];
+    uint64_t frame_index;
+    uint32_t pass_count;
+    int active_pass;
+    bool pending;
+    char labels[SG_GPU_PASS_TIMING_MAX_PASSES][SG_GPU_PASS_TIMING_LABEL_SIZE];
+} _sgu_d3d11_gpu_timing_frame_t;
+static struct {
+    ID3D11Device* device;
+    ID3D11DeviceContext* context;
+    int current_slot;
+    _sgu_d3d11_gpu_timing_frame_t frames[_SGU_D3D11_GPU_TIMING_FRAMES];
+} _sgu_d3d11_gpu_timing;
+
+_SOKOL_PRIVATE bool _sgu_d3d11_gpu_timing_make_query(ID3D11Query** query, D3D11_QUERY type) {
+    if (*query) return true;
+    D3D11_QUERY_DESC desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.Query = type;
+    return SUCCEEDED(_sgu_d3d11_gpu_timing.device->CreateQuery(&desc, query));
+}
+
+_SOKOL_PRIVATE void _sgu_d3d11_gpu_timing_shutdown(void) {
+    for (int i = 0; i < _SGU_D3D11_GPU_TIMING_FRAMES; ++i) {
+        _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[i];
+        if (frame->disjoint) frame->disjoint->Release();
+        for (int j = 0; j < 2 + SG_GPU_PASS_TIMING_MAX_PASSES * 2; ++j) {
+            if (frame->queries[j]) frame->queries[j]->Release();
+        }
+    }
+    if (_sgu_d3d11_gpu_timing.context) _sgu_d3d11_gpu_timing.context->Release();
+    if (_sgu_d3d11_gpu_timing.device) _sgu_d3d11_gpu_timing.device->Release();
+    memset(&_sgu_d3d11_gpu_timing, 0, sizeof(_sgu_d3d11_gpu_timing));
+    _sgu_d3d11_gpu_timing.current_slot = -1;
+}
+
+_SOKOL_PRIVATE bool _sgu_d3d11_gpu_timing_initialize(void) {
+    _sgu_d3d11_gpu_timing.device = _sg.d3d11.dev;
+    _sgu_d3d11_gpu_timing.context = _sg.d3d11.ctx;
+    if (!_sgu_d3d11_gpu_timing.device || !_sgu_d3d11_gpu_timing.context) {
+        _sgu_d3d11_gpu_timing.device = NULL;
+        _sgu_d3d11_gpu_timing.context = NULL;
+        return false;
+    }
+    _sgu_d3d11_gpu_timing.device->AddRef();
+    _sgu_d3d11_gpu_timing.context->AddRef();
+    _sgu_d3d11_gpu_timing.current_slot = -1;
+    for (int i = 0; i < _SGU_D3D11_GPU_TIMING_FRAMES; ++i) {
+        _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[i];
+        frame->active_pass = -1;
+        if (!_sgu_d3d11_gpu_timing_make_query(&frame->disjoint, D3D11_QUERY_TIMESTAMP_DISJOINT) ||
+            !_sgu_d3d11_gpu_timing_make_query(&frame->queries[0], D3D11_QUERY_TIMESTAMP) ||
+            !_sgu_d3d11_gpu_timing_make_query(&frame->queries[1], D3D11_QUERY_TIMESTAMP)) {
+            _sgu_d3d11_gpu_timing_shutdown();
+            return false;
+        }
+    }
+    return true;
+}
+
+_SOKOL_PRIVATE void _sgu_d3d11_gpu_timing_begin_pass(const sg_pass* pass) {
+    if (!_sgu_gpu_pass_timing_state.enabled) return;
+    int slot = _sgu_d3d11_gpu_timing.current_slot;
+    ID3D11DeviceContext* context = _sgu_d3d11_gpu_timing.context;
+    if (slot < 0) {
+        for (int i = 0; i < _SGU_D3D11_GPU_TIMING_FRAMES; ++i) {
+            if (!_sgu_d3d11_gpu_timing.frames[i].pending) { slot = i; break; }
+        }
+        // Keep unfinished queries intact; skip recording if the GPU is behind.
+        if (slot < 0) return;
+        _sgu_d3d11_gpu_timing.current_slot = slot;
+        _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[slot];
+        frame->frame_index = _sg.frame_index;
+        frame->pass_count = 0;
+        context->Begin(frame->disjoint);
+        context->End(frame->queries[0]);
+    }
+    _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[slot];
+    frame->active_pass = -1;
+    if (frame->pass_count >= SG_GPU_PASS_TIMING_MAX_PASSES) return;
+    const uint32_t index = frame->pass_count;
+    if (!_sgu_d3d11_gpu_timing_make_query(&frame->queries[2 + index * 2], D3D11_QUERY_TIMESTAMP) ||
+        !_sgu_d3d11_gpu_timing_make_query(&frame->queries[3 + index * 2], D3D11_QUERY_TIMESTAMP)) return;
+    const char* label = pass->label ? pass->label : (pass->compute ? "compute" : "render");
+    strncpy(frame->labels[index], label, SG_GPU_PASS_TIMING_LABEL_SIZE - 1);
+    frame->labels[index][SG_GPU_PASS_TIMING_LABEL_SIZE - 1] = 0;
+    frame->active_pass = (int)index;
+    ++frame->pass_count;
+    context->End(frame->queries[2 + index * 2]);
+}
+
+_SOKOL_PRIVATE void _sgu_d3d11_gpu_timing_end_pass(void) {
+    const int slot = _sgu_d3d11_gpu_timing.current_slot;
+    if (slot < 0) return;
+    _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[slot];
+    if (frame->active_pass < 0) return;
+    _sgu_d3d11_gpu_timing.context->End(frame->queries[3 + (uint32_t)frame->active_pass * 2]);
+    frame->active_pass = -1;
+}
+
+_SOKOL_PRIVATE void _sgu_d3d11_gpu_timing_commit(void) {
+    const int slot = _sgu_d3d11_gpu_timing.current_slot;
+    if (slot < 0) return;
+    _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[slot];
+    _sgu_d3d11_gpu_timing.context->End(frame->queries[1]);
+    _sgu_d3d11_gpu_timing.context->End(frame->disjoint);
+    frame->pending = true;
+    _sgu_d3d11_gpu_timing.current_slot = -1;
+}
+
+_SOKOL_PRIVATE int _sgu_d3d11_gpu_timing_poll(sg_gpu_pass_timing* timings, int max_timings) {
+    _sgu_d3d11_gpu_timing_frame_t* oldest = NULL;
+    for (int i = 0; i < _SGU_D3D11_GPU_TIMING_FRAMES; ++i) {
+        _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[i];
+        if (frame->pending && (!oldest || frame->frame_index < oldest->frame_index)) oldest = frame;
+    }
+    if (!oldest) return 0;
+    ID3D11DeviceContext* context = _sgu_d3d11_gpu_timing.context;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
+    HRESULT status = context->GetData(oldest->disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (status == S_FALSE) return 0;
+    if (FAILED(status) || disjoint.Disjoint || !disjoint.Frequency) { oldest->pending = false; return 0; }
+    uint64_t results[2 + SG_GPU_PASS_TIMING_MAX_PASSES * 2];
+    const uint32_t queries = 2 + oldest->pass_count * 2;
+    for (uint32_t i = 0; i < queries; ++i) {
+        status = context->GetData(oldest->queries[i], &results[i], sizeof(results[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (status == S_FALSE) return 0;
+        if (FAILED(status)) { oldest->pending = false; return 0; }
+    }
+    int count = 0;
+    for (uint32_t i = 0; i <= oldest->pass_count && count < max_timings; ++i) {
+        sg_gpu_pass_timing* timing = &timings[count++];
+        const char* label = i == 0 ? "Frame" : oldest->labels[i - 1];
+        strncpy(timing->label, label, SG_GPU_PASS_TIMING_LABEL_SIZE - 1);
+        timing->label[SG_GPU_PASS_TIMING_LABEL_SIZE - 1] = 0;
+        timing->frame_index = oldest->frame_index;
+        timing->milliseconds = (double)(results[i * 2 + 1] - results[i * 2]) * 1000.0 / (double)disjoint.Frequency;
+    }
+    oldest->pending = false;
+    return count;
+}
+#endif /* SOKOL_D3D11 */
+
 /*--- GPU Pass Timings: Trace Hooks -----------------------------------------*/
+_SOKOL_PRIVATE void _sgu_gpu_timing_trace_begin_pass(const sg_pass* pass, void* user_data) {
+    _sgu_gpu_pass_timing_state_t* state = (_sgu_gpu_pass_timing_state_t*)user_data;
+#if defined(SOKOL_VULKAN)
+    _sgu_vk_gpu_timing_begin_pass(pass);
+#elif defined(SOKOL_D3D11)
+    _sgu_d3d11_gpu_timing_begin_pass(pass);
+#endif
+    if (state->previous_hooks.begin_pass) {
+        state->previous_hooks.begin_pass(pass, state->previous_hooks.user_data);
+    }
+}
+
 _SOKOL_PRIVATE void _sgu_gpu_timing_trace_end_pass(void* user_data) {
     _sgu_gpu_pass_timing_state_t* state = (_sgu_gpu_pass_timing_state_t*)user_data;
 #if defined(SOKOL_METAL)
     _sgu_mtl_gpu_timing_end_pass();
+#elif defined(SOKOL_VULKAN)
+    _sgu_vk_gpu_timing_end_pass();
+#elif defined(SOKOL_D3D11)
+    _sgu_d3d11_gpu_timing_end_pass();
 #endif
     if (state->previous_hooks.end_pass) {
         state->previous_hooks.end_pass(state->previous_hooks.user_data);
@@ -755,6 +1071,8 @@ _SOKOL_PRIVATE void _sgu_gpu_timing_trace_commit(void* user_data) {
     _sgu_gpu_pass_timing_state_t* state = (_sgu_gpu_pass_timing_state_t*)user_data;
 #if defined(SOKOL_METAL)
     _sgu_mtl_gpu_timing_commit();
+#elif defined(SOKOL_D3D11)
+    _sgu_d3d11_gpu_timing_commit();
 #endif
     if (state->previous_hooks.commit) {
         state->previous_hooks.commit(state->previous_hooks.user_data);
@@ -1120,12 +1438,20 @@ SOKOL_API_IMPL void sg_readback_destroy(void* request) {
 }
 
 SOKOL_API_IMPL bool sg_gpu_pass_timings_setup(void) {
+    if (!sg_isvalid()) return false;
+#if !defined(SOKOL_TRACE_HOOKS)
+    return false;
+#endif
     if (_sgu_gpu_pass_timing_state.setup) {
         return _sgu_gpu_pass_timing_state.supported;
     }
     _sgu_gpu_pass_timing_state.setup = true;
 #if defined(SOKOL_METAL)
     _sgu_gpu_pass_timing_state.supported = _sgu_mtl_gpu_timing_initialize();
+#elif defined(SOKOL_VULKAN)
+    _sgu_gpu_pass_timing_state.supported = _sgu_vk_gpu_timing_initialize();
+#elif defined(SOKOL_D3D11)
+    _sgu_gpu_pass_timing_state.supported = _sgu_d3d11_gpu_timing_initialize();
 #else
     _sgu_gpu_pass_timing_state.supported = false;
 #endif
@@ -1135,6 +1461,7 @@ SOKOL_API_IMPL bool sg_gpu_pass_timings_setup(void) {
     sg_trace_hooks hooks;
     memset(&hooks, 0, sizeof(hooks));
     hooks.user_data = &_sgu_gpu_pass_timing_state;
+    hooks.begin_pass = _sgu_gpu_timing_trace_begin_pass;
     hooks.end_pass = _sgu_gpu_timing_trace_end_pass;
     hooks.commit = _sgu_gpu_timing_trace_commit;
     _sgu_gpu_pass_timing_state.previous_hooks = sg_install_trace_hooks(&hooks);
@@ -1144,6 +1471,10 @@ SOKOL_API_IMPL bool sg_gpu_pass_timings_setup(void) {
 SOKOL_API_IMPL void sg_gpu_pass_timings_shutdown(void) {
 #if defined(SOKOL_METAL)
     _sgu_mtl_gpu_timing_shutdown();
+#elif defined(SOKOL_VULKAN)
+    _sgu_vk_gpu_timing_shutdown();
+#elif defined(SOKOL_D3D11)
+    _sgu_d3d11_gpu_timing_shutdown();
 #endif
     memset(&_sgu_gpu_pass_timing_state, 0, sizeof(_sgu_gpu_pass_timing_state));
 }
@@ -1151,28 +1482,6 @@ SOKOL_API_IMPL void sg_gpu_pass_timings_shutdown(void) {
 SOKOL_API_IMPL void sg_gpu_pass_timings_set_enabled(bool enabled) {
     _sgu_gpu_pass_timing_state.enabled =
         _sgu_gpu_pass_timing_state.setup && _sgu_gpu_pass_timing_state.supported && enabled;
-}
-
-SOKOL_API_IMPL void sg_gpu_pass_timings_mtl_prepare_render_pass(const sg_pass* pass, const void* descriptor) {
-#if defined(SOKOL_METAL)
-    if (_sgu_gpu_pass_timing_state.enabled && pass && !pass->compute && descriptor) {
-        _sgu_mtl_gpu_timing_render_descriptor(pass, (__bridge MTLRenderPassDescriptor*)descriptor);
-    }
-#else
-    (void)pass;
-    (void)descriptor;
-#endif
-}
-
-SOKOL_API_IMPL void sg_gpu_pass_timings_mtl_prepare_compute_pass(const sg_pass* pass, const void* descriptor) {
-#if defined(SOKOL_METAL)
-    if (_sgu_gpu_pass_timing_state.enabled && pass && pass->compute && descriptor) {
-        _sgu_mtl_gpu_timing_compute_descriptor(pass, (__bridge MTLComputePassDescriptor*)descriptor);
-    }
-#else
-    (void)pass;
-    (void)descriptor;
-#endif
 }
 
 SOKOL_API_IMPL bool sg_gpu_pass_timings_supported(void) {
@@ -1185,6 +1494,10 @@ SOKOL_API_IMPL int sg_gpu_pass_timings_poll(sg_gpu_pass_timing* timings, int max
     }
 #if defined(SOKOL_METAL)
     return _sgu_mtl_gpu_timing_poll(timings, max_timings);
+#elif defined(SOKOL_VULKAN)
+    return _sgu_vk_gpu_timing_poll(timings, max_timings);
+#elif defined(SOKOL_D3D11)
+    return _sgu_d3d11_gpu_timing_poll(timings, max_timings);
 #else
     return 0;
 #endif
