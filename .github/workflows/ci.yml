@@ -1,0 +1,93 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The utilities use Sokol internals: update this revision deliberately.
+  SOKOL_REVISION: 7151e640e6ccc44a1e6eefb50cd1435a7e00da63
+
+jobs:
+  native:
+    name: ${{ matrix.platform.os }} / ${{ matrix.platform.backend }} / ${{ matrix.config }}
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+        platform:
+          - {os: ubuntu-24.04, backend: SOKOL_GLCORE}
+          - {os: ubuntu-24.04, backend: SOKOL_VULKAN}
+          - {os: macos-15, backend: SOKOL_GLCORE}
+          - {os: macos-15, backend: SOKOL_METAL}
+          - {os: windows-2025, backend: SOKOL_D3D11}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: sokol-utils
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: floooh/sokol
+          ref: ${{ env.SOKOL_REVISION }}
+          path: sokol
+          persist-credentials: false
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libasound2-dev libvulkan-dev
+      - name: Configure
+        working-directory: sokol-utils
+        run: cmake -S tests -B build/ci -DSOKOL_BACKEND=${{ matrix.platform.backend }} -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+      - name: Build C and C++
+        working-directory: sokol-utils
+        run: cmake --build build/ci --config ${{ matrix.config }} --parallel 2
+      - name: Test
+        working-directory: sokol-utils
+        run: ctest --test-dir build/ci -C ${{ matrix.config }} --output-on-failure --no-tests=error
+
+  web:
+    name: WebGL2 / ${{ matrix.config }} (build only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: sokol-utils
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: floooh/sokol
+          ref: ${{ env.SOKOL_REVISION }}
+          path: sokol
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: emscripten-core/emsdk
+          path: emsdk
+          persist-credentials: false
+      - name: Install Emscripten
+        run: |
+          ./emsdk/emsdk install 4.0.19
+          ./emsdk/emsdk activate 4.0.19
+      - name: Build C and C++ for WebGL2
+        shell: bash
+        run: |
+          source emsdk/emsdk_env.sh
+          emcmake cmake -S sokol-utils/tests -B sokol-utils/build/ci -DSOKOL_BACKEND=SOKOL_GLES3 -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+          cmake --build sokol-utils/build/ci --parallel 2

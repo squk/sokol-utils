@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(sokol-utils-test)
+enable_testing()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 11)
@@ -136,3 +137,9 @@ endmacro()
 
 add_subdirectory(compile)
 add_subdirectory(functional)
+
+if (NOT EMSCRIPTEN)
+    add_test(NAME functional COMMAND sokol-utils-test)
+    add_test(NAME compile-c COMMAND sokol-utils-compiletest-c)
+    add_test(NAME compile-cxx COMMAND sokol-utils-compiletest-cxx)
+endif()

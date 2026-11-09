@@ -32,6 +32,11 @@ Include the utility headers *after* the corresponding sokol header implementatio
 #include "sokol_gfx_utils.h"
 ```
 
+## CI
+
+[GitHub Actions](.github/workflows/ci.yml) builds and tests Debug/Release on Linux,
+macOS, and Windows, and compiles WebGL2. GPU and browser runtime tests are not covered.
+
 ## API
 
 ### sokol_app_utils.h
