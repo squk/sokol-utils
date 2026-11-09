@@ -123,6 +123,33 @@ SOKOL_GFX_UTILS_API_DECL bool sg_gpu_pass_timings_supported(void);
 */
 SOKOL_GFX_UTILS_API_DECL int sg_gpu_pass_timings_poll(sg_gpu_pass_timing* timings, int max_timings);
 
+/* Native receipts for sg_commit_tracked. These APIs run on the graphics
+   context's owning thread, outside passes. A receipt covers preceding work
+   submitted by this tracked commit on Sokol's queue/context; it does not prove
+   rendered output validity or completion on other queues.
+
+   A null receipt, expired device generation or unavailable tracking reports
+   UNKNOWN. Destroying a pending receipt never waits: internal ownership lasts
+   until its marker finishes or explicit shutdown. Do not query a destroyed
+   receipt. Call sg_shutdown_submission_receipts before sg_shutdown or switching
+   graphics backends; surviving public receipts then report UNKNOWN and may be
+   destroyed through a later backend dispatcher. */
+typedef struct sg_submission_receipt_t* sg_submission_receipt;
+typedef enum sg_submission_status {
+    SG_SUBMISSION_UNKNOWN,
+    SG_SUBMISSION_PENDING,
+    SG_SUBMISSION_COMPLETE,
+    SG_SUBMISSION_FAILED
+} sg_submission_status;
+SOKOL_GFX_UTILS_API_DECL bool sg_submission_completion_supported(void);
+/* Commits even when optional receipt allocation/marker creation is unavailable.
+   Polls issue no waits. Explicit shutdown may wait on Vulkan. */
+SOKOL_GFX_UTILS_API_DECL sg_submission_receipt sg_commit_tracked(void);
+SOKOL_GFX_UTILS_API_DECL sg_submission_status sg_query_submission_receipt(sg_submission_receipt receipt);
+SOKOL_GFX_UTILS_API_DECL void sg_destroy_submission_receipt(sg_submission_receipt receipt);
+/* False leaves Vulkan receipts intact: retry before graphics teardown. */
+SOKOL_GFX_UTILS_API_DECL bool sg_shutdown_submission_receipts(void);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
@@ -1501,6 +1528,564 @@ SOKOL_API_IMPL int sg_gpu_pass_timings_poll(sg_gpu_pass_timing* timings, int max
 #else
     return 0;
 #endif
+}
+
+#if defined(SOKOL_METAL)
+typedef struct {
+    // The receipt owns one retain; calloc stores no ARC-managed fields.
+    void* command_buffer;
+} _sgu_mtl_completion_t;
+
+_SOKOL_PRIVATE bool _sgu_mtl_completion_make(_sgu_mtl_completion_t* marker) {
+    memset(marker, 0, sizeof(*marker));
+    if (!_sg.mtl.cmd_buffer) return false;
+#if __has_feature(objc_arc)
+    marker->command_buffer = (__bridge_retained void*)_sg.mtl.cmd_buffer;
+#else
+    marker->command_buffer = (void*)[_sg.mtl.cmd_buffer retain];
+#endif
+    return true;
+}
+_SOKOL_PRIVATE sg_submission_status _sgu_mtl_completion_poll(const _sgu_mtl_completion_t* marker) {
+    if (!marker || !marker->command_buffer) return SG_SUBMISSION_UNKNOWN;
+#if __has_feature(objc_arc)
+    id<MTLCommandBuffer> command_buffer = (__bridge id<MTLCommandBuffer>)marker->command_buffer;
+#else
+    id<MTLCommandBuffer> command_buffer = (id<MTLCommandBuffer>)marker->command_buffer;
+#endif
+    if (command_buffer.status == MTLCommandBufferStatusCompleted) return SG_SUBMISSION_COMPLETE;
+    if (command_buffer.status == MTLCommandBufferStatusError) return SG_SUBMISSION_FAILED;
+    return SG_SUBMISSION_PENDING;
+}
+_SOKOL_PRIVATE void _sgu_mtl_completion_destroy(_sgu_mtl_completion_t* marker) {
+    if (!marker || !marker->command_buffer) return;
+#if __has_feature(objc_arc)
+    CFRelease((CFTypeRef)marker->command_buffer);
+#else
+    [(id<MTLCommandBuffer>)marker->command_buffer release];
+#endif
+    marker->command_buffer = NULL;
+}
+#endif
+
+#if defined(SOKOL_VULKAN)
+typedef struct {
+    VkDevice device;
+    VkFence fence;
+    sg_submission_status status;
+} _sgu_vk_completion_t;
+
+_SOKOL_PRIVATE bool _sgu_vk_completion_make(_sgu_vk_completion_t* marker) {
+    VkFenceCreateInfo info;
+    VkSubmitInfo submit;
+    VkResult result;
+    memset(marker, 0, sizeof(*marker));
+    if (!_sg.vk.valid || !_sg.vk.dev || !_sg.vk.queue) return false;
+    marker->device = _sg.vk.dev;
+    memset(&info, 0, sizeof(info));
+    info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    result = vkCreateFence(marker->device, &info, NULL, &marker->fence);
+    if (result != VK_SUCCESS) {
+        marker->status = result == VK_ERROR_DEVICE_LOST ? SG_SUBMISSION_FAILED : SG_SUBMISSION_UNKNOWN;
+        return marker->status == SG_SUBMISSION_FAILED;
+    }
+    memset(&submit, 0, sizeof(submit));
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    /* A separate fence after sg_commit covers preceding queue submissions and
+       cannot be confused with Sokol's reusable frame fence slots. */
+    result = vkQueueSubmit(_sg.vk.queue, 1, &submit, marker->fence);
+    if (result != VK_SUCCESS) {
+        vkDestroyFence(marker->device, marker->fence, NULL);
+        marker->fence = VK_NULL_HANDLE;
+        marker->status = result == VK_ERROR_DEVICE_LOST ? SG_SUBMISSION_FAILED : SG_SUBMISSION_UNKNOWN;
+        return marker->status == SG_SUBMISSION_FAILED;
+    }
+    marker->status = SG_SUBMISSION_PENDING;
+    return true;
+}
+_SOKOL_PRIVATE sg_submission_status _sgu_vk_completion_poll(const _sgu_vk_completion_t* marker) {
+    VkResult result;
+    if (!marker) return SG_SUBMISSION_UNKNOWN;
+    if (!marker->fence) return marker->status;
+    result = vkGetFenceStatus(marker->device, marker->fence);
+    if (result == VK_SUCCESS) return SG_SUBMISSION_COMPLETE;
+    if (result == VK_ERROR_DEVICE_LOST) return SG_SUBMISSION_FAILED;
+    /* Query failures other than device loss do not prove the fence is idle.
+       Keep native ownership and retry; shutdown is the only blocking path. */
+    return SG_SUBMISSION_PENDING;
+}
+_SOKOL_PRIVATE void _sgu_vk_completion_destroy(_sgu_vk_completion_t* marker) {
+    if (!marker) return;
+    if (marker->fence) vkDestroyFence(marker->device, marker->fence, NULL);
+    memset(marker, 0, sizeof(*marker));
+}
+#endif
+
+/* One marker covers commands already issued on Sokol's immediate context.
+   Call make/poll/destroy on that context's owning thread, outside Sokol passes.
+   Destroy before sg_shutdown; cancellation never proves completion. */
+#if defined(SOKOL_D3D11)
+typedef struct {
+    ID3D11Query* query;
+    ID3D11DeviceContext* context;
+} _sgu_d3d11_completion_t;
+
+_SOKOL_PRIVATE bool _sgu_d3d11_completion_make(_sgu_d3d11_completion_t* marker) {
+    D3D11_QUERY_DESC desc;
+    HRESULT result;
+    memset(marker, 0, sizeof(*marker));
+    if (!sg_isvalid() || _sg.cur_pass.in_pass || !_sg.d3d11.dev || !_sg.d3d11.ctx) return false;
+    memset(&desc, 0, sizeof(desc));
+    desc.Query = D3D11_QUERY_EVENT;
+#if defined(__cplusplus)
+    result = _sg.d3d11.dev->CreateQuery(&desc, &marker->query);
+#else
+    result = _sg.d3d11.dev->lpVtbl->CreateQuery(_sg.d3d11.dev, &desc, &marker->query);
+#endif
+    if (FAILED(result) || !marker->query) {
+        if (marker->query) _sg_d3d11_Release(marker->query);
+        marker->query = NULL;
+        return false;
+    }
+    marker->context = _sg.d3d11.ctx;
+    _sg_d3d11_AddRef(marker->context);
+#if defined(__cplusplus)
+    marker->context->End(marker->query);
+    marker->context->Flush();
+#else
+    marker->context->lpVtbl->End(marker->context, (ID3D11Asynchronous*)marker->query);
+    marker->context->lpVtbl->Flush(marker->context);
+#endif
+    /* Submit once at insertion so DONOTFLUSH polling makes progress even if
+       the app stops rendering. Flush submits work; it does not wait for it. */
+    return true;
+}
+
+_SOKOL_PRIVATE sg_submission_status _sgu_d3d11_completion_poll(const _sgu_d3d11_completion_t* marker) {
+    BOOL completed = FALSE;
+    HRESULT result;
+    if (!marker || !marker->query || !marker->context) return SG_SUBMISSION_FAILED;
+#if defined(__cplusplus)
+    result = marker->context->GetData(marker->query, &completed, sizeof(completed), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+#else
+    result = marker->context->lpVtbl->GetData(marker->context, (ID3D11Asynchronous*)marker->query,
+        &completed, sizeof(completed), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+#endif
+    if (result == S_FALSE) return SG_SUBMISSION_PENDING;
+    if (FAILED(result)) return SG_SUBMISSION_FAILED;
+    return completed ? SG_SUBMISSION_COMPLETE : SG_SUBMISSION_PENDING;
+}
+
+_SOKOL_PRIVATE void _sgu_d3d11_completion_destroy(_sgu_d3d11_completion_t* marker) {
+    if (!marker) return;
+    if (marker->query) _sg_d3d11_Release(marker->query);
+    if (marker->context) _sg_d3d11_Release(marker->context);
+    memset(marker, 0, sizeof(*marker));
+}
+#endif
+
+/* Use the same current GL context and owning thread for make/poll/destroy.
+   Destroy before context teardown and sg_shutdown. Cancellation never proves
+   completion. The marker covers commands before insertion in this context. */
+#if defined(_SOKOL_ANY_GL)
+#if defined(_SOKOL_USE_WIN32_GL_LOADER)
+/* Sokol's Win32 loader does not declare GL sync objects or these calls. */
+typedef struct __GLsync* _sgu_gl_sync;
+typedef _sgu_gl_sync (GL_APIENTRY* _sgu_gl_fence_fn)(GLenum, unsigned int);
+typedef GLenum (GL_APIENTRY* _sgu_gl_wait_fn)(_sgu_gl_sync, unsigned int, GLuint64);
+typedef void (GL_APIENTRY* _sgu_gl_delete_fn)(_sgu_gl_sync);
+typedef void (GL_APIENTRY* _sgu_gl_flush_fn)(void);
+static _sgu_gl_fence_fn _sgu_gl_fence;
+static _sgu_gl_wait_fn _sgu_gl_wait;
+static _sgu_gl_delete_fn _sgu_gl_delete;
+static _sgu_gl_flush_fn _sgu_gl_flush;
+_SOKOL_PRIVATE void* _sgu_gl_completion_proc(const char* name, _sg_wglGetProcAddress get_proc) {
+    PROC result = get_proc(name);
+    if (!result || result == (PROC)1 || result == (PROC)2 || result == (PROC)3 || result == (PROC)-1)
+        result = GetProcAddress(_sg.gl.opengl32_dll, name);
+    return (void*)result;
+}
+_SOKOL_PRIVATE bool _sgu_gl_completion_supported(void) {
+    _sg_wglGetProcAddress get_proc;
+    if (!sg_isvalid() || !_sg.gl.opengl32_dll) return false;
+    get_proc = (_sg_wglGetProcAddress)GetProcAddress(_sg.gl.opengl32_dll, "wglGetProcAddress");
+    if (!get_proc) return false;
+    _sgu_gl_fence = (_sgu_gl_fence_fn)_sgu_gl_completion_proc("glFenceSync", get_proc);
+    _sgu_gl_wait = (_sgu_gl_wait_fn)_sgu_gl_completion_proc("glClientWaitSync", get_proc);
+    _sgu_gl_delete = (_sgu_gl_delete_fn)_sgu_gl_completion_proc("glDeleteSync", get_proc);
+    _sgu_gl_flush = (_sgu_gl_flush_fn)_sgu_gl_completion_proc("glFlush", get_proc);
+    return _sgu_gl_fence && _sgu_gl_wait && _sgu_gl_delete && _sgu_gl_flush;
+}
+#else
+typedef GLsync _sgu_gl_sync;
+#define _sgu_gl_fence glFenceSync
+#define _sgu_gl_wait glClientWaitSync
+#define _sgu_gl_delete glDeleteSync
+#define _sgu_gl_flush glFlush
+_SOKOL_PRIVATE bool _sgu_gl_completion_supported(void) { return sg_isvalid(); }
+#endif
+#ifndef GL_SYNC_GPU_COMMANDS_COMPLETE
+#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#define GL_ALREADY_SIGNALED 0x911A
+#define GL_TIMEOUT_EXPIRED 0x911B
+#define GL_CONDITION_SATISFIED 0x911C
+#endif
+typedef struct {
+    _sgu_gl_sync sync;
+} _sgu_gl_completion_t;
+
+_SOKOL_PRIVATE bool _sgu_gl_completion_make(_sgu_gl_completion_t* marker) {
+    marker->sync = 0;
+    if (_sg.cur_pass.in_pass || !_sgu_gl_completion_supported()) return false;
+    marker->sync = _sgu_gl_fence(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!marker->sync) return false;
+    /* Submit the marker once; later polls neither flush nor wait. */
+    _sgu_gl_flush();
+    return true;
+}
+
+_SOKOL_PRIVATE sg_submission_status _sgu_gl_completion_poll(const _sgu_gl_completion_t* marker) {
+    GLenum result;
+    if (!marker || !marker->sync) return SG_SUBMISSION_FAILED;
+    result = _sgu_gl_wait(marker->sync, 0, 0);
+    if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) return SG_SUBMISSION_COMPLETE;
+    if (result == GL_TIMEOUT_EXPIRED) return SG_SUBMISSION_PENDING;
+    return SG_SUBMISSION_FAILED;
+}
+
+_SOKOL_PRIVATE void _sgu_gl_completion_destroy(_sgu_gl_completion_t* marker) {
+    if (!marker) return;
+    if (marker->sync) _sgu_gl_delete(marker->sync);
+    marker->sync = 0;
+}
+#endif
+
+/* A receipt marks work already submitted to _sg.wgpu.queue, not the current
+   unfinished encoder. Call make only after sg_commit has returned. */
+#if defined(SOKOL_WGPU)
+
+#if defined(WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT) && defined(__cplusplus) && (__cplusplus >= 201103L)
+#include <atomic>
+#include <new>
+#define _SGU_WGPU_CPP_ATOMICS (1)
+#define _SGU_WGPU_COMPLETION_AVAILABLE (1)
+#elif defined(WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT) && defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L) && !defined(__STDC_NO_ATOMICS__)
+#include <stdatomic.h>
+#define _SGU_WGPU_C11_ATOMICS (1)
+#define _SGU_WGPU_COMPLETION_AVAILABLE (1)
+#elif defined(WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT) && defined(_MSC_VER)
+#include <intrin.h>
+#define _SGU_WGPU_MSVC_ATOMICS (1)
+#define _SGU_WGPU_COMPLETION_AVAILABLE (1)
+#elif defined(WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT) && (defined(__GNUC__) || defined(__clang__))
+#define _SGU_WGPU_GNU_ATOMICS (1)
+#define _SGU_WGPU_COMPLETION_AVAILABLE (1)
+#else
+#define _SGU_WGPU_COMPLETION_AVAILABLE (0)
+#endif
+
+typedef struct _sgu_wgpu_completion_state_t _sgu_wgpu_completion_state_t;
+typedef struct _sgu_wgpu_completion_t {
+    _sgu_wgpu_completion_state_t* state;
+} _sgu_wgpu_completion_t;
+
+#if _SGU_WGPU_COMPLETION_AVAILABLE
+struct _sgu_wgpu_completion_state_t {
+#if defined(_SGU_WGPU_CPP_ATOMICS)
+    std::atomic<int> references;
+    std::atomic<int> status;
+#elif defined(_SGU_WGPU_C11_ATOMICS)
+    atomic_int references;
+    atomic_int status;
+#elif defined(_SGU_WGPU_MSVC_ATOMICS)
+    volatile long references;
+    volatile long status;
+#else
+    int references;
+    int status;
+#endif
+};
+
+_SOKOL_PRIVATE void _sgu_wgpu_completion_release(_sgu_wgpu_completion_state_t* state) {
+#if defined(_SGU_WGPU_CPP_ATOMICS)
+    if (state->references.fetch_sub(1, std::memory_order_acq_rel) == 1) delete state;
+#elif defined(_SGU_WGPU_C11_ATOMICS)
+    if (atomic_fetch_sub_explicit(&state->references, 1, memory_order_acq_rel) == 1) free(state);
+#elif defined(_SGU_WGPU_MSVC_ATOMICS)
+    if (_InterlockedDecrement(&state->references) == 0) free(state);
+#else
+    if (__atomic_fetch_sub(&state->references, 1, __ATOMIC_ACQ_REL) == 1) free(state);
+#endif
+}
+
+_SOKOL_PRIVATE void _sgu_wgpu_completion_callback(WGPUQueueWorkDoneStatus status,
+    WGPUStringView message, void* userdata1, void* userdata2) {
+    (void)message;
+    (void)userdata2;
+    _sgu_wgpu_completion_state_t* state = (_sgu_wgpu_completion_state_t*)userdata1;
+    const int result = status == WGPUQueueWorkDoneStatus_Success
+        ? SG_SUBMISSION_COMPLETE : SG_SUBMISSION_FAILED;
+    /* May run on another thread or after shutdown. Touch only this callback's
+       heap state, never Sokol, WebGPU, or the common receipt manager. */
+#if defined(_SGU_WGPU_CPP_ATOMICS)
+    state->status.store(result, std::memory_order_release);
+#elif defined(_SGU_WGPU_C11_ATOMICS)
+    atomic_store_explicit(&state->status, result, memory_order_release);
+#elif defined(_SGU_WGPU_MSVC_ATOMICS)
+    _InterlockedExchange(&state->status, result);
+#else
+    __atomic_store_n(&state->status, result, __ATOMIC_RELEASE);
+#endif
+    _sgu_wgpu_completion_release(state);
+}
+#endif
+
+_SOKOL_PRIVATE bool _sgu_wgpu_completion_supported(void) {
+#if _SGU_WGPU_COMPLETION_AVAILABLE
+    return sg_isvalid() && _sg.wgpu.queue != 0;
+#else
+    return false;
+#endif
+}
+
+_SOKOL_PRIVATE bool _sgu_wgpu_completion_make(_sgu_wgpu_completion_t* out) {
+    out->state = 0;
+#if _SGU_WGPU_COMPLETION_AVAILABLE
+    if (!_sgu_wgpu_completion_supported()) return false;
+#if defined(_SGU_WGPU_CPP_ATOMICS)
+    _sgu_wgpu_completion_state_t* state = new (std::nothrow) _sgu_wgpu_completion_state_t;
+#else
+    _sgu_wgpu_completion_state_t* state = (_sgu_wgpu_completion_state_t*)malloc(sizeof(*state));
+#endif
+    if (!state) return false;
+    /* The manager and callback each own one reference. The callback may fire
+       before registration returns or long after the manager drops its ref. */
+#if defined(_SGU_WGPU_CPP_ATOMICS)
+    state->references.store(2, std::memory_order_relaxed);
+    state->status.store(SG_SUBMISSION_PENDING, std::memory_order_relaxed);
+#elif defined(_SGU_WGPU_C11_ATOMICS)
+    atomic_init(&state->references, 2);
+    atomic_init(&state->status, SG_SUBMISSION_PENDING);
+#elif defined(_SGU_WGPU_MSVC_ATOMICS)
+    state->references = 2;
+    state->status = SG_SUBMISSION_PENDING;
+#else
+    __atomic_store_n(&state->references, 2, __ATOMIC_RELAXED);
+    __atomic_store_n(&state->status, SG_SUBMISSION_PENDING, __ATOMIC_RELAXED);
+#endif
+    out->state = state;
+    WGPUQueueWorkDoneCallbackInfo info = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
+    info.mode = WGPUCallbackMode_AllowSpontaneous;
+    info.callback = _sgu_wgpu_completion_callback;
+    info.userdata1 = state;
+    /* No wait, map, extra submit, or event pump. Runtime owns the future; the
+       callback releases its reference after success, error, or cancellation. */
+    (void)wgpuQueueOnSubmittedWorkDone(_sg.wgpu.queue, info);
+    return true;
+#else
+    return false;
+#endif
+}
+
+_SOKOL_PRIVATE sg_submission_status _sgu_wgpu_completion_poll(const _sgu_wgpu_completion_t* completion) {
+#if _SGU_WGPU_COMPLETION_AVAILABLE
+    if (!completion->state) return SG_SUBMISSION_UNKNOWN;
+#if defined(_SGU_WGPU_CPP_ATOMICS)
+    return (sg_submission_status)completion->state->status.load(std::memory_order_acquire);
+#elif defined(_SGU_WGPU_C11_ATOMICS)
+    return (sg_submission_status)atomic_load_explicit(&completion->state->status, memory_order_acquire);
+#elif defined(_SGU_WGPU_MSVC_ATOMICS)
+    return (sg_submission_status)_InterlockedCompareExchange(&completion->state->status, 0, 0);
+#else
+    return (sg_submission_status)__atomic_load_n(&completion->state->status, __ATOMIC_ACQUIRE);
+#endif
+#else
+    (void)completion;
+    return SG_SUBMISSION_UNKNOWN;
+#endif
+}
+
+_SOKOL_PRIVATE void _sgu_wgpu_completion_destroy(_sgu_wgpu_completion_t* completion) {
+#if _SGU_WGPU_COMPLETION_AVAILABLE
+    if (completion->state) _sgu_wgpu_completion_release(completion->state);
+#endif
+    completion->state = 0;
+}
+
+#endif /* SOKOL_WGPU */
+
+#ifndef SG_SUBMISSION_RECEIPT_CAPACITY
+#define SG_SUBMISSION_RECEIPT_CAPACITY (64)
+#endif
+#if SG_SUBMISSION_RECEIPT_CAPACITY < 1
+#error "SG_SUBMISSION_RECEIPT_CAPACITY must be positive"
+#endif
+
+#if defined(SOKOL_METAL)
+typedef _sgu_mtl_completion_t _sgu_submission_native_t;
+#define _sgu_submission_native_make _sgu_mtl_completion_make
+#define _sgu_submission_native_poll _sgu_mtl_completion_poll
+#define _sgu_submission_native_destroy _sgu_mtl_completion_destroy
+#elif defined(SOKOL_VULKAN)
+typedef _sgu_vk_completion_t _sgu_submission_native_t;
+#define _sgu_submission_native_make _sgu_vk_completion_make
+#define _sgu_submission_native_poll _sgu_vk_completion_poll
+#define _sgu_submission_native_destroy _sgu_vk_completion_destroy
+#elif defined(SOKOL_D3D11)
+typedef _sgu_d3d11_completion_t _sgu_submission_native_t;
+#define _sgu_submission_native_make _sgu_d3d11_completion_make
+#define _sgu_submission_native_poll _sgu_d3d11_completion_poll
+#define _sgu_submission_native_destroy _sgu_d3d11_completion_destroy
+#elif defined(_SOKOL_ANY_GL)
+typedef _sgu_gl_completion_t _sgu_submission_native_t;
+#define _sgu_submission_native_make _sgu_gl_completion_make
+#define _sgu_submission_native_poll _sgu_gl_completion_poll
+#define _sgu_submission_native_destroy _sgu_gl_completion_destroy
+#elif defined(SOKOL_WGPU)
+typedef _sgu_wgpu_completion_t _sgu_submission_native_t;
+#define _sgu_submission_native_make _sgu_wgpu_completion_make
+#define _sgu_submission_native_poll _sgu_wgpu_completion_poll
+#define _sgu_submission_native_destroy _sgu_wgpu_completion_destroy
+#else
+typedef struct { int unused; } _sgu_submission_native_t;
+_SOKOL_PRIVATE bool _sgu_submission_native_make(_sgu_submission_native_t* marker) { (void)marker; return false; }
+_SOKOL_PRIVATE sg_submission_status _sgu_submission_native_poll(const _sgu_submission_native_t* marker) { (void)marker; return SG_SUBMISSION_UNKNOWN; }
+_SOKOL_PRIVATE void _sgu_submission_native_destroy(_sgu_submission_native_t* marker) { (void)marker; }
+#endif
+
+typedef struct _sgu_submission_owner_t _sgu_submission_owner_t;
+/* This prefix and payload pointer have the same layout in every backend TU.
+   A dispatcher may destroy an expired public receipt from a previous backend;
+   it must never interpret another backend's native payload. */
+struct sg_submission_receipt_t {
+    _sgu_submission_owner_t* owner;
+    uint64_t generation;
+    struct sg_submission_receipt_t* next;
+    void* native;
+    sg_submission_status status;
+    bool listed;
+    bool released;
+};
+struct _sgu_submission_owner_t {
+    sg_submission_receipt head;
+    uint64_t generation;
+    uint32_t count;
+};
+static _sgu_submission_owner_t _sgu_submission_owner;
+
+_SOKOL_PRIVATE void _sgu_submission_release_native(sg_submission_receipt receipt) {
+    if (!receipt->native) return;
+    _sgu_submission_native_destroy((_sgu_submission_native_t*)receipt->native);
+    free(receipt->native);
+    receipt->native = NULL;
+}
+_SOKOL_PRIVATE void _sgu_submission_collect(void) {
+    sg_submission_receipt* link = &_sgu_submission_owner.head;
+    while (*link) {
+        sg_submission_receipt receipt = *link;
+        if (receipt->native) {
+            receipt->status = _sgu_submission_native_poll((const _sgu_submission_native_t*)receipt->native);
+            /* Unknown does not prove an in-flight native marker is safe to destroy. */
+            if (receipt->status == SG_SUBMISSION_COMPLETE || receipt->status == SG_SUBMISSION_FAILED)
+                _sgu_submission_release_native(receipt);
+        }
+        if (receipt->released && !receipt->native) {
+            *link = receipt->next;
+            --_sgu_submission_owner.count;
+            free(receipt);
+        } else link = &receipt->next;
+    }
+}
+SOKOL_API_IMPL bool sg_submission_completion_supported(void) {
+    if (!sg_isvalid()) return false;
+#if defined(SOKOL_METAL)
+    return _sg.mtl.valid && _sg.mtl.cmd_queue;
+#elif defined(SOKOL_VULKAN)
+    return _sg.vk.valid && _sg.vk.dev && _sg.vk.queue;
+#elif defined(SOKOL_D3D11)
+    return _sg.d3d11.dev && _sg.d3d11.ctx;
+#elif defined(_SOKOL_ANY_GL)
+    return _sgu_gl_completion_supported();
+#elif defined(SOKOL_WGPU)
+    return _sgu_wgpu_completion_supported();
+#else
+    return false;
+#endif
+}
+SOKOL_API_IMPL sg_submission_receipt sg_commit_tracked(void) {
+    sg_submission_receipt receipt = NULL;
+    bool made = false;
+    if (!sg_isvalid() || _sg.cur_pass.in_pass) return NULL;
+    _sgu_submission_collect();
+    if (sg_submission_completion_supported() && _sgu_submission_owner.count < SG_SUBMISSION_RECEIPT_CAPACITY) {
+        receipt = (sg_submission_receipt)calloc(1, sizeof(*receipt));
+        if (receipt) {
+            receipt->native = calloc(1, sizeof(_sgu_submission_native_t));
+            if (!receipt->native) { free(receipt); receipt = NULL; }
+        }
+    }
+#if defined(SOKOL_METAL)
+    /* Capture the exact frame command buffer before sg_commit resets it. */
+    if (receipt) made = _sgu_submission_native_make((_sgu_submission_native_t*)receipt->native);
+#endif
+    sg_commit();
+#if !defined(SOKOL_METAL)
+    if (receipt) made = _sgu_submission_native_make((_sgu_submission_native_t*)receipt->native);
+#endif
+    if (receipt) {
+        if (!made) {
+            _sgu_submission_release_native(receipt);
+            free(receipt);
+            return NULL;
+        }
+        receipt->owner = &_sgu_submission_owner;
+        receipt->generation = _sgu_submission_owner.generation;
+        receipt->status = SG_SUBMISSION_PENDING;
+        receipt->listed = true;
+        receipt->next = _sgu_submission_owner.head;
+        _sgu_submission_owner.head = receipt;
+        ++_sgu_submission_owner.count;
+    }
+    return receipt;
+}
+SOKOL_API_IMPL sg_submission_status sg_query_submission_receipt(sg_submission_receipt receipt) {
+    if (!receipt || !receipt->listed || receipt->released || receipt->owner != &_sgu_submission_owner ||
+        receipt->generation != _sgu_submission_owner.generation || !sg_isvalid()) return SG_SUBMISSION_UNKNOWN;
+    _sgu_submission_collect();
+    return receipt->status;
+}
+SOKOL_API_IMPL void sg_destroy_submission_receipt(sg_submission_receipt receipt) {
+    if (!receipt || receipt->released) return;
+    if (!receipt->listed) { free(receipt); return; }
+    receipt->released = true;
+    /* A foreign live record stays with its original owner. Explicit shutdown
+       before a backend switch prevents that case in a correct caller. */
+    if (receipt->owner == &_sgu_submission_owner && sg_isvalid()) _sgu_submission_collect();
+}
+SOKOL_API_IMPL bool sg_shutdown_submission_receipts(void) {
+    sg_submission_receipt receipt = _sgu_submission_owner.head;
+#if defined(SOKOL_VULKAN)
+    /* Vulkan fences cannot be destroyed while their queue operations run.
+       This wait belongs only to explicit device shutdown, never polling. */
+    if (receipt && sg_isvalid()) {
+        VkResult result = vkDeviceWaitIdle(_sg.vk.dev);
+        if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) return false;
+    }
+#endif
+    while (receipt) {
+        sg_submission_receipt next = receipt->next;
+        if (sg_isvalid()) _sgu_submission_release_native(receipt);
+        else { free(receipt->native); receipt->native = NULL; }
+        receipt->listed = false;
+        receipt->next = NULL;
+        receipt->status = SG_SUBMISSION_UNKNOWN;
+        if (receipt->released) free(receipt);
+        receipt = next;
+    }
+    _sgu_submission_owner.head = NULL;
+    _sgu_submission_owner.count = 0;
+    ++_sgu_submission_owner.generation;
+    return true;
 }
 
 #endif /* SOKOL_GFX_UTILS_IMPL */

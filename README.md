@@ -126,3 +126,26 @@ counting overlap once. Devices without stage counters report only `Frame`.
 Vulkan's adapter brackets Sokol's render command buffer and resets query pools
 only after Sokol has finished the slot's earlier work. The adapter must share
 the utility implementation's translation unit to call its private helpers.
+
+### Submission completion
+
+Replace `sg_commit()` with `sg_commit_tracked()` to get an opaque
+`sg_submission_receipt`. Query it with `sg_query_submission_receipt()`; results
+are `SG_SUBMISSION_UNKNOWN`, `SG_SUBMISSION_PENDING`, `SG_SUBMISSION_COMPLETE`,
+or `SG_SUBMISSION_FAILED`. Destroy each receipt with
+`sg_destroy_submission_receipt()`, including pending receipts.
+
+Metal tracks the actual command buffer. Vulkan adds a fence on Sokol's queue;
+D3D11 uses an event query, GL/GLES a sync object, and WebGPU a queue callback.
+`sg_submission_completion_supported()` checks the current backend. Unsupported
+tracking, allocation failure, or exhausted capacity returns a null receipt;
+the tracked call still commits. `SG_SUBMISSION_RECEIPT_CAPACITY` defaults to 64.
+Completion covers this Sokol queue/context, not other queues or output validity.
+
+Call these functions on the graphics thread, outside passes. Polling and receipt
+destruction never wait. Call `sg_shutdown_submission_receipts()` before
+`sg_shutdown()` or a backend switch; Vulkan may wait during this explicit
+shutdown. If it returns `false`, Vulkan could not confirm idle: receipts stay
+intact. Retry cleanup or stop graphics teardown; do not destroy the device.
+On success, surviving receipts report unknown and still need destruction.
+WebGPU requires the modern callback API and supported atomic operations.
