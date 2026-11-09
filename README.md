@@ -1,4 +1,4 @@
-# sokol_utils
+# sokol-utils
 
 Extension utilities for the [sokol](https://github.com/floooh/sokol) headers.
 

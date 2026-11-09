@@ -1,5 +1,5 @@
 set(c_sources
-    sokol_utils_test.c
+    sokol-utils-test.c
     sokol_app_utils_test.c
     sokol_gfx_utils_test.c
 )
