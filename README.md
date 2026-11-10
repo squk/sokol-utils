@@ -65,6 +65,7 @@ bool sapp_window_visible(void);
 void sapp_set_swap_interval(int interval);
 int sapp_get_swap_interval(void);
 void sapp_set_macos_background(bool enabled);
+bool sapp_get_macos_background(void);
 sapp_swapchain sapp_acquire_swapchain_checked(void);
 ```
 

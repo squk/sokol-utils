@@ -103,6 +103,7 @@ SOKOL_APP_UTILS_API_DECL int sapp_get_swap_interval(void);
    activating the app, and keep rendering while the window is covered.
    No-op elsewhere. */
 SOKOL_APP_UTILS_API_DECL void sapp_set_macos_background(bool enabled);
+SOKOL_APP_UTILS_API_DECL bool sapp_get_macos_background(void);
 /* Use instead of sapp_acquire_swapchain() (sglue_swapchain() calls that).
    macOS+Metal: invalid while the window is covered (unless background mode is
    on) and when no drawable is free, so skip the swapchain pass. With swap
@@ -1477,6 +1478,14 @@ SOKOL_API_IMPL void sapp_set_macos_background(bool enabled) {
   _sapp_utils_macos.background = enabled;
 #else
   (void)enabled;
+#endif
+}
+
+SOKOL_API_IMPL bool sapp_get_macos_background(void) {
+#if defined(_SAPP_MACOS)
+  return _sapp_utils_macos.background;
+#else
+  return false;
 #endif
 }
 

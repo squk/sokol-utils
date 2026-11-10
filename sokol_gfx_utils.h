@@ -346,7 +346,7 @@ SOKOL_API_IMPL void sg_indirect_barrier(void) {
 
 _SOKOL_PRIVATE _sg_buffer_t* _sgu_indirect_args(sg_buffer args, int offset, int size, bool compute) {
     if (!sg_indirect_supported() || !_sg.cur_pass.valid || !_sg.cur_pass.in_pass ||
-        _sg.cur_pass.is_compute != compute || !_sg.next_draw_valid || offset < 0 || (offset & 3)) return 0;
+        _sg.cur_pass.is_compute != compute || _sg_skipdraw_any() || offset < 0 || (offset & 3)) return 0;
     _sg_buffer_t* buf = _sg_lookup_buffer(args.id);
     if (!buf || buf->slot.state != SG_RESOURCESTATE_VALID || !buf->cmn.usage.storage_buffer ||
         size > buf->cmn.size || offset > buf->cmn.size - size) return 0;
