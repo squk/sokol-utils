@@ -64,6 +64,8 @@ void sapp_set_window_visible(bool visible);
 bool sapp_window_visible(void);
 void sapp_set_swap_interval(int interval);
 int sapp_get_swap_interval(void);
+void sapp_set_macos_background(bool enabled);
+sapp_swapchain sapp_acquire_swapchain_checked(void);
 ```
 
 *Note: Most of these functions are only supported on desktop platforms (Windows, macOS, Linux).*
@@ -76,6 +78,16 @@ outside the content area, movement without capture stops at leave, and the
 absolute position remains frozen while the mouse is locked. A warp is reflected
 by the getter when Sokol receives the resulting native mouse event. Setting the
 position while the mouse is locked, or on an unsupported platform, is a no-op.
+
+On macOS, sokol-utils runs frames from its own timer when the swap interval is
+0 or the program runs without an app bundle. CADisplayLink cannot run
+unthrottled, and AppKit does not schedule it for command-line launches. It
+replaces methods of sokol_app.h's private classes when the program loads.
+`sapp_acquire_swapchain_checked()` returns an invalid swapchain while the window
+is covered or no drawable is free; call it instead of `sapp_acquire_swapchain()`
+(which `sglue_swapchain()` uses). `sapp_set_macos_background(true)` before
+`sapp_run()` opens the window behind other windows without activating the app
+and keeps rendering while it is covered.
 
 ### sokol_gfx_utils.h
 

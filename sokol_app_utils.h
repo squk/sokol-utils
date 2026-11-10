@@ -99,6 +99,17 @@ SOKOL_APP_UTILS_API_DECL bool sapp_window_visible(void);
 SOKOL_APP_UTILS_API_DECL void sapp_set_swap_interval(int interval);
 /* get the current swap interval */
 SOKOL_APP_UTILS_API_DECL int sapp_get_swap_interval(void);
+/* macOS, before sapp_run(): open the window behind other windows without
+   activating the app, and keep rendering while the window is covered.
+   No-op elsewhere. */
+SOKOL_APP_UTILS_API_DECL void sapp_set_macos_background(bool enabled);
+/* Use instead of sapp_acquire_swapchain() (sglue_swapchain() calls that).
+   macOS+Metal: invalid while the window is covered (unless background mode is
+   on) and when no drawable is free, so skip the swapchain pass. With swap
+   interval 0, sapp_acquire_swapchain() does not see the covered window and
+   asserts when nextDrawable times out. Elsewhere this calls
+   sapp_acquire_swapchain(). Call once per frame. */
+SOKOL_APP_UTILS_API_DECL sapp_swapchain sapp_acquire_swapchain_checked(void);
 
 #ifdef __cplusplus
 } /* extern "C" */
@@ -299,47 +310,144 @@ _SOKOL_PRIVATE const char* _sapp_macos_display_name(int index) {
   return "";
 }
 
+/* Frame driving, swapchain acquisition and background launch.
+
+   sokol_app.h runs macOS frames from CADisplayLink, and from a 60 Hz NSTimer
+   (mtl.obscured_timer) while the window is covered. sokol-utils runs frames
+   from its own dispatch timer instead in two cases:
+   - swap interval 0: frames run unthrottled.
+   - command-line launches (no bundle identifier): AppKit does not schedule
+     the CADisplayLink, so frames run at 60 Hz.
+   While sokol-utils owns frames, the display link stays paused (so sokol's
+   timing does not read its timestamps) and the hooked view callbacks do
+   nothing.
+
+   The hooks replace methods of sokol_app.h's private classes when the program
+   loads (_sapp_utils_macos_install_hooks). */
+#include <objc/message.h>
+#include <objc/runtime.h>
+
+static struct {
+    bool background;        /* sapp_set_macos_background() */
+    bool launch_started;    /* applicationDidFinishLaunching ran */
+    IMP did_finish_launching;
+#if defined(SOKOL_METAL)
+    IMP display_link_fired;
+    IMP obscured_timer_fired;
+    dispatch_source_t frame_timer;
+#endif
+} _sapp_utils_macos;
+
+_SOKOL_PRIVATE bool _sapp_utils_macos_command_line_launch(void) {
+    return nil == NSBundle.mainBundle.bundleIdentifier;
+}
+
+_SOKOL_PRIVATE bool _sapp_utils_macos_window_hidden(void) {
+    NSWindow* window = _sapp.macos.window;
+    return (nil == window) || !(window.occlusionState & NSWindowOcclusionStateVisible);
+}
+
+#if defined(SOKOL_METAL)
+_SOKOL_PRIVATE bool _sapp_utils_macos_owns_frames(void) {
+    return _sapp_utils_macos.launch_started &&
+        (_sapp_utils_macos_command_line_launch() || (0 == _sapp.desc.swap_interval));
+}
+
+_SOKOL_PRIVATE void _sapp_utils_macos_stop_frame_timer(void) {
+    if (_sapp_utils_macos.frame_timer) {
+        dispatch_source_cancel(_sapp_utils_macos.frame_timer);
+#if !__has_feature(objc_arc)
+        dispatch_release(_sapp_utils_macos.frame_timer);
+#endif
+        _sapp_utils_macos.frame_timer = nil;
+    }
+}
+
+_SOKOL_PRIVATE void _sapp_utils_macos_frame_tick(void) {
+    if (!_sapp.valid || !_sapp_utils_macos_owns_frames()) {
+        return;
+    }
+    /* sokol_app.h unpauses the link when the window becomes visible. */
+    if (_sapp.mtl.display_link && !_sapp.mtl.display_link.paused) {
+        _sapp.mtl.display_link.paused = YES;
+    }
+    _sapp_macos_frame();
+}
+
+_SOKOL_PRIVATE void _sapp_utils_macos_set_link_rate(int interval) {
+    if (![_sapp.mtl.display_link respondsToSelector:@selector(setPreferredFrameRateRange:)]) {
+        return;
+    }
+    NSScreen* screen = _sapp.macos.window ? _sapp.macos.window.screen : nil;
+    const NSInteger max_fps = (screen ? screen : [NSScreen mainScreen]).maximumFramesPerSecond;
+    const float fps = (float)max_fps / (float)interval;
+    const CAFrameRateRange range = { fps, fps, fps };
+    _sapp.mtl.display_link.preferredFrameRateRange = range;
+}
+
+/* Chooses who runs frames after launch and after swap interval changes. */
+_SOKOL_PRIVATE void _sapp_utils_macos_update_frame_driver(void) {
+    _sapp_utils_macos_stop_frame_timer();
+    if (!_sapp_utils_macos.launch_started) {
+        return;
+    }
+    const int interval = _sapp.desc.swap_interval;
+    if (_sapp_utils_macos_owns_frames()) {
+        _sapp_macos_mtl_stop_display_link();
+        _sapp_macos_mtl_stop_obscured_timer();
+        const uint64_t period = (0 == interval)
+            ? 100 * NSEC_PER_USEC
+            : (uint64_t)(_SAPP_MACOS_MTL_OBSCURED_FRAME_DURATION_IN_SECONDS * NSEC_PER_SEC);
+        const uint64_t leeway = (0 == interval) ? period : 0;
+        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, period, leeway);
+        dispatch_source_set_event_handler(timer, ^{
+            _sapp_utils_macos_frame_tick();
+        });
+        dispatch_resume(timer);
+        _sapp_utils_macos.frame_timer = timer;
+        return;
+    }
+    /* Hand frames back to sokol_app.h in the state its visibility handlers
+       expect: the display link while visible, the obscured timer while
+       covered. */
+    if (nil == _sapp.mtl.display_link) {
+        return;
+    }
+    if (_sapp_utils_macos_window_hidden()) {
+        _sapp_macos_mtl_stop_display_link();
+        if (nil == _sapp.mtl.obscured_timer) {
+            _sapp_macos_mtl_start_obscured_timer();
+        }
+    } else {
+        _sapp_macos_mtl_stop_obscured_timer();
+        _sapp_utils_macos_set_link_rate(interval);
+        _sapp.mtl.display_link.paused = NO;
+    }
+}
+
+_SOKOL_PRIVATE void _sapp_utils_macos_display_link_fired(id self, SEL cmd, id sender) {
+    if (!_sapp_utils_macos_owns_frames()) {
+        ((void (*)(id, SEL, id))_sapp_utils_macos.display_link_fired)(self, cmd, sender);
+    }
+}
+
+_SOKOL_PRIVATE void _sapp_utils_macos_obscured_timer_fired(id self, SEL cmd, NSTimer* timer) {
+    if (!_sapp_utils_macos_owns_frames()) {
+        ((void (*)(id, SEL, NSTimer*))_sapp_utils_macos.obscured_timer_fired)(self, cmd, timer);
+    }
+}
+#endif /* SOKOL_METAL */
+
 _SOKOL_PRIVATE void _sapp_macos_set_swap_interval(int interval) {
     _sapp.desc.swap_interval = interval;
     #if defined(SOKOL_METAL)
-    static dispatch_source_t _sapp_macos_unthrottled_timer = nil;
     if (_sapp.mtl.layer) {
         if ([_sapp.mtl.layer respondsToSelector:@selector(setDisplaySyncEnabled:)]) {
             [_sapp.mtl.layer setDisplaySyncEnabled:(interval > 0)];
         }
     }
-    if (_sapp_macos_unthrottled_timer) {
-        dispatch_source_cancel(_sapp_macos_unthrottled_timer);
-        _sapp_macos_unthrottled_timer = nil;
-    }
-    if (interval == 0) {
-        if (_sapp.mtl.display_link) {
-            [_sapp.mtl.display_link setPaused:YES];
-        }
-        _sapp_macos_unthrottled_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-        dispatch_source_set_timer(_sapp_macos_unthrottled_timer, DISPATCH_TIME_NOW, 100 * NSEC_PER_USEC, 100 * NSEC_PER_USEC);
-        dispatch_source_set_event_handler(_sapp_macos_unthrottled_timer, ^{
-            [_sapp.macos.view displayLinkFired:nil];
-        });
-        dispatch_resume(_sapp_macos_unthrottled_timer);
-    } else {
-        // Keep the timer frame driver active for obscured windows and direct
-        // launches. Their paused display link must not supply frame timing.
-        if (_sapp.mtl.display_link && nil == _sapp.mtl.obscured_timer) {
-            [_sapp.mtl.display_link setPaused:NO];
-            if ([_sapp.mtl.display_link respondsToSelector:@selector(setPreferredFrameRateRange:)]) {
-                NSInteger max_fps = 60;
-                if (_sapp.macos.window) {
-                    max_fps = [[_sapp.macos.window screen] maximumFramesPerSecond];
-                } else {
-                    max_fps = [[NSScreen mainScreen] maximumFramesPerSecond];
-                }
-                const float preferred_fps = (float)max_fps / (float)interval;
-                CAFrameRateRange frame_rate_range = { preferred_fps, preferred_fps, preferred_fps };
-                _sapp.mtl.display_link.preferredFrameRateRange = frame_rate_range;
-            }
-        }
-    }
+    _sapp_utils_macos_update_frame_driver();
     #endif
     #if defined(SOKOL_GLCORE)
     if (_sapp.macos.view) {
@@ -351,6 +459,119 @@ _SOKOL_PRIVATE void _sapp_macos_set_swap_interval(int interval) {
     }
     #endif
 }
+
+/* Copy of applicationDidFinishLaunching in sokol_app.h. It orders the window
+   behind other windows instead of activating the app, and does not post
+   sokol's focus event. Keep it in sync when updating sokol_app.h. */
+_SOKOL_PRIVATE void _sapp_utils_macos_finish_launching_in_background(id delegate) {
+    NSApp.activationPolicy = NSApplicationActivationPolicyRegular;
+    _sapp_macos_init_cursors();
+    if ((_sapp.window_width == 0) || (_sapp.window_height == 0)) {
+        _sapp_macos_init_default_dimensions();
+    }
+    const NSUInteger style =
+        NSWindowStyleMaskTitled |
+        NSWindowStyleMaskClosable |
+        NSWindowStyleMaskMiniaturizable |
+        NSWindowStyleMaskResizable;
+    NSRect window_rect = NSMakeRect(0, 0, _sapp.window_width, _sapp.window_height);
+    _sapp.macos.window = [[_sapp_macos_window alloc]
+        initWithContentRect:window_rect
+        styleMask:style
+        backing:NSBackingStoreBuffered
+        defer:NO];
+    _sapp.macos.window.releasedWhenClosed = NO;
+    _sapp.macos.window.title = [NSString stringWithUTF8String:_sapp.window_title];
+    _sapp.macos.window.acceptsMouseMovedEvents = YES;
+    _sapp.macos.window.restorable = YES;
+    if (_sapp.desc.composite_mode != SAPP_COMPOSITEMODE_OPAQUE) {
+        _sapp.macos.window.opaque = NO;
+        _sapp.macos.window.backgroundColor = [NSColor clearColor];
+        _sapp.macos.window.hasShadow = NO;
+    }
+    _sapp.macos.win_dlg = [[_sapp_macos_window_delegate alloc] init];
+    _sapp.macos.window.delegate = _sapp.macos.win_dlg;
+    #if defined(SOKOL_METAL)
+        _sapp_macos_mtl_init();
+    #elif defined(SOKOL_GLCORE)
+        _sapp_macos_gl_init(window_rect);
+    #elif defined(SOKOL_WGPU)
+        _sapp_macos_wgpu_init();
+    #endif
+    _sapp.macos.window.contentView = _sapp.macos.view;
+    [_sapp.macos.window makeFirstResponder:_sapp.macos.view];
+    [_sapp.macos.window center];
+    _sapp.valid = true;
+    if (_sapp.fullscreen) {
+        [_sapp.macos.window toggleFullScreen:delegate];
+    }
+    [_sapp.macos.window orderBack:nil];
+    _sapp_macos_update_dimensions();
+}
+
+_SOKOL_PRIVATE void _sapp_utils_macos_did_finish_launching(id self, SEL cmd, NSNotification* notification) {
+    /* AppKit and the command-line fallback can both deliver launch. */
+    if (_sapp_utils_macos.launch_started) {
+        return;
+    }
+    _sapp_utils_macos.launch_started = true;
+    /* sokol_app.h divides by the swap interval when it creates the display
+       link. Only sapp_set_swap_interval(0) before launch makes it zero. */
+    const int swap_interval = _sapp.desc.swap_interval;
+    if (0 == swap_interval) {
+        _sapp.desc.swap_interval = 1;
+    }
+    if (_sapp_utils_macos.background) {
+        _sapp_utils_macos_finish_launching_in_background(self);
+    } else {
+        ((void (*)(id, SEL, NSNotification*))_sapp_utils_macos.did_finish_launching)(self, cmd, notification);
+    }
+    #if defined(SOKOL_METAL)
+    if (0 == swap_interval) {
+        _sapp_macos_set_swap_interval(0);
+    } else if (_sapp_utils_macos_owns_frames()) {
+        _sapp_utils_macos_update_frame_driver();
+    }
+    #else
+    _sapp.desc.swap_interval = swap_interval;
+    #endif
+}
+
+/* Command-line launches are not guaranteed to receive
+   applicationDidFinishLaunching. sokol_app.h creates its delegate just before
+   [NSApp run], so the delegate's init queues a fallback launch. */
+_SOKOL_PRIVATE id _sapp_utils_macos_app_delegate_init(id self, SEL cmd) {
+    struct objc_super super_info = { self, class_getSuperclass([_sapp_macos_app_delegate class]) };
+    self = ((id (*)(struct objc_super*, SEL))objc_msgSendSuper)(&super_info, cmd);
+    if (self && _sapp_utils_macos_command_line_launch()) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!_sapp_utils_macos.launch_started) {
+                NSNotification* notification = [NSNotification
+                    notificationWithName:NSApplicationDidFinishLaunchingNotification object:NSApp];
+                [_sapp.macos.app_dlg applicationDidFinishLaunching:notification];
+            }
+        });
+    }
+    return self;
+}
+
+__attribute__((constructor)) static void _sapp_utils_macos_install_hooks(void) {
+    Class delegate_class = [_sapp_macos_app_delegate class];
+    Method did_finish = class_getInstanceMethod(delegate_class, @selector(applicationDidFinishLaunching:));
+    _sapp_utils_macos.did_finish_launching =
+        method_setImplementation(did_finish, (IMP)_sapp_utils_macos_did_finish_launching);
+    class_addMethod(delegate_class, @selector(init), (IMP)_sapp_utils_macos_app_delegate_init, "@@:");
+    #if defined(SOKOL_METAL)
+    Class view_class = [_sapp_macos_view class];
+    Method link_fired = class_getInstanceMethod(view_class, @selector(displayLinkFired:));
+    _sapp_utils_macos.display_link_fired =
+        method_setImplementation(link_fired, (IMP)_sapp_utils_macos_display_link_fired);
+    Method timer_fired = class_getInstanceMethod(view_class, @selector(obscuredTimerFired:));
+    _sapp_utils_macos.obscured_timer_fired =
+        method_setImplementation(timer_fired, (IMP)_sapp_utils_macos_obscured_timer_fired);
+    #endif
+}
+
 /* window style and visibility */
 static bool _sapp_utils_resizable = true;
 static bool _sapp_utils_decorated = true;
@@ -1249,6 +1470,42 @@ SOKOL_API_IMPL void sapp_set_swap_interval(int interval) {
 
 SOKOL_API_IMPL int sapp_get_swap_interval(void) {
   return _sapp.desc.swap_interval;
+}
+
+SOKOL_API_IMPL void sapp_set_macos_background(bool enabled) {
+#if defined(_SAPP_MACOS)
+  _sapp_utils_macos.background = enabled;
+#else
+  (void)enabled;
+#endif
+}
+
+SOKOL_API_IMPL sapp_swapchain sapp_acquire_swapchain_checked(void) {
+#if defined(_SAPP_MACOS) && defined(SOKOL_METAL)
+  SOKOL_ASSERT(_sapp.valid);
+  _SAPP_STRUCT(sapp_swapchain, res);
+  /* nextDrawable can wait up to a second on a covered window. */
+  if (!_sapp_utils_macos.background && _sapp_utils_macos_window_hidden()) {
+    res.invalid = true;
+    return res;
+  }
+  id<CAMetalDrawable> drawable = [_sapp.mtl.layer nextDrawable];
+  if (nil == drawable) {
+    res.invalid = true;
+    return res;
+  }
+  res.metal.current_drawable = (__bridge const void*) drawable;
+  res.metal.depth_stencil_texture = (__bridge const void*) _sapp.mtl.depth_tex;
+  res.metal.msaa_color_texture = (__bridge const void*) _sapp.mtl.msaa_tex;
+  res.width = sapp_width();
+  res.height = sapp_height();
+  res.color_format = sapp_color_format();
+  res.depth_format = sapp_depth_format();
+  res.sample_count = sapp_sample_count();
+  return res;
+#else
+  return sapp_acquire_swapchain();
+#endif
 }
 
 #endif /* SOKOL_APP_UTILS_IMPL */
