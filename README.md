@@ -204,12 +204,25 @@ frames that can use the structure. Call these functions on the sokol_gfx
 thread. Call `sg_accel_shutdown` after `sg_shutdown`, with the native device
 alive.
 
+Builds share one grow-only scratch buffer per frame in flight. The mask of an
+instance must be non-zero (`0xFF` hits always). `sg_make_blas` needs both
+buffers valid, and index values are not range checked. The index offset is a
+multiple of the index size. `sg_make_blas` and `sg_make_tlas` return NULL when
+the structure exceeds a Vulkan device limit. `sg_destroy_accel` after
+`sg_accel_shutdown` does nothing: destroy every structure first.
+
 `sg_accel_bind(tlas, slot)` uses the slot sokol-slang reflects (0..3). On Metal
 it sets `[[buffer(16 + slot)]]` on the compute encoder and marks the TLAS and
-its BLASes resident. On Vulkan, sokol_gfx does not know the binding: create the
-shader with `sg_make_shader_accel(desc, slot_mask)`, which adds set 1 binding
-`44 + slot` to its layout, and call `sg_accel_bind` after each
-`sg_apply_bindings` in the compute pass.
+its BLASes resident; call it in every compute pass that traces. sokol-slang
+uses buffers 0..15 for uniform blocks and storage buffers, so 16..19 is free;
+`sg_make_shader_accel` rejects a shader with a storage buffer there. On Vulkan,
+sokol_gfx does not know the binding: create the shader with
+`sg_make_shader_accel(desc, slot_mask)`, which adds set 1 binding `44 + slot`
+(`SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS`) to its layout, and call
+`sg_accel_bind` after each `sg_apply_bindings` in the compute pass. A shader
+with no views or samplers gets its own descriptor chunk. Otherwise
+`sg_accel_bind` writes into the chunk of the last `sg_apply_bindings`: no
+`sg_dispatch` or `sg_apply_uniforms` may sit between the two calls.
 
 Vulkan device setup: the application creates the `VkDevice` and must enable the
 extensions `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and
@@ -217,5 +230,6 @@ extensions `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and
 `VkPhysicalDeviceAccelerationStructureFeaturesKHR::accelerationStructure` and
 `VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery`, besides `bufferDeviceAddress`
 and descriptor buffers that sokol_gfx already needs. `sg_ray_query_supported`
-checks the GPU and entry points; it cannot see which features the application
-enabled.
+checks that the GPU lists the extensions, offers the features and that the entry
+points load; it cannot see what the application enabled, so the application
+must enable them whenever the GPU offers them.

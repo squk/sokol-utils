@@ -5,9 +5,9 @@
 
 void use_gfx_utils(void) {
     sg_readback_request((sg_image){0});
-    sg_blas_desc blas_desc = {0};
-    sg_tlas_desc tlas_desc = {0};
-    sg_accel_instance instance = {0};
+    sg_blas_desc blas_desc = {};
+    sg_tlas_desc tlas_desc = {};
+    sg_accel_instance instance = {};
     sg_accel blas = sg_make_blas(&blas_desc);
     sg_accel tlas = sg_make_tlas(&tlas_desc);
     sg_build_blas(blas);
