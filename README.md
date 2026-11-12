@@ -179,7 +179,7 @@ bool sg_build_blas(sg_accel blas);
 bool sg_refit_blas(sg_accel blas);
 bool sg_build_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
 bool sg_refit_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
-sg_shader sg_make_shader_accel(const sg_shader_desc* desc, int slot_mask);
+sg_shader sg_make_shader_accel(const sg_shader_desc* desc, const sg_accel_layout_desc* layout);
 bool sg_accel_bind(sg_accel tlas, int slot);
 void sg_destroy_accel(sg_accel accel);
 void sg_accel_shutdown(void);
@@ -211,14 +211,24 @@ multiple of the index size. `sg_make_blas` and `sg_make_tlas` return NULL when
 the structure exceeds a Vulkan device limit. `sg_destroy_accel` after
 `sg_accel_shutdown` does nothing: destroy every structure first.
 
-`sg_accel_bind(tlas, slot)` uses the slot sokol-slang reflects (0..3). On Metal
-it sets `[[buffer(16 + slot)]]` on the compute encoder and marks the TLAS and
-its BLASes resident; call it in every compute pass that traces. sokol-slang
-uses buffers 0..15 for uniform blocks and storage buffers, so 16..19 is free;
-`sg_make_shader_accel` rejects a shader with a storage buffer there. On Vulkan,
-sokol_gfx does not know the binding: create the shader with
-`sg_make_shader_accel(desc, slot_mask)`, which adds set 1 binding `44 + slot`
-(`SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS`) to its layout, and call
+The shader compiler (sokol-slang) decides where each acceleration structure slot
+(0..`SG_ACCEL_MAX_SLOTS - 1`) lives and writes `msl_buffer_n` and
+`spirv_set1_binding_n` per slot into its reflection data. Pass those numbers to
+`sg_make_shader_accel` in an `sg_accel_layout_desc` (`num_slots` and one
+`sg_accel_slot_layout` of `slot`, `msl_buffer_n`, `vk_binding_n` each; use -1
+for a backend the shader does not target). The runtime assumes no index. It logs
+and returns an invalid shader when a slot or index repeats or is out of range,
+when a Metal index equals a uniform block or storage buffer index, or when a
+Vulkan binding equals a view or sampler binding or lies below
+`SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS` (a sign that compiler and
+runtime use different `sokol_gfx.h` versions). It keeps the layout until the
+shader is destroyed.
+
+`sg_accel_bind(tlas, slot)` uses the recorded numbers. On Metal it sets
+the structure at the recorded `[[buffer(n)]]` on the compute encoder and marks
+the TLAS and its BLASes resident; call it in every compute pass that traces. On
+Vulkan, sokol_gfx does not know the binding: `sg_make_shader_accel` adds it to
+the set 1 layout, and call
 `sg_accel_bind` after each `sg_apply_bindings` in the compute pass. A shader
 with no views or samplers gets its own descriptor chunk. Otherwise
 `sg_accel_bind` writes into the chunk of the last `sg_apply_bindings`: no

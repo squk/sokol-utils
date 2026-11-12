@@ -217,19 +217,32 @@ SOKOL_GFX_UTILS_API_DECL bool sg_shutdown_submission_receipts(void);
 
     Binding. sokol_gfx has no acceleration structure bind slot type. sokol-slang
     reflects acceleration structures of compute shaders as a separate slot
-    namespace 0..3 (ShaderReflection acceleration_structure_slot). Its native
-    index is Metal buffer 16 + slot and Vulkan set 1 binding 44 + slot.
-    - Metal: sg_accel_bind(tlas, slot) sets [[buffer(16 + slot)]] on the compute
-      encoder and marks the TLAS and its BLASes resident. Metal keeps no
-      binding across encoders: call it in every compute pass that traces.
-      sokol-slang puts storage buffers at [[buffer(8..15)]] (at most 8 per
-      stage), so 16..19 is free. sokol_gfx itself accepts storage buffers at
-      8..22, so sg_make_shader_accel rejects a hand-written shader whose
-      storage buffer uses 16..19.
+    namespace 0..SG_ACCEL_MAX_SLOTS-1 (ShaderReflection acceleration_structure_slot)
+    and writes the native index of each slot per shader (msl_buffer_n and
+    spirv_set1_binding_n of its reflection data). The runtime assumes no index:
+    pass those numbers in an sg_accel_layout_desc to sg_make_shader_accel, which
+    records them per shader until the shader is destroyed. sg_accel_bind uses
+    the recorded numbers.
+    sg_make_shader_accel logs and returns an invalid shader when:
+    - a slot is repeated or not below SG_ACCEL_MAX_SLOTS, or num_slots is out of
+      range;
+    - Metal: an msl_buffer_n is negative, above 30, repeated, or equal to the
+      msl_buffer_n of a uniform block or storage buffer of the shader;
+    - Vulkan: a vk_binding_n is negative, repeated, or equal to the binding of a
+      view or sampler of the shader. It must also be at least
+      SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS of the sokol_gfx.h that
+      this header is built with. A smaller number means the shader compiler
+      and the runtime were built against different sokol_gfx.h versions; the
+      error names both numbers.
+    This header targets the sokol_gfx.h that goBot vendors (it reads
+    _sg_skipdraw_any), not older sokol versions.
+    - Metal: sg_accel_bind(tlas, slot) sets the structure at the recorded
+      [[buffer(n)]] on the compute encoder and marks the TLAS and its BLASes
+      resident. Metal keeps no binding across encoders: call it in every
+      compute pass that traces.
     - Vulkan: sokol_gfx builds the set 1 layout without that binding, so the
-      shader must come from sg_make_shader_accel. It adds the bindings to the
-      layout. The base 44 is SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS,
-      so it never meets a view or sampler binding.
+      shader must come from sg_make_shader_accel. It adds the recorded
+      bindings to the layout.
       sg_accel_bind writes the TLAS descriptor into a descriptor buffer chunk:
       * For a shader without views and samplers it allocates and binds its own
         chunk, so no sg_apply_bindings is needed.
@@ -307,13 +320,30 @@ SOKOL_GFX_UTILS_API_DECL bool sg_refit_blas(sg_accel blas);
 SOKOL_GFX_UTILS_API_DECL bool sg_build_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
 SOKOL_GFX_UTILS_API_DECL bool sg_refit_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
 SOKOL_GFX_UTILS_API_DECL bool sg_accel_built(sg_accel accel);
-/* Like sg_make_shader. slot_mask has one bit per acceleration structure slot
-   (0..3) the compute shader uses. Vulkan needs it (see above), other backends
-   ignore it. */
-SOKOL_GFX_UTILS_API_DECL sg_shader sg_make_shader_accel(const sg_shader_desc* desc, int slot_mask);
-/* slot is 0..3. Returns false outside a compute pass, when the TLAS is not
-   built, when the shader was not made for this slot with sg_make_shader_accel,
-   or (Vulkan) when the last sg_apply_bindings failed. */
+#define SG_ACCEL_MAX_SLOTS (4)
+
+/* Where one acceleration structure slot sits in a shader. The shader compiler
+   decides these numbers and writes them into its reflection data. Pass them
+   unchanged. Set the field of a backend the shader does not target to -1. */
+typedef struct sg_accel_slot_layout {
+    uint8_t slot;       /* acceleration structure slot index, < SG_ACCEL_MAX_SLOTS */
+    int msl_buffer_n;   /* Metal: [[buffer(n)]] index the shader reads the structure from; -1 when unused */
+    int vk_binding_n;   /* Vulkan: binding number in descriptor set 1; -1 when unused */
+} sg_accel_slot_layout;
+
+typedef struct sg_accel_layout_desc {
+    int num_slots;      /* 0..SG_ACCEL_MAX_SLOTS */
+    sg_accel_slot_layout slots[SG_ACCEL_MAX_SLOTS];
+} sg_accel_layout_desc;
+
+/* Like sg_make_shader. layout lists the acceleration structure slots the
+   compute shader uses (NULL means none). On failure it logs the cause through
+   the sokol logger and returns an invalid shader. See the Binding contract
+   above for the checks. The layout is copied. */
+SOKOL_GFX_UTILS_API_DECL sg_shader sg_make_shader_accel(const sg_shader_desc* desc, const sg_accel_layout_desc* layout);
+/* slot is 0..SG_ACCEL_MAX_SLOTS-1. Returns false outside a compute pass, when
+   the TLAS is not built, when the shader was not made for this slot with
+   sg_make_shader_accel, or (Vulkan) when the last sg_apply_bindings failed. */
 SOKOL_GFX_UTILS_API_DECL bool sg_accel_bind(sg_accel tlas, int slot);
 SOKOL_GFX_UTILS_API_DECL void sg_accel_shutdown(void);
 
@@ -329,6 +359,8 @@ SOKOL_GFX_UTILS_API_DECL void sg_accel_shutdown(void);
 
 #include <stdlib.h> // malloc, free
 #include <string.h> // memcpy
+#include <stdarg.h> // va_list, for the accel layout error messages
+#include <stdio.h>  // vsnprintf
 
 #ifndef GFX_READBACK_TIMEOUT_MS
 #define GFX_READBACK_TIMEOUT_MS (2000)
@@ -2373,6 +2405,73 @@ _SOKOL_PRIVATE int _sgu_accel_triangle_count(const sg_accel blas) {
     return (blas->blas.index_format == SG_ACCEL_INDEXFORMAT_NONE ? blas->blas.vertex_count : blas->blas.index_count) / 3;
 }
 
+/* Sends an error to the sokol logger of sg_setup. sokol_gfx has no log item for
+   these messages, so item 0 carries the text. */
+_SOKOL_PRIVATE void _sgu_accel_log(const char* fmt, ...) {
+    if (!_sg.desc.logger.func) return;
+    char msg[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+    _sg.desc.logger.func("sg_gfx_utils", 1, 0, msg, 0, 0, _sg.desc.logger.user_data);
+}
+
+/* The layouts that sg_make_shader_accel recorded, one entry per shader. Vulkan
+   and Metal read them in sg_accel_bind. Entries of destroyed shaders are
+   dropped on the next add. */
+#define _SGU_ACCEL_MAX_SHADERS (64)
+static struct {
+    uint32_t id[_SGU_ACCEL_MAX_SHADERS];
+    sg_accel_layout_desc layout[_SGU_ACCEL_MAX_SHADERS];
+    int count;
+} _sgu_accel_shaders;
+
+_SOKOL_PRIVATE void _sgu_accel_prune_shaders(void) {
+    int keep = 0;
+    for (int i = 0; i < _sgu_accel_shaders.count; i++) {
+        if (!_sg_lookup_shader(_sgu_accel_shaders.id[i])) continue;
+        _sgu_accel_shaders.id[keep] = _sgu_accel_shaders.id[i];
+        _sgu_accel_shaders.layout[keep] = _sgu_accel_shaders.layout[i];
+        keep++;
+    }
+    _sgu_accel_shaders.count = keep;
+}
+
+/* Returns the recorded layout of a slot of a shader, or 0 if there is none. */
+_SOKOL_PRIVATE const sg_accel_slot_layout* _sgu_accel_find_slot(uint32_t shader_id, int slot) {
+    for (int i = 0; i < _sgu_accel_shaders.count; i++) {
+        if (_sgu_accel_shaders.id[i] != shader_id) continue;
+        const sg_accel_layout_desc* layout = &_sgu_accel_shaders.layout[i];
+        for (int j = 0; j < layout->num_slots; j++) {
+            if (layout->slots[j].slot == slot) return &layout->slots[j];
+        }
+    }
+    return 0;
+}
+
+/* Checks what does not depend on the backend. */
+_SOKOL_PRIVATE bool _sgu_accel_validate_slots(const sg_accel_layout_desc* layout) {
+    if (layout->num_slots < 0 || layout->num_slots > SG_ACCEL_MAX_SLOTS) {
+        _sgu_accel_log("sg_make_shader_accel: num_slots %d is not in 0..%d", layout->num_slots, SG_ACCEL_MAX_SLOTS);
+        return false;
+    }
+    for (int i = 0; i < layout->num_slots; i++) {
+        const int slot = layout->slots[i].slot;
+        if (slot >= SG_ACCEL_MAX_SLOTS) {
+            _sgu_accel_log("sg_make_shader_accel: slot %d is not below %d", slot, SG_ACCEL_MAX_SLOTS);
+            return false;
+        }
+        for (int j = 0; j < i; j++) {
+            if (layout->slots[j].slot == slot) {
+                _sgu_accel_log("sg_make_shader_accel: slot %d is listed twice", slot);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /*--- Acceleration Structures: Vulkan ----------------------------------------*/
 #if defined(SOKOL_VULKAN)
 
@@ -2748,48 +2847,68 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_record(sg_accel a, const sg_accel_instance* in
     return true;
 }
 
-/* Shaders whose set 1 layout got acceleration structure bindings. */
-#define _SGU_VK_ACCEL_BINDING_BASE (SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS)
-#define _SGU_VK_ACCEL_MAX_SHADERS (64)
-/* sokol-slang and the shader loader of goBot hardcode 44. */
-typedef char _sgu_vk_accel_binding_base_is_44[(_SGU_VK_ACCEL_BINDING_BASE == 44) ? 1 : -1];
-static struct {
-    uint32_t id[_SGU_VK_ACCEL_MAX_SHADERS];
-    int mask[_SGU_VK_ACCEL_MAX_SHADERS];
-    int count;
-} _sgu_vk_accel_shaders;
-
-/* Drops table entries of destroyed shaders. */
-_SOKOL_PRIVATE void _sgu_vk_accel_prune_shaders(void) {
-    int keep = 0;
-    for (int i = 0; i < _sgu_vk_accel_shaders.count; i++) {
-        if (!_sg_lookup_shader(_sgu_vk_accel_shaders.id[i])) continue;
-        _sgu_vk_accel_shaders.id[keep] = _sgu_vk_accel_shaders.id[i];
-        _sgu_vk_accel_shaders.mask[keep] = _sgu_vk_accel_shaders.mask[i];
-        keep++;
+/* Checks the Vulkan binding numbers of a layout against the shader desc. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_validate(const sg_shader_desc* desc, const sg_accel_layout_desc* layout) {
+    const int floor_n = SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS;
+    for (int i = 0; i < layout->num_slots; i++) {
+        const int n = layout->slots[i].vk_binding_n;
+        if (n < 0) {
+            _sgu_accel_log("sg_make_shader_accel: slot %d has no Vulkan binding (vk_binding_n %d)", layout->slots[i].slot, n);
+            return false;
+        }
+        if (n < floor_n) {
+            _sgu_accel_log("sg_make_shader_accel: slot %d vk_binding_n %d is below %d (SG_MAX_VIEW_BINDSLOTS + "
+                "SG_MAX_SAMPLER_BINDSLOTS of this runtime). The shader compiler and the runtime use different "
+                "sokol_gfx.h versions", layout->slots[i].slot, n, floor_n);
+            return false;
+        }
+        for (int j = 0; j < i; j++) {
+            if (layout->slots[j].vk_binding_n == n) {
+                _sgu_accel_log("sg_make_shader_accel: slots %d and %d share vk_binding_n %d",
+                    layout->slots[j].slot, layout->slots[i].slot, n);
+                return false;
+            }
+        }
+        for (int j = 0; j < SG_MAX_VIEW_BINDSLOTS; j++) {
+            const sg_shader_view* v = &desc->views[j];
+            const bool hit =
+                (v->texture.stage != SG_SHADERSTAGE_NONE && v->texture.spirv_set1_binding_n == n) ||
+                (v->storage_buffer.stage != SG_SHADERSTAGE_NONE && v->storage_buffer.spirv_set1_binding_n == n) ||
+                (v->storage_image.stage != SG_SHADERSTAGE_NONE && v->storage_image.spirv_set1_binding_n == n);
+            if (hit) {
+                _sgu_accel_log("sg_make_shader_accel: slot %d vk_binding_n %d collides with view %d",
+                    layout->slots[i].slot, n, j);
+                return false;
+            }
+        }
+        for (int j = 0; j < SG_MAX_SAMPLER_BINDSLOTS; j++) {
+            if (desc->samplers[j].stage != SG_SHADERSTAGE_NONE && desc->samplers[j].spirv_set1_binding_n == n) {
+                _sgu_accel_log("sg_make_shader_accel: slot %d vk_binding_n %d collides with sampler %d",
+                    layout->slots[i].slot, n, j);
+                return false;
+            }
+        }
     }
-    _sgu_vk_accel_shaders.count = keep;
+    return true;
 }
 
 /* Rebuilds the set 1 layout and pipeline layout of a new shader with extra
-   acceleration structure bindings after the view and sampler bindings.
-   Offsets of the existing bindings do not change because the new binding
-   numbers are higher. No pipeline uses the layouts yet, so the old ones can be
-   destroyed at once. Returns false and keeps the shader unchanged on failure. */
-_SOKOL_PRIVATE bool _sgu_vk_accel_patch_shader(sg_shader id, int slot_mask) {
-    _sgu_vk_accel_prune_shaders();
+   acceleration structure bindings at the numbers the layout gives.
+   sg_make_shader_accel checked that they meet no view or sampler binding. The
+   offsets of the existing bindings are read again from the new layout.
+   No pipeline uses the layouts yet, so the old ones can be destroyed at once.
+   Returns false and keeps the shader unchanged on failure. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_patch_shader(sg_shader id, const sg_accel_layout_desc* layout) {
     _sg_shader_t* shd = _sg_lookup_shader(id.id);
     if (!shd || shd->slot.state != SG_RESOURCESTATE_VALID || !shd->vk.compute_func.module) return false;
-    if (_sgu_vk_accel_shaders.count >= _SGU_VK_ACCEL_MAX_SHADERS) return false;
     VkDevice dev = _sg.vk.dev;
-    VkDescriptorSetLayoutBinding entries[SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS + 4];
+    VkDescriptorSetLayoutBinding entries[SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS + SG_ACCEL_MAX_SLOTS];
     memset(entries, 0, sizeof(entries));
     uint32_t n = 0;
     for (int i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
         if (shd->cmn.views[i].stage == SG_SHADERSTAGE_NONE) continue;
         VkDescriptorSetLayoutBinding* e = &entries[n++];
         e->binding = shd->vk.view_set1_bnd_n[i];
-        if (e->binding >= (uint32_t)_SGU_VK_ACCEL_BINDING_BASE) return false;
         e->descriptorCount = 1;
         e->stageFlags = _sg_vk_shader_stage(shd->cmn.views[i].stage);
         e->descriptorType = shd->cmn.views[i].view_type == SG_VIEWTYPE_TEXTURE ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
@@ -2800,15 +2919,13 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_patch_shader(sg_shader id, int slot_mask) {
         if (shd->cmn.samplers[i].stage == SG_SHADERSTAGE_NONE) continue;
         VkDescriptorSetLayoutBinding* e = &entries[n++];
         e->binding = shd->vk.smp_set1_bnd_n[i];
-        if (e->binding >= (uint32_t)_SGU_VK_ACCEL_BINDING_BASE) return false;
         e->descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         e->descriptorCount = 1;
         e->stageFlags = _sg_vk_shader_stage(shd->cmn.samplers[i].stage);
     }
-    for (int i = 0; i < 4; i++) {
-        if (!(slot_mask & (1 << i))) continue;
+    for (int i = 0; i < layout->num_slots; i++) {
         VkDescriptorSetLayoutBinding* e = &entries[n++];
-        e->binding = (uint32_t)(_SGU_VK_ACCEL_BINDING_BASE + i);
+        e->binding = (uint32_t)layout->slots[i].vk_binding_n;
         e->descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         e->descriptorCount = 1;
         e->stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -2851,9 +2968,6 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_patch_shader(sg_shader id, int slot_mask) {
         _sg.vk.ext.get_descriptor_set_layout_binding_offset(dev, dsl, shd->vk.smp_set1_bnd_n[i], &offset);
         shd->vk.smp_dset_offsets[i] = (uint16_t)offset;
     }
-    _sgu_vk_accel_shaders.id[_sgu_vk_accel_shaders.count] = id.id;
-    _sgu_vk_accel_shaders.mask[_sgu_vk_accel_shaders.count] = slot_mask;
-    _sgu_vk_accel_shaders.count++;
     return true;
 }
 
@@ -2877,14 +2991,11 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_shader_has_no_views(const _sg_shader_t* shd) {
    old one, and finding the old one is the same guess. */
 _SOKOL_PRIVATE bool _sgu_vk_accel_bind(const sg_accel a, int slot) {
     const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
-    if (!pip || !_sg.next_draw_valid) return false;
+    if (!pip || _sg_skipdraw_any()) return false;
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
     if (!shd || !shd->vk.view_smp_dset_size || !_sg.vk.bind.cur_mem_ptr || _sg.vk.bind.overflown) return false;
-    bool patched = false;
-    for (int i = 0; i < _sgu_vk_accel_shaders.count; i++) {
-        if (_sgu_vk_accel_shaders.id[i] == shd->slot.id && (_sgu_vk_accel_shaders.mask[i] & (1 << slot))) patched = true;
-    }
-    if (!patched) return false;
+    const sg_accel_slot_layout* slot_layout = _sgu_accel_find_slot(shd->slot.id, slot);
+    if (!slot_layout || slot_layout->vk_binding_n < 0) return false;
     const bool own_chunk = _sgu_vk_accel_shader_has_no_views(shd);
     VkDeviceSize chunk_offset = 0;
     if (own_chunk) {
@@ -2901,7 +3012,7 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_bind(const sg_accel a, int slot) {
     uint8_t* chunk = _sg_vk_shared_buffer_ptr(&_sg.vk.bind, chunk_offset);
     VkDeviceSize binding_offset = 0;
     _sg.vk.ext.get_descriptor_set_layout_binding_offset(_sg.vk.dev, shd->vk.view_smp_dsl,
-        (uint32_t)(_SGU_VK_ACCEL_BINDING_BASE + slot), &binding_offset);
+        (uint32_t)slot_layout->vk_binding_n, &binding_offset);
     _SG_STRUCT(VkDescriptorGetInfoEXT, get_info);
     get_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
     get_info.type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -2925,7 +3036,6 @@ _SOKOL_PRIVATE void _sgu_vk_accel_shutdown(void) {
     for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) _sgu_vk_accel_free(&_sgu_vk_accel_scratch.mem[i]);
     memset(&_sgu_vk_accel_scratch, 0, sizeof(_sgu_vk_accel_scratch));
     memset(&_sgu_vk_accel_state, 0, sizeof(_sgu_vk_accel_state));
-    memset(&_sgu_vk_accel_shaders, 0, sizeof(_sgu_vk_accel_shaders));
 }
 
 #endif /* SOKOL_VULKAN */
@@ -2950,12 +3060,47 @@ _SOKOL_PRIVATE void _sgu_vk_accel_shutdown(void) {
 #define _SGU_MTL_DROP(obj) [(obj) release]
 #endif
 
-/* sokol-slang maps slot n to [[buffer(16 + n)]]. It puts uniform blocks at
-   0..7 and storage buffers at 8..15 (at most 8 per stage), so 16..19 is free.
-   sokol_gfx accepts storage buffers at 8..22; sg_make_shader_accel rejects a
-   shader that puts one at 16..19. */
-#define _SGU_MTL_ACCEL_BUFFER_BASE (16)
-#define _SGU_MTL_ACCEL_SLOTS (4)
+/* Metal has 31 buffer indices per stage: 0..30. */
+#define _SGU_MTL_MAX_BUFFER_N (30)
+
+/* Checks the buffer indices of a layout against the uniform blocks and storage
+   buffers of the shader desc. Every stage counts, which is stricter than
+   needed for a compute shader but never wrong. */
+_SOKOL_PRIVATE bool _sgu_mtl_accel_validate(const sg_shader_desc* desc, const sg_accel_layout_desc* layout) {
+    for (int i = 0; i < layout->num_slots; i++) {
+        const int n = layout->slots[i].msl_buffer_n;
+        if (n < 0 || n > _SGU_MTL_MAX_BUFFER_N) {
+            _sgu_accel_log("sg_make_shader_accel: slot %d msl_buffer_n %d is not in 0..%d",
+                layout->slots[i].slot, n, _SGU_MTL_MAX_BUFFER_N);
+            return false;
+        }
+        for (int j = 0; j < i; j++) {
+            if (layout->slots[j].msl_buffer_n == n) {
+                _sgu_accel_log("sg_make_shader_accel: slots %d and %d share msl_buffer_n %d",
+                    layout->slots[j].slot, layout->slots[i].slot, n);
+                return false;
+            }
+        }
+        for (int j = 0; j < SG_MAX_UNIFORMBLOCK_BINDSLOTS; j++) {
+            const sg_shader_uniform_block* ub = &desc->uniform_blocks[j];
+            if (ub->stage != SG_SHADERSTAGE_NONE && ub->msl_buffer_n == n) {
+                _sgu_accel_log("sg_make_shader_accel: slot %d msl_buffer_n %d collides with uniform block %d",
+                    layout->slots[i].slot, n, j);
+                return false;
+            }
+        }
+        for (int j = 0; j < SG_MAX_VIEW_BINDSLOTS; j++) {
+            const sg_shader_storage_buffer_view* sbuf = &desc->views[j].storage_buffer;
+            if (sbuf->stage != SG_SHADERSTAGE_NONE && sbuf->msl_buffer_n == n) {
+                _sgu_accel_log("sg_make_shader_accel: slot %d msl_buffer_n %d collides with storage buffer view %d",
+                    layout->slots[i].slot, n, j);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /* Offset alignment of builds inside the shared scratch buffer. */
 #define _SGU_MTL_ACCEL_SCRATCH_ALIGN (256)
 
@@ -3207,13 +3352,20 @@ _SOKOL_PRIVATE bool _sgu_mtl_accel_record(sg_accel a, const sg_accel_instance* i
     return false;
 }
 
-/* Binds the TLAS as [[buffer(16 + slot)]] and marks it and its BLASes resident. */
+/* Binds the TLAS at the buffer index recorded for the slot of the current
+   pipeline's shader and marks it and its BLASes resident. */
 _SOKOL_PRIVATE bool _sgu_mtl_accel_bind(const sg_accel a, int slot) {
     if (@available(macOS 12.0, iOS 15.0, *)) {
         if (nil == _sg.mtl.compute_cmd_encoder) return false;
+        const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+        if (!pip) return false;
+        const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+        if (!shd) return false;
+        const sg_accel_slot_layout* slot_layout = _sgu_accel_find_slot(shd->slot.id, slot);
+        if (!slot_layout || slot_layout->msl_buffer_n < 0) return false;
         id<MTLComputeCommandEncoder> encoder = _sg.mtl.compute_cmd_encoder;
         id<MTLAccelerationStructure> tlas = _SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->native.as);
-        [encoder setAccelerationStructure:tlas atBufferIndex:(NSUInteger)(_SGU_MTL_ACCEL_BUFFER_BASE + slot)];
+        [encoder setAccelerationStructure:tlas atBufferIndex:(NSUInteger)slot_layout->msl_buffer_n];
         [encoder useResource:tlas usage:MTLResourceUsageRead];
         for (int i = 0; i < a->blas_count; i++) {
             [encoder useResource:_SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->blas_list[i]->native.as) usage:MTLResourceUsageRead];
@@ -3413,43 +3565,54 @@ SOKOL_API_IMPL bool sg_accel_built(sg_accel accel) {
     return accel && accel->built;
 }
 
-SOKOL_API_IMPL sg_shader sg_make_shader_accel(const sg_shader_desc* desc, int slot_mask) {
-    #if defined(SOKOL_METAL)
-    /* A storage buffer at buffer(16 + slot) would collide with the TLAS. */
-    if (desc && (slot_mask & 0xF)) {
-        for (int i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
-            const sg_shader_storage_buffer_view* sbuf = &desc->views[i].storage_buffer;
-            if (sbuf->stage != SG_SHADERSTAGE_NONE && sbuf->msl_buffer_n >= _SGU_MTL_ACCEL_BUFFER_BASE &&
-                sbuf->msl_buffer_n < _SGU_MTL_ACCEL_BUFFER_BASE + _SGU_MTL_ACCEL_SLOTS) {
-                sg_shader invalid = { SG_INVALID_ID };
-                return invalid;
-            }
+SOKOL_API_IMPL sg_shader sg_make_shader_accel(const sg_shader_desc* desc, const sg_accel_layout_desc* layout) {
+    const sg_shader invalid = { SG_INVALID_ID };
+    sg_accel_layout_desc none;
+    memset(&none, 0, sizeof(none));
+    if (!layout) layout = &none;
+    if (!desc || !_sgu_accel_validate_slots(layout)) return invalid;
+    #if defined(SOKOL_VULKAN)
+    if (!_sgu_vk_accel_validate(desc, layout)) return invalid;
+    #elif defined(SOKOL_METAL)
+    if (!_sgu_mtl_accel_validate(desc, layout)) return invalid;
+    #endif
+    #if defined(SOKOL_VULKAN) || defined(SOKOL_METAL)
+    if (layout->num_slots > 0) {
+        _sgu_accel_prune_shaders();
+        if (_sgu_accel_shaders.count >= _SGU_ACCEL_MAX_SHADERS) {
+            _sgu_accel_log("sg_make_shader_accel: more than %d live shaders with acceleration structures", _SGU_ACCEL_MAX_SHADERS);
+            return invalid;
         }
     }
     #endif
     sg_shader shader = sg_make_shader(desc);
     #if defined(SOKOL_VULKAN)
-    if (slot_mask & 0xF) {
-        if (!sg_ray_query_supported() || !_sgu_vk_accel_patch_shader(shader, slot_mask & 0xF)) {
+    if (layout->num_slots > 0) {
+        if (!sg_ray_query_supported() || !_sgu_vk_accel_patch_shader(shader, layout)) {
             sg_destroy_shader(shader);
-            sg_shader invalid = { SG_INVALID_ID };
             return invalid;
         }
     }
-    #else
-    (void)slot_mask;
+    #endif
+    #if defined(SOKOL_VULKAN) || defined(SOKOL_METAL)
+    if (layout->num_slots > 0 && shader.id != SG_INVALID_ID) {
+        _sgu_accel_shaders.id[_sgu_accel_shaders.count] = shader.id;
+        _sgu_accel_shaders.layout[_sgu_accel_shaders.count] = *layout;
+        _sgu_accel_shaders.count++;
+    }
     #endif
     return shader;
 }
 
 SOKOL_API_IMPL bool sg_accel_bind(sg_accel tlas, int slot) {
-    if (!tlas || !tlas->is_tlas || !tlas->built || slot < 0 || slot > 3 || !sg_ray_query_supported()) return false;
+    if (!tlas || !tlas->is_tlas || !tlas->built || slot < 0 || slot >= SG_ACCEL_MAX_SLOTS || !sg_ray_query_supported()) return false;
     if (!_sg.cur_pass.valid || !_sg.cur_pass.in_pass || !_sg.cur_pass.is_compute) return false;
     return _sgu_accel_native_bind(tlas, slot);
 }
 
 SOKOL_API_IMPL void sg_accel_shutdown(void) {
     _sgu_accel_native_shutdown();
+    memset(&_sgu_accel_shaders, 0, sizeof(_sgu_accel_shaders));
     _sgu_accel_down = true;
 }
 
