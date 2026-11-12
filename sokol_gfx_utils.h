@@ -150,6 +150,133 @@ SOKOL_GFX_UTILS_API_DECL void sg_destroy_submission_receipt(sg_submission_receip
 /* False leaves Vulkan receipts intact: retry before graphics teardown. */
 SOKOL_GFX_UTILS_API_DECL bool sg_shutdown_submission_receipts(void);
 
+/*
+    Acceleration structures and ray queries for compute shaders.
+
+    A bottom-level structure (BLAS) holds one triangle mesh. A top-level
+    structure (TLAS) holds instances of BLASes, each with a transform, an id
+    and a mask. A compute shader traces rays against a TLAS with ray queries.
+    Vulkan uses VK_KHR_acceleration_structure and VK_KHR_ray_query. Metal uses
+    MTLAccelerationStructure. D3D11, WebGPU and GL report no support. Sokol has
+    no D3D12 backend: on Windows, ray queries go through Vulkan.
+
+    Contract:
+    - Call from the thread that owns the sokol_gfx context. Calls that record
+      GPU work (build, refit) run outside passes, in the frame's command order.
+      A build must be recorded before the compute pass that reads it. Vulkan
+      builds end with a barrier for later passes. Metal orders encoders.
+    - Vertex, index and TLAS data come from sg_buffer objects made with
+      sg_make_accel_input_buffer. A BLAS stores the sg_buffer ids and reads the
+      buffers again at every build or refit. Do not destroy those buffers while
+      a build that reads them can still be recorded.
+    - The caller owns each sg_accel and frees it with sg_destroy_accel. A TLAS
+      holds a reference to each BLAS in its desc. A BLAS destroyed earlier
+      lives until its last TLAS is destroyed. Destruction is deferred until the
+      GPU finished the frames that can use the structure.
+    - sg_make_blas and sg_make_tlas allocate memory but record no commands.
+      The structure is empty until built.
+    - A TLAS takes one build or refit per frame.
+    - Refit keeps topology and updates positions or transforms in place. It
+      needs allow_update. After a BLAS changes, refit or rebuild each TLAS
+      that uses it.
+    - Compaction is not supported.
+    - Call sg_accel_shutdown after sg_shutdown, while the native device exists.
+
+    Vulkan device setup. sokol_gfx does not create the VkDevice, the
+    application does. It must enable, in addition to what sokol_gfx needs:
+      extensions: VK_KHR_acceleration_structure, VK_KHR_ray_query,
+                  VK_KHR_deferred_host_operations
+      features:   VkPhysicalDeviceAccelerationStructureFeaturesKHR::accelerationStructure
+                  VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery
+                  bufferDeviceAddress (sokol_gfx already requires it)
+    sg_ray_query_supported checks that the GPU offers these features and that
+    the entry points load. It cannot see which features the application
+    enabled: a device created without them is a caller error.
+
+    Binding. sokol_gfx has no acceleration structure bind slot type. sokol-slang
+    reflects acceleration structures of compute shaders as a separate slot
+    namespace 0..3 (ShaderReflection acceleration_structure_slot). Its native
+    index is Metal buffer 16 + slot and Vulkan set 1 binding 44 + slot.
+    - Metal: sg_accel_bind(tlas, slot) sets [[buffer(16 + slot)]] on the compute
+      encoder and marks the TLAS and its BLASes resident.
+    - Vulkan: sokol_gfx builds the set 1 layout without that binding, so the
+      shader must come from sg_make_shader_accel. It adds the bindings to the
+      layout. sg_accel_bind writes the TLAS descriptor into the descriptor
+      buffer chunk that the last sg_apply_bindings recorded.
+    Call sg_accel_bind in a compute pass after sg_apply_pipeline and
+    sg_apply_bindings, and again after every later sg_apply_bindings: that call
+    starts a new descriptor chunk without the TLAS.
+*/
+typedef struct sg_accel_t* sg_accel;
+
+typedef enum sg_accel_index_format {
+    SG_ACCEL_INDEXFORMAT_NONE,      /* triangle list from vertices, vertex_count % 3 == 0 */
+    SG_ACCEL_INDEXFORMAT_UINT16,
+    SG_ACCEL_INDEXFORMAT_UINT32
+} sg_accel_index_format;
+
+/* Vertices are float3 positions. Offsets and strides are in bytes and are
+   multiples of four. The buffers must come from sg_make_accel_input_buffer. */
+typedef struct sg_blas_desc {
+    sg_buffer vertex_buffer;
+    int vertex_offset;
+    int vertex_stride;      /* at least 12 */
+    int vertex_count;
+    sg_buffer index_buffer; /* unused when index_format is NONE */
+    int index_offset;
+    sg_accel_index_format index_format;
+    int index_count;        /* multiple of 3 */
+    bool opaque;            /* skip any-hit tests for every triangle */
+    bool allow_update;      /* permit sg_refit_blas */
+    const char* label;
+} sg_blas_desc;
+
+/* The TLAS holds up to max_instances instances of the listed BLASes. */
+typedef struct sg_tlas_desc {
+    const sg_accel* blas;
+    int blas_count;
+    int max_instances;
+    bool allow_update;      /* permit sg_refit_tlas */
+    const char* label;
+} sg_tlas_desc;
+
+#define SG_ACCEL_INSTANCE_OPAQUE (1)    /* treat all geometry of the instance as opaque */
+#define SG_ACCEL_INSTANCE_NO_CULL (2)   /* disable triangle facing culling */
+
+typedef struct sg_accel_instance {
+    float transform[12];    /* row-major 3x4 object-to-world matrix */
+    uint32_t id;            /* low 24 bits only */
+    uint8_t mask;           /* ray mask, 8 bits */
+    uint8_t flags;          /* SG_ACCEL_INSTANCE_* */
+    int blas_index;         /* index into sg_tlas_desc.blas */
+} sg_accel_instance;
+
+SOKOL_GFX_UTILS_API_DECL bool sg_ray_query_supported(void);
+/* Like sg_make_indirect_buffer: needs usage.storage_buffer, returns an invalid
+   buffer when ray queries are unsupported. On Vulkan the buffer also gets
+   build-input usage. The caller destroys it with sg_destroy_buffer. */
+SOKOL_GFX_UTILS_API_DECL sg_buffer sg_make_accel_input_buffer(const sg_buffer_desc* desc);
+/* Return NULL on failure. */
+SOKOL_GFX_UTILS_API_DECL sg_accel sg_make_blas(const sg_blas_desc* desc);
+SOKOL_GFX_UTILS_API_DECL sg_accel sg_make_tlas(const sg_tlas_desc* desc);
+SOKOL_GFX_UTILS_API_DECL void sg_destroy_accel(sg_accel accel);
+/* Record a build or refit. Return false when nothing was recorded. A TLAS
+   build needs every referenced BLAS built. Refit of a TLAS keeps the instance
+   count of its last build. */
+SOKOL_GFX_UTILS_API_DECL bool sg_build_blas(sg_accel blas);
+SOKOL_GFX_UTILS_API_DECL bool sg_refit_blas(sg_accel blas);
+SOKOL_GFX_UTILS_API_DECL bool sg_build_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
+SOKOL_GFX_UTILS_API_DECL bool sg_refit_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
+SOKOL_GFX_UTILS_API_DECL bool sg_accel_built(sg_accel accel);
+/* Like sg_make_shader. slot_mask has one bit per acceleration structure slot
+   (0..3) the compute shader uses. Vulkan needs it (see above), other backends
+   ignore it. */
+SOKOL_GFX_UTILS_API_DECL sg_shader sg_make_shader_accel(const sg_shader_desc* desc, int slot_mask);
+/* slot is 0..3. Returns false outside a compute pass or when the TLAS is not
+   built. */
+SOKOL_GFX_UTILS_API_DECL bool sg_accel_bind(sg_accel tlas, int slot);
+SOKOL_GFX_UTILS_API_DECL void sg_accel_shutdown(void);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
@@ -196,7 +323,9 @@ static _sgu_dispatch_indirect_fn _sgu_dispatch_indirect;
 #endif
 
 #if defined(SOKOL_VULKAN)
-_SOKOL_PRIVATE sg_resource_state _sgu_vk_create_indirect_buffer(_sg_buffer_t* buf, const sg_buffer_desc* desc) {
+/* Creates a storage buffer with extra Vulkan usage bits. Used for indirect
+   argument buffers and for acceleration structure build inputs. */
+_SOKOL_PRIVATE sg_resource_state _sgu_vk_create_indirect_buffer(_sg_buffer_t* buf, const sg_buffer_desc* desc, VkBufferUsageFlags extra_usage) {
     SOKOL_ASSERT(_sg.vk.dev);
     SOKOL_ASSERT(buf && desc);
     SOKOL_ASSERT(buf->cmn.size > 0);
@@ -214,7 +343,7 @@ _SOKOL_PRIVATE sg_resource_state _sgu_vk_create_indirect_buffer(_sg_buffer_t* bu
     _SG_STRUCT(VkBufferCreateInfo, create_info);
     create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     create_info.size = (VkDeviceSize)buf->cmn.size;
-    create_info.usage = _sg_vk_buffer_usage(&buf->cmn.usage) | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    create_info.usage = _sg_vk_buffer_usage(&buf->cmn.usage) | extra_usage;
     create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     res = vkCreateBuffer(_sg.vk.dev, &create_info, 0, &buf->vk.buf);
     if (res != VK_SUCCESS) {
@@ -279,7 +408,7 @@ SOKOL_API_IMPL sg_buffer sg_make_indirect_buffer(const sg_buffer_desc* desc) {
     _sg_buffer_t* buf = _sg_lookup_buffer(result.id);
     if (!buf) return result;
     _sg_buffer_common_init(&buf->cmn, &d);
-    buf->slot.state = _sgu_vk_create_indirect_buffer(buf, &d);
+    buf->slot.state = _sgu_vk_create_indirect_buffer(buf, &d, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
     _sg_resource_stats_inc(buffers.inited);
     _SG_TRACE_ARGS(init_buffer, result, &d);
     return result;
@@ -2086,6 +2215,964 @@ SOKOL_API_IMPL bool sg_shutdown_submission_receipts(void) {
     _sgu_submission_owner.count = 0;
     ++_sgu_submission_owner.generation;
     return true;
+}
+
+/*--- Acceleration Structures ------------------------------------------------*/
+
+/* Native state per backend. Vulkan keeps the structure in its own buffer. The
+   instance buffers form a ring with one slot per sokol frame in flight, so the
+   CPU never rewrites a slot the GPU still reads. */
+#if defined(SOKOL_VULKAN)
+typedef struct {
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    VkDeviceAddress addr;
+    void* map;
+} _sgu_vk_mem_t;
+
+typedef struct {
+    VkAccelerationStructureKHR as;
+    _sgu_vk_mem_t store;
+    VkDeviceAddress addr;
+    VkDeviceSize build_scratch;
+    VkDeviceSize update_scratch;
+    _sgu_vk_mem_t instances[SG_NUM_INFLIGHT_FRAMES];
+} _sgu_accel_native_t;
+#elif defined(SOKOL_METAL)
+/* Objective-C objects are held as retained void* so the structs stay plain C
+   under both ARC and manual reference counting. */
+typedef struct {
+    void* as;
+    void* blas_array;   /* NSArray of the BLAS objects of a TLAS */
+    void* instances[SG_NUM_INFLIGHT_FRAMES];
+    uint64_t build_scratch;
+    uint64_t refit_scratch;
+} _sgu_accel_native_t;
+#else
+typedef struct { int unused; } _sgu_accel_native_t;
+#endif
+
+/* Backend-neutral part. A TLAS keeps a reference on each BLAS it lists. The
+   desc label is not stored. */
+struct sg_accel_t {
+    bool is_tlas;
+    bool built;
+    bool allow_update;
+    bool destroy_requested;     /* BLAS destroyed while a TLAS still uses it */
+    bool recorded;              /* a TLAS build or refit ran in last_frame */
+    uint32_t last_frame;
+    int refs;
+    sg_blas_desc blas;
+    sg_accel* blas_list;
+    int blas_count;
+    int max_instances;
+    int built_count;
+    _sgu_accel_native_t native;
+};
+
+_SOKOL_PRIVATE _sg_buffer_t* _sgu_accel_input_buffer(sg_buffer id, int offset, int64_t bytes) {
+    _sg_buffer_t* buf = _sg_lookup_buffer(id.id);
+    if (!buf || buf->slot.state != SG_RESOURCESTATE_VALID || !buf->cmn.usage.storage_buffer) return 0;
+    if (offset < 0 || bytes < 0 || (int64_t)offset + bytes > (int64_t)buf->cmn.size) return 0;
+    #if defined(SOKOL_VULKAN)
+    if (!buf->vk.dev_addr) return 0;
+    #endif
+    return buf;
+}
+
+_SOKOL_PRIVATE int _sgu_accel_index_size(sg_accel_index_format format) {
+    return format == SG_ACCEL_INDEXFORMAT_UINT16 ? 2 : (format == SG_ACCEL_INDEXFORMAT_UINT32 ? 4 : 0);
+}
+
+/* Returns the buffers a BLAS reads, or false when one is gone or too small. */
+_SOKOL_PRIVATE bool _sgu_accel_blas_buffers(const sg_accel blas, _sg_buffer_t** vb, _sg_buffer_t** ib) {
+    const sg_blas_desc* d = &blas->blas;
+    const int64_t vbytes = (int64_t)d->vertex_stride * (int64_t)(d->vertex_count - 1) + 12;
+    *vb = _sgu_accel_input_buffer(d->vertex_buffer, d->vertex_offset, vbytes);
+    *ib = 0;
+    if (!*vb) return false;
+    if (d->index_format != SG_ACCEL_INDEXFORMAT_NONE) {
+        *ib = _sgu_accel_input_buffer(d->index_buffer, d->index_offset,
+            (int64_t)d->index_count * _sgu_accel_index_size(d->index_format));
+        if (!*ib) return false;
+    }
+    return true;
+}
+
+_SOKOL_PRIVATE int _sgu_accel_triangle_count(const sg_accel blas) {
+    return (blas->blas.index_format == SG_ACCEL_INDEXFORMAT_NONE ? blas->blas.vertex_count : blas->blas.index_count) / 3;
+}
+
+/*--- Acceleration Structures: Vulkan ----------------------------------------*/
+#if defined(SOKOL_VULKAN)
+
+static struct {
+    bool init;
+    bool supported;
+    VkDevice device;
+    VkDeviceSize scratch_align;
+    PFN_vkCreateAccelerationStructureKHR create;
+    PFN_vkDestroyAccelerationStructureKHR destroy;
+    PFN_vkGetAccelerationStructureBuildSizesKHR get_build_sizes;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR get_address;
+    PFN_vkCmdBuildAccelerationStructuresKHR cmd_build;
+} _sgu_vk_accel_state;
+
+#define _SGU_VK_ACCEL_LOAD(field, name) \
+    _sgu_vk_accel_state.field = (PFN_##name)vkGetDeviceProcAddr(_sgu_vk_accel_state.device, #name)
+
+/* Loads entry points once per device. The GPU must offer the features; the
+   application must have enabled them (see the contract above). */
+_SOKOL_PRIVATE bool _sgu_vk_accel_supported(void) {
+    if (!_sg.vk.valid || !_sg.vk.dev) return false;
+    if (_sgu_vk_accel_state.init && _sgu_vk_accel_state.device == _sg.vk.dev) {
+        return _sgu_vk_accel_state.supported;
+    }
+    memset(&_sgu_vk_accel_state, 0, sizeof(_sgu_vk_accel_state));
+    _sgu_vk_accel_state.init = true;
+    _sgu_vk_accel_state.device = _sg.vk.dev;
+
+    _SG_STRUCT(VkPhysicalDeviceRayQueryFeaturesKHR, rq_features);
+    rq_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    _SG_STRUCT(VkPhysicalDeviceAccelerationStructureFeaturesKHR, as_features);
+    as_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    as_features.pNext = &rq_features;
+    _SG_STRUCT(VkPhysicalDeviceFeatures2, features);
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = &as_features;
+    vkGetPhysicalDeviceFeatures2(_sg.vk.phys_dev, &features);
+    if (!as_features.accelerationStructure || !rq_features.rayQuery) return false;
+
+    _SG_STRUCT(VkPhysicalDeviceAccelerationStructurePropertiesKHR, as_props);
+    as_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
+    _SG_STRUCT(VkPhysicalDeviceProperties2, props);
+    props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props.pNext = &as_props;
+    vkGetPhysicalDeviceProperties2(_sg.vk.phys_dev, &props);
+    _sgu_vk_accel_state.scratch_align = as_props.minAccelerationStructureScratchOffsetAlignment
+        ? as_props.minAccelerationStructureScratchOffsetAlignment : 1;
+
+    _SGU_VK_ACCEL_LOAD(create, vkCreateAccelerationStructureKHR);
+    _SGU_VK_ACCEL_LOAD(destroy, vkDestroyAccelerationStructureKHR);
+    _SGU_VK_ACCEL_LOAD(get_build_sizes, vkGetAccelerationStructureBuildSizesKHR);
+    _SGU_VK_ACCEL_LOAD(get_address, vkGetAccelerationStructureDeviceAddressKHR);
+    _SGU_VK_ACCEL_LOAD(cmd_build, vkCmdBuildAccelerationStructuresKHR);
+    _sgu_vk_accel_state.supported = _sgu_vk_accel_state.create && _sgu_vk_accel_state.destroy &&
+        _sgu_vk_accel_state.get_build_sizes && _sgu_vk_accel_state.get_address && _sgu_vk_accel_state.cmd_build;
+    return _sgu_vk_accel_state.supported;
+}
+
+/* Memory comes from sokol's allocator. STORAGE_BUFFER memory is device local
+   with a device address; UNIFORMS memory is host visible, coherent and also
+   has a device address, which suits instance data written by the CPU. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_alloc(_sgu_vk_mem_t* out, VkDeviceSize size, VkBufferUsageFlags usage, _sg_vk_memtype_t type) {
+    memset(out, 0, sizeof(*out));
+    VkDevice dev = _sgu_vk_accel_state.device;
+    _SG_STRUCT(VkBufferCreateInfo, create_info);
+    create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    create_info.size = size ? size : 16;
+    create_info.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(dev, &create_info, 0, &out->buf) != VK_SUCCESS) {
+        _SG_ERROR(VULKAN_CREATE_BUFFER_FAILED);
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    _SG_STRUCT(VkMemoryRequirements, reqs);
+    vkGetBufferMemoryRequirements(dev, out->buf, &reqs);
+    out->mem = _sg_vk_mem_alloc_device_memory(type, &reqs);
+    if (!out->mem) {
+        _SG_ERROR(VULKAN_ALLOC_BUFFER_DEVICE_MEMORY_FAILED);
+        vkDestroyBuffer(dev, out->buf, 0);
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    if (vkBindBufferMemory(dev, out->buf, out->mem, 0) != VK_SUCCESS) {
+        _SG_ERROR(VULKAN_BIND_BUFFER_MEMORY_FAILED);
+        vkDestroyBuffer(dev, out->buf, 0);
+        vkFreeMemory(dev, out->mem, 0);
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    _SG_STRUCT(VkBufferDeviceAddressInfo, addr_info);
+    addr_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    addr_info.buffer = out->buf;
+    out->addr = vkGetBufferDeviceAddress(dev, &addr_info);
+    if (type == _SG_VK_MEMTYPE_UNIFORMS) {
+        if (vkMapMemory(dev, out->mem, 0, VK_WHOLE_SIZE, 0, &out->map) != VK_SUCCESS) {
+            vkDestroyBuffer(dev, out->buf, 0);
+            vkFreeMemory(dev, out->mem, 0);
+            memset(out, 0, sizeof(*out));
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Deferred free goes through sokol's delete queue: it runs after the GPU
+   finished the frame slot. After sg_shutdown the device is idle. */
+_SOKOL_PRIVATE void _sgu_vk_accel_free(_sgu_vk_mem_t* mem) {
+    if (!mem->buf && !mem->mem) return;
+    if (sg_isvalid()) {
+        if (mem->buf) _sg_vk_delete_queue_add(_sg_vk_buffer_destructor, (void*)mem->buf);
+        if (mem->mem) _sg_vk_delete_queue_add(_sg_vk_memory_destructor, (void*)mem->mem);
+    } else {
+        if (mem->buf) vkDestroyBuffer(_sgu_vk_accel_state.device, mem->buf, 0);
+        if (mem->mem) vkFreeMemory(_sgu_vk_accel_state.device, mem->mem, 0);
+    }
+    memset(mem, 0, sizeof(*mem));
+}
+
+_SOKOL_PRIVATE void _sgu_vk_accel_destructor(void* obj) {
+    _sgu_vk_accel_state.destroy(_sgu_vk_accel_state.device, (VkAccelerationStructureKHR)obj, 0);
+}
+
+_SOKOL_PRIVATE void _sgu_vk_accel_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+    VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    _SG_STRUCT(VkMemoryBarrier2, barrier);
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = src_stage;
+    barrier.srcAccessMask = src_access;
+    barrier.dstStageMask = dst_stage;
+    barrier.dstAccessMask = dst_access;
+    _SG_STRUCT(VkDependencyInfo, dependency);
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
+/* Fills the geometry, build info and range for one structure. Mode, source,
+   destination and scratch are left to the caller. For a TLAS, instance_count
+   and instance_addr describe the instance buffer. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_fill(const sg_accel a, VkAccelerationStructureGeometryKHR* geo,
+    VkAccelerationStructureBuildGeometryInfoKHR* info, VkAccelerationStructureBuildRangeInfoKHR* range,
+    uint32_t instance_count, VkDeviceAddress instance_addr) {
+    geo->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    info->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    info->flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    if (a->allow_update) info->flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+    info->geometryCount = 1;
+    info->pGeometries = geo;
+    if (a->is_tlas) {
+        geo->geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+        geo->geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+        geo->geometry.instances.arrayOfPointers = VK_FALSE;
+        geo->geometry.instances.data.deviceAddress = instance_addr;
+        info->type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+        range->primitiveCount = instance_count;
+        return true;
+    }
+    _sg_buffer_t* vb = 0;
+    _sg_buffer_t* ib = 0;
+    if (!_sgu_accel_blas_buffers(a, &vb, &ib)) return false;
+    const sg_blas_desc* d = &a->blas;
+    geo->geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geo->flags = d->opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
+    VkAccelerationStructureGeometryTrianglesDataKHR* tri = &geo->geometry.triangles;
+    tri->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    tri->vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    tri->vertexData.deviceAddress = vb->vk.dev_addr + (VkDeviceAddress)d->vertex_offset;
+    tri->vertexStride = (VkDeviceSize)d->vertex_stride;
+    tri->maxVertex = (uint32_t)(d->vertex_count - 1);
+    tri->indexType = VK_INDEX_TYPE_NONE_KHR;
+    if (ib) {
+        tri->indexType = (d->index_format == SG_ACCEL_INDEXFORMAT_UINT16) ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+        tri->indexData.deviceAddress = ib->vk.dev_addr + (VkDeviceAddress)d->index_offset;
+    }
+    info->type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    range->primitiveCount = (uint32_t)_sgu_accel_triangle_count(a);
+    return true;
+}
+
+_SOKOL_PRIVATE bool _sgu_vk_accel_make(sg_accel a, const char* label) {
+    if (!_sgu_vk_accel_supported()) return false;
+    VkDevice dev = _sgu_vk_accel_state.device;
+    VkDeviceAddress instance_addr = 0;
+    if (a->is_tlas) {
+        const VkDeviceSize bytes = (VkDeviceSize)a->max_instances * sizeof(VkAccelerationStructureInstanceKHR);
+        for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) {
+            if (!_sgu_vk_accel_alloc(&a->native.instances[i], bytes,
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, _SG_VK_MEMTYPE_UNIFORMS)) {
+                return false;
+            }
+        }
+        instance_addr = a->native.instances[0].addr;
+    }
+    _SG_STRUCT(VkAccelerationStructureGeometryKHR, geo);
+    _SG_STRUCT(VkAccelerationStructureBuildGeometryInfoKHR, info);
+    _SG_STRUCT(VkAccelerationStructureBuildRangeInfoKHR, range);
+    if (!_sgu_vk_accel_fill(a, &geo, &info, &range, (uint32_t)a->max_instances, instance_addr)) return false;
+    _SG_STRUCT(VkAccelerationStructureBuildSizesInfoKHR, sizes);
+    sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    _sgu_vk_accel_state.get_build_sizes(dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &info,
+        &range.primitiveCount, &sizes);
+    a->native.build_scratch = sizes.buildScratchSize;
+    a->native.update_scratch = sizes.updateScratchSize;
+    if (!_sgu_vk_accel_alloc(&a->native.store, sizes.accelerationStructureSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, _SG_VK_MEMTYPE_STORAGE_BUFFER)) {
+        return false;
+    }
+    _SG_STRUCT(VkAccelerationStructureCreateInfoKHR, create_info);
+    create_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+    create_info.buffer = a->native.store.buf;
+    create_info.size = sizes.accelerationStructureSize;
+    create_info.type = info.type;
+    if (_sgu_vk_accel_state.create(dev, &create_info, 0, &a->native.as) != VK_SUCCESS || !a->native.as) {
+        a->native.as = 0;
+        return false;
+    }
+    _SG_STRUCT(VkAccelerationStructureDeviceAddressInfoKHR, addr_info);
+    addr_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+    addr_info.accelerationStructure = a->native.as;
+    a->native.addr = _sgu_vk_accel_state.get_address(dev, &addr_info);
+    _sg_vk_set_object_label(VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR, (uint64_t)a->native.as, label);
+    return true;
+}
+
+_SOKOL_PRIVATE void _sgu_vk_accel_destroy(sg_accel a) {
+    if (a->native.as) {
+        if (sg_isvalid()) _sg_vk_delete_queue_add(_sgu_vk_accel_destructor, (void*)a->native.as);
+        else _sgu_vk_accel_destructor((void*)a->native.as);
+        a->native.as = 0;
+    }
+    _sgu_vk_accel_free(&a->native.store);
+    for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) _sgu_vk_accel_free(&a->native.instances[i]);
+}
+
+/* Records a build or refit into the frame's command buffer. Barriers on both
+   sides order the build against earlier GPU writes (for example compute
+   writes to vertex data) and against later ray queries. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_record(sg_accel a, const sg_accel_instance* inst, int count, bool refit) {
+    _sg_vk_acquire_frame_command_buffers();
+    VkCommandBuffer cmd = _sg.vk.frame.cmd_buf;
+    if (!cmd) return false;
+    VkDeviceAddress instance_addr = 0;
+    if (a->is_tlas) {
+        _sgu_vk_mem_t* mem = &a->native.instances[_sg.vk.frame_slot];
+        VkAccelerationStructureInstanceKHR* dst = (VkAccelerationStructureInstanceKHR*)mem->map;
+        for (int i = 0; i < count; i++) {
+            const sg_accel_instance* s = &inst[i];
+            VkAccelerationStructureInstanceKHR* d = &dst[i];
+            memset(d, 0, sizeof(*d));
+            memcpy(d->transform.matrix, s->transform, sizeof(d->transform.matrix));
+            d->instanceCustomIndex = s->id & 0xFFFFFFu;
+            d->mask = s->mask;
+            d->flags = ((s->flags & SG_ACCEL_INSTANCE_OPAQUE) ? VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR : 0) |
+                       ((s->flags & SG_ACCEL_INSTANCE_NO_CULL) ? VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR : 0);
+            d->accelerationStructureReference = (uint64_t)a->blas_list[s->blas_index]->native.addr;
+        }
+        instance_addr = mem->addr;
+    }
+    _SG_STRUCT(VkAccelerationStructureGeometryKHR, geo);
+    _SG_STRUCT(VkAccelerationStructureBuildGeometryInfoKHR, info);
+    _SG_STRUCT(VkAccelerationStructureBuildRangeInfoKHR, range);
+    if (!_sgu_vk_accel_fill(a, &geo, &info, &range, (uint32_t)count, instance_addr)) return false;
+    const VkDeviceSize scratch_size = refit ? a->native.update_scratch : a->native.build_scratch;
+    const VkDeviceSize align = _sgu_vk_accel_state.scratch_align;
+    _sgu_vk_mem_t scratch;
+    if (!_sgu_vk_accel_alloc(&scratch, scratch_size + align, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, _SG_VK_MEMTYPE_STORAGE_BUFFER)) {
+        return false;
+    }
+    info.mode = refit ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    info.srcAccelerationStructure = refit ? a->native.as : VK_NULL_HANDLE;
+    info.dstAccelerationStructure = a->native.as;
+    info.scratchData.deviceAddress = (scratch.addr + align - 1) & ~(align - 1);
+    const VkAccelerationStructureBuildRangeInfoKHR* range_ptr = &range;
+
+    _sgu_vk_accel_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+        VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+    _sgu_vk_accel_state.cmd_build(cmd, 1, &info, &range_ptr);
+    _sgu_vk_accel_barrier(cmd, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+    /* The GPU reads the scratch buffer until this frame completes. */
+    _sgu_vk_accel_free(&scratch);
+    return true;
+}
+
+/* Shaders whose set 1 layout got acceleration structure bindings. */
+#define _SGU_VK_ACCEL_BINDING_BASE (44)
+#define _SGU_VK_ACCEL_MAX_SHADERS (64)
+static struct {
+    uint32_t id[_SGU_VK_ACCEL_MAX_SHADERS];
+    int mask[_SGU_VK_ACCEL_MAX_SHADERS];
+    int count;
+} _sgu_vk_accel_shaders;
+
+/* Rebuilds the set 1 layout and pipeline layout of a new shader with extra
+   acceleration structure bindings after the view and sampler bindings.
+   Offsets of the existing bindings do not change because the new binding
+   numbers are higher. No pipeline uses the layouts yet, so the old ones can be
+   destroyed at once. Returns false and keeps the shader unchanged on failure. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_patch_shader(sg_shader id, int slot_mask) {
+    _sg_shader_t* shd = _sg_lookup_shader(id.id);
+    if (!shd || shd->slot.state != SG_RESOURCESTATE_VALID || !shd->vk.compute_func.module) return false;
+    if (_sgu_vk_accel_shaders.count >= _SGU_VK_ACCEL_MAX_SHADERS) return false;
+    VkDevice dev = _sg.vk.dev;
+    VkDescriptorSetLayoutBinding entries[SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS + 4];
+    memset(entries, 0, sizeof(entries));
+    uint32_t n = 0;
+    for (int i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
+        if (shd->cmn.views[i].stage == SG_SHADERSTAGE_NONE) continue;
+        VkDescriptorSetLayoutBinding* e = &entries[n++];
+        e->binding = shd->vk.view_set1_bnd_n[i];
+        e->descriptorCount = 1;
+        e->stageFlags = _sg_vk_shader_stage(shd->cmn.views[i].stage);
+        e->descriptorType = shd->cmn.views[i].view_type == SG_VIEWTYPE_TEXTURE ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+            : (shd->cmn.views[i].view_type == SG_VIEWTYPE_STORAGEBUFFER ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+            : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    }
+    for (int i = 0; i < SG_MAX_SAMPLER_BINDSLOTS; i++) {
+        if (shd->cmn.samplers[i].stage == SG_SHADERSTAGE_NONE) continue;
+        VkDescriptorSetLayoutBinding* e = &entries[n++];
+        e->binding = shd->vk.smp_set1_bnd_n[i];
+        e->descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        e->descriptorCount = 1;
+        e->stageFlags = _sg_vk_shader_stage(shd->cmn.samplers[i].stage);
+    }
+    for (int i = 0; i < 4; i++) {
+        if (!(slot_mask & (1 << i))) continue;
+        VkDescriptorSetLayoutBinding* e = &entries[n++];
+        e->binding = (uint32_t)(_SGU_VK_ACCEL_BINDING_BASE + i);
+        e->descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        e->descriptorCount = 1;
+        e->stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    _SG_STRUCT(VkDescriptorSetLayoutCreateInfo, dsl_info);
+    dsl_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dsl_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    dsl_info.bindingCount = n;
+    dsl_info.pBindings = entries;
+    VkDescriptorSetLayout dsl = 0;
+    if (vkCreateDescriptorSetLayout(dev, &dsl_info, 0, &dsl) != VK_SUCCESS) {
+        _SG_ERROR(VULKAN_CREATE_DESCRIPTOR_SET_LAYOUT_FAILED);
+        return false;
+    }
+    VkDescriptorSetLayout set_layouts[2] = { shd->vk.ub_dsl, dsl };
+    _SG_STRUCT(VkPipelineLayoutCreateInfo, pl_info);
+    pl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl_info.setLayoutCount = 2;
+    pl_info.pSetLayouts = set_layouts;
+    VkPipelineLayout layout = 0;
+    if (vkCreatePipelineLayout(dev, &pl_info, 0, &layout) != VK_SUCCESS) {
+        _SG_ERROR(VULKAN_CREATE_PIPELINE_LAYOUT_FAILED);
+        vkDestroyDescriptorSetLayout(dev, dsl, 0);
+        return false;
+    }
+    vkDestroyPipelineLayout(dev, shd->vk.pip_layout, 0);
+    vkDestroyDescriptorSetLayout(dev, shd->vk.view_smp_dsl, 0);
+    shd->vk.pip_layout = layout;
+    shd->vk.view_smp_dsl = dsl;
+    _sg.vk.ext.get_descriptor_set_layout_size(dev, dsl, &shd->vk.view_smp_dset_size);
+    for (int i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
+        if (shd->cmn.views[i].stage == SG_SHADERSTAGE_NONE) continue;
+        VkDeviceSize offset = 0;
+        _sg.vk.ext.get_descriptor_set_layout_binding_offset(dev, dsl, shd->vk.view_set1_bnd_n[i], &offset);
+        shd->vk.view_dset_offsets[i] = (uint16_t)offset;
+    }
+    for (int i = 0; i < SG_MAX_SAMPLER_BINDSLOTS; i++) {
+        if (shd->cmn.samplers[i].stage == SG_SHADERSTAGE_NONE) continue;
+        VkDeviceSize offset = 0;
+        _sg.vk.ext.get_descriptor_set_layout_binding_offset(dev, dsl, shd->vk.smp_set1_bnd_n[i], &offset);
+        shd->vk.smp_dset_offsets[i] = (uint16_t)offset;
+    }
+    _sgu_vk_accel_shaders.id[_sgu_vk_accel_shaders.count] = id.id;
+    _sgu_vk_accel_shaders.mask[_sgu_vk_accel_shaders.count] = slot_mask;
+    _sgu_vk_accel_shaders.count++;
+    return true;
+}
+
+/* Writes the TLAS descriptor into the chunk that the last sg_apply_bindings
+   put in sokol's descriptor buffer. The chunk starts one rounded size before
+   the buffer's current offset. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_bind(const sg_accel a, int slot) {
+    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+    if (!pip) return false;
+    const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+    if (!shd || !shd->vk.view_smp_dset_size || !_sg.vk.bind.cur_mem_ptr || _sg.vk.bind.overflown) return false;
+    bool patched = false;
+    for (int i = 0; i < _sgu_vk_accel_shaders.count; i++) {
+        if (_sgu_vk_accel_shaders.id[i] == shd->slot.id && (_sgu_vk_accel_shaders.mask[i] & (1 << slot))) patched = true;
+    }
+    if (!patched) return false;
+    const uint32_t chunk_size = _sg_roundup_pow2_u32((uint32_t)shd->vk.view_smp_dset_size, _sg.vk.bind.align);
+    if (_sg.vk.bind.offset < chunk_size) return false;
+    uint8_t* chunk = _sg_vk_shared_buffer_ptr(&_sg.vk.bind, _sg.vk.bind.offset - chunk_size);
+    VkDeviceSize binding_offset = 0;
+    _sg.vk.ext.get_descriptor_set_layout_binding_offset(_sg.vk.dev, shd->vk.view_smp_dsl,
+        (uint32_t)(_SGU_VK_ACCEL_BINDING_BASE + slot), &binding_offset);
+    _SG_STRUCT(VkDescriptorGetInfoEXT, get_info);
+    get_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
+    get_info.type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    get_info.data.accelerationStructure = a->native.addr;
+    _sg.vk.ext.get_descriptor(_sg.vk.dev, &get_info,
+        _sg.vk.descriptor_buffer_props.accelerationStructureDescriptorSize, chunk + binding_offset);
+    return true;
+}
+
+_SOKOL_PRIVATE void _sgu_vk_accel_shutdown(void) {
+    memset(&_sgu_vk_accel_state, 0, sizeof(_sgu_vk_accel_state));
+    memset(&_sgu_vk_accel_shaders, 0, sizeof(_sgu_vk_accel_shaders));
+}
+
+#endif /* SOKOL_VULKAN */
+
+/*--- Acceleration Structures: Metal -----------------------------------------*/
+#if defined(SOKOL_METAL)
+
+#if !defined(__OBJC__)
+#error "Metal implementation requires Objective-C"
+#endif
+
+#if __has_feature(objc_arc)
+#define _SGU_MTL_RETAIN(obj) ((__bridge_retained void*)(obj))
+#define _SGU_MTL_OBJ(type, ptr) ((__bridge type)(ptr))
+#define _SGU_MTL_RELEASE(ptr) CFRelease((CFTypeRef)(ptr))
+#define _SGU_MTL_DROP(obj) ((void)0)
+#else
+#define _SGU_MTL_RETAIN(obj) ((void*)[(obj) retain])
+#define _SGU_MTL_OBJ(type, ptr) ((type)(ptr))
+#define _SGU_MTL_RELEASE(ptr) [(id)(ptr) release]
+/* Drops the +1 reference of a new* method result once it is retained. */
+#define _SGU_MTL_DROP(obj) [(obj) release]
+#endif
+
+#define _SGU_MTL_ACCEL_BUFFER_BASE (16) /* sokol-slang maps slot n to [[buffer(16 + n)]] */
+
+/* Sokol's command buffer does not retain resources by default. A destroyed
+   object waits here until every frame that could use it has completed. */
+typedef struct {
+    void* obj;
+    uint32_t frame;
+} _sgu_mtl_accel_garbage_t;
+
+static struct {
+    _sgu_mtl_accel_garbage_t* items;
+    int count;
+    int capacity;
+} _sgu_mtl_accel_garbage;
+
+_SOKOL_PRIVATE void _sgu_mtl_accel_collect(bool all) {
+    int keep = 0;
+    for (int i = 0; i < _sgu_mtl_accel_garbage.count; i++) {
+        _sgu_mtl_accel_garbage_t item = _sgu_mtl_accel_garbage.items[i];
+        if (all || (uint32_t)(_sg.frame_index - item.frame) > (uint32_t)SG_NUM_INFLIGHT_FRAMES) {
+            _SGU_MTL_RELEASE(item.obj);
+        } else {
+            _sgu_mtl_accel_garbage.items[keep++] = item;
+        }
+    }
+    _sgu_mtl_accel_garbage.count = keep;
+}
+
+_SOKOL_PRIVATE void _sgu_mtl_accel_defer(void* obj) {
+    if (!obj) return;
+    if (_sgu_mtl_accel_garbage.count == _sgu_mtl_accel_garbage.capacity) {
+        const int capacity = _sgu_mtl_accel_garbage.capacity ? _sgu_mtl_accel_garbage.capacity * 2 : 32;
+        _sgu_mtl_accel_garbage_t* items = (_sgu_mtl_accel_garbage_t*)realloc(
+            _sgu_mtl_accel_garbage.items, sizeof(_sgu_mtl_accel_garbage_t) * (size_t)capacity);
+        if (!items) {
+            /* Out of memory: leak the object, never free it while in flight. */
+            return;
+        }
+        _sgu_mtl_accel_garbage.items = items;
+        _sgu_mtl_accel_garbage.capacity = capacity;
+    }
+    _sgu_mtl_accel_garbage_t* item = &_sgu_mtl_accel_garbage.items[_sgu_mtl_accel_garbage.count++];
+    item->obj = obj;
+    item->frame = _sg.frame_index;
+}
+
+_SOKOL_PRIVATE bool _sgu_mtl_accel_supported(void) {
+    if (!_sg.mtl.device) return false;
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        return [_sg.mtl.device supportsRaytracing];
+    }
+    return false;
+}
+
+/* Same frame command buffer setup as sokol_gfx's first pass of a frame, so
+   builds can run before any pass. sokol_gfx then reuses this buffer. */
+_SOKOL_PRIVATE bool _sgu_mtl_accel_acquire_cmd_buffer(void) {
+    if (!_sg.mtl.cmd_queue) return false;
+    if (nil == _sg.mtl.cmd_buffer) {
+        dispatch_semaphore_wait(_sg.mtl.sem, DISPATCH_TIME_FOREVER);
+        if (_sg.desc.metal.use_command_buffer_with_retained_references) {
+            _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBuffer];
+        } else {
+            _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBufferWithUnretainedReferences];
+        }
+        [_sg.mtl.cmd_buffer enqueue];
+        [_sg.mtl.cmd_buffer addCompletedHandler:^(id<MTLCommandBuffer> cmd_buf) {
+            /* This block runs on another thread. */
+            _SOKOL_UNUSED(cmd_buf);
+            dispatch_semaphore_signal(_sg.mtl.sem);
+        }];
+    }
+    return true;
+}
+
+_SOKOL_PRIVATE MTLPrimitiveAccelerationStructureDescriptor* _sgu_mtl_accel_blas_descriptor(const sg_accel a) API_AVAILABLE(macos(12.0), ios(15.0)) {
+    _sg_buffer_t* vb = 0;
+    _sg_buffer_t* ib = 0;
+    if (!_sgu_accel_blas_buffers(a, &vb, &ib)) return nil;
+    const sg_blas_desc* d = &a->blas;
+    MTLAccelerationStructureTriangleGeometryDescriptor* geo = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+    geo.vertexBuffer = _sg_mtl_id(vb->mtl.buf[vb->cmn.active_slot]);
+    geo.vertexBufferOffset = (NSUInteger)d->vertex_offset;
+    geo.vertexStride = (NSUInteger)d->vertex_stride;
+    geo.triangleCount = (NSUInteger)_sgu_accel_triangle_count(a);
+    geo.opaque = d->opaque ? YES : NO;
+    if (ib) {
+        geo.indexBuffer = _sg_mtl_id(ib->mtl.buf[ib->cmn.active_slot]);
+        geo.indexBufferOffset = (NSUInteger)d->index_offset;
+        geo.indexType = (d->index_format == SG_ACCEL_INDEXFORMAT_UINT16) ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+    }
+    MTLPrimitiveAccelerationStructureDescriptor* desc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+    desc.geometryDescriptors = @[geo];
+    desc.usage = a->allow_update ? MTLAccelerationStructureUsageRefit : MTLAccelerationStructureUsageNone;
+    return desc;
+}
+
+_SOKOL_PRIVATE MTLInstanceAccelerationStructureDescriptor* _sgu_mtl_accel_tlas_descriptor(const sg_accel a, uint32_t ring, int count) API_AVAILABLE(macos(12.0), ios(15.0)) {
+    MTLInstanceAccelerationStructureDescriptor* desc = [MTLInstanceAccelerationStructureDescriptor descriptor];
+    desc.instanceCount = (NSUInteger)count;
+    desc.instanceDescriptorBuffer = _SGU_MTL_OBJ(id<MTLBuffer>, a->native.instances[ring]);
+    desc.instanceDescriptorBufferOffset = 0;
+    desc.instanceDescriptorStride = sizeof(MTLAccelerationStructureUserIDInstanceDescriptor);
+    desc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeUserID;
+    desc.instancedAccelerationStructures = _SGU_MTL_OBJ(NSArray*, a->native.blas_array);
+    desc.usage = a->allow_update ? MTLAccelerationStructureUsageRefit : MTLAccelerationStructureUsageNone;
+    return desc;
+}
+
+_SOKOL_PRIVATE bool _sgu_mtl_accel_make(sg_accel a, const char* label) {
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        _sgu_mtl_accel_collect(false);
+        id<MTLDevice> dev = _sg.mtl.device;
+        MTLAccelerationStructureDescriptor* desc = nil;
+        if (a->is_tlas) {
+            NSMutableArray* array = [NSMutableArray arrayWithCapacity:(NSUInteger)a->blas_count];
+            for (int i = 0; i < a->blas_count; i++) {
+                [array addObject:_SGU_MTL_OBJ(id, a->blas_list[i]->native.as)];
+            }
+            a->native.blas_array = _SGU_MTL_RETAIN(array);
+            const NSUInteger bytes = (NSUInteger)a->max_instances * sizeof(MTLAccelerationStructureUserIDInstanceDescriptor);
+            for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) {
+                id<MTLBuffer> buffer = [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+                if (nil == buffer) return false;
+                a->native.instances[i] = _SGU_MTL_RETAIN(buffer);
+                _SGU_MTL_DROP(buffer);
+            }
+            desc = _sgu_mtl_accel_tlas_descriptor(a, 0, a->max_instances);
+        } else {
+            desc = _sgu_mtl_accel_blas_descriptor(a);
+        }
+        if (nil == desc) return false;
+        const MTLAccelerationStructureSizes sizes = [dev accelerationStructureSizesWithDescriptor:desc];
+        id<MTLAccelerationStructure> as = [dev newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+        if (nil == as) return false;
+        #if defined(SOKOL_DEBUG)
+        if (label) as.label = [NSString stringWithUTF8String:label];
+        #else
+        (void)label;
+        #endif
+        a->native.as = _SGU_MTL_RETAIN(as);
+        _SGU_MTL_DROP(as);
+        a->native.build_scratch = (uint64_t)sizes.buildScratchBufferSize;
+        a->native.refit_scratch = (uint64_t)sizes.refitScratchBufferSize;
+        return true;
+    }
+    (void)label;
+    return false;
+}
+
+_SOKOL_PRIVATE void _sgu_mtl_accel_destroy(sg_accel a) {
+    _sgu_mtl_accel_collect(false);
+    _sgu_mtl_accel_defer(a->native.as);
+    _sgu_mtl_accel_defer(a->native.blas_array);
+    for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) _sgu_mtl_accel_defer(a->native.instances[i]);
+    memset(&a->native, 0, sizeof(a->native));
+}
+
+/* Records a build or refit on an acceleration structure encoder in the frame's
+   command buffer. Encoders run in order, so later compute passes see the result. */
+_SOKOL_PRIVATE bool _sgu_mtl_accel_record(sg_accel a, const sg_accel_instance* inst, int count, bool refit) {
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        _sgu_mtl_accel_collect(false);
+        if (!_sgu_mtl_accel_acquire_cmd_buffer()) return false;
+        MTLAccelerationStructureDescriptor* desc = nil;
+        if (a->is_tlas) {
+            const uint32_t ring = _sg.mtl.cur_frame_rotate_index;
+            id<MTLBuffer> buffer = _SGU_MTL_OBJ(id<MTLBuffer>, a->native.instances[ring]);
+            MTLAccelerationStructureUserIDInstanceDescriptor* dst = (MTLAccelerationStructureUserIDInstanceDescriptor*)[buffer contents];
+            for (int i = 0; i < count; i++) {
+                const sg_accel_instance* s = &inst[i];
+                MTLAccelerationStructureUserIDInstanceDescriptor* d = &dst[i];
+                for (int c = 0; c < 4; c++) {
+                    d->transformationMatrix.columns[c] = MTLPackedFloat3Make(s->transform[c], s->transform[4 + c], s->transform[8 + c]);
+                }
+                uint32_t options = 0;
+                if (s->flags & SG_ACCEL_INSTANCE_OPAQUE) options |= (uint32_t)MTLAccelerationStructureInstanceOptionOpaque;
+                if (s->flags & SG_ACCEL_INSTANCE_NO_CULL) options |= (uint32_t)MTLAccelerationStructureInstanceOptionDisableTriangleCulling;
+                d->options = (MTLAccelerationStructureInstanceOptions)options;
+                d->mask = s->mask;
+                d->intersectionFunctionTableOffset = 0;
+                d->accelerationStructureIndex = (uint32_t)s->blas_index;
+                d->userID = s->id & 0xFFFFFFu;
+            }
+            desc = _sgu_mtl_accel_tlas_descriptor(a, ring, count);
+        } else {
+            desc = _sgu_mtl_accel_blas_descriptor(a);
+        }
+        if (nil == desc) return false;
+        const uint64_t scratch_size = refit ? a->native.refit_scratch : a->native.build_scratch;
+        id<MTLBuffer> scratch = [_sg.mtl.device newBufferWithLength:(NSUInteger)(scratch_size ? scratch_size : 16)
+            options:MTLResourceStorageModePrivate];
+        if (nil == scratch) return false;
+        id<MTLAccelerationStructure> as = _SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->native.as);
+        id<MTLAccelerationStructureCommandEncoder> encoder = [_sg.mtl.cmd_buffer accelerationStructureCommandEncoder];
+        if (refit) {
+            [encoder refitAccelerationStructure:as descriptor:desc destination:as scratchBuffer:scratch scratchBufferOffset:0];
+        } else {
+            [encoder buildAccelerationStructure:as descriptor:desc scratchBuffer:scratch scratchBufferOffset:0];
+        }
+        [encoder endEncoding];
+        /* The completion block keeps the scratch buffer alive until the GPU is done. */
+        [_sg.mtl.cmd_buffer addCompletedHandler:^(id<MTLCommandBuffer> cmd_buf) {
+            _SOKOL_UNUSED(cmd_buf);
+            _SOKOL_UNUSED(scratch);
+        }];
+        _SGU_MTL_DROP(scratch);
+        return true;
+    }
+    (void)a; (void)inst; (void)count; (void)refit;
+    return false;
+}
+
+/* Binds the TLAS as [[buffer(16 + slot)]] and marks it and its BLASes resident. */
+_SOKOL_PRIVATE bool _sgu_mtl_accel_bind(const sg_accel a, int slot) {
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        if (nil == _sg.mtl.compute_cmd_encoder) return false;
+        id<MTLComputeCommandEncoder> encoder = _sg.mtl.compute_cmd_encoder;
+        id<MTLAccelerationStructure> tlas = _SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->native.as);
+        [encoder setAccelerationStructure:tlas atBufferIndex:(NSUInteger)(_SGU_MTL_ACCEL_BUFFER_BASE + slot)];
+        [encoder useResource:tlas usage:MTLResourceUsageRead];
+        for (int i = 0; i < a->blas_count; i++) {
+            [encoder useResource:_SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->blas_list[i]->native.as) usage:MTLResourceUsageRead];
+        }
+        return true;
+    }
+    (void)a; (void)slot;
+    return false;
+}
+
+_SOKOL_PRIVATE void _sgu_mtl_accel_shutdown(void) {
+    _sgu_mtl_accel_collect(true);
+    free(_sgu_mtl_accel_garbage.items);
+    memset(&_sgu_mtl_accel_garbage, 0, sizeof(_sgu_mtl_accel_garbage));
+}
+
+#endif /* SOKOL_METAL */
+
+/*--- Acceleration Structures: Backend Dispatch ------------------------------*/
+#if defined(SOKOL_VULKAN)
+#define _sgu_accel_native_supported _sgu_vk_accel_supported
+#define _sgu_accel_native_make _sgu_vk_accel_make
+#define _sgu_accel_native_destroy _sgu_vk_accel_destroy
+#define _sgu_accel_native_record _sgu_vk_accel_record
+#define _sgu_accel_native_bind _sgu_vk_accel_bind
+#define _sgu_accel_native_shutdown _sgu_vk_accel_shutdown
+#elif defined(SOKOL_METAL)
+#define _sgu_accel_native_supported _sgu_mtl_accel_supported
+#define _sgu_accel_native_make _sgu_mtl_accel_make
+#define _sgu_accel_native_destroy _sgu_mtl_accel_destroy
+#define _sgu_accel_native_record _sgu_mtl_accel_record
+#define _sgu_accel_native_bind _sgu_mtl_accel_bind
+#define _sgu_accel_native_shutdown _sgu_mtl_accel_shutdown
+#else
+/* D3D11, WebGPU, GL and the dummy backend report no support. */
+_SOKOL_PRIVATE bool _sgu_accel_native_supported(void) { return false; }
+_SOKOL_PRIVATE bool _sgu_accel_native_make(sg_accel a, const char* label) { (void)a; (void)label; return false; }
+_SOKOL_PRIVATE void _sgu_accel_native_destroy(sg_accel a) { (void)a; }
+_SOKOL_PRIVATE bool _sgu_accel_native_record(sg_accel a, const sg_accel_instance* inst, int count, bool refit) {
+    (void)a; (void)inst; (void)count; (void)refit; return false;
+}
+_SOKOL_PRIVATE bool _sgu_accel_native_bind(const sg_accel a, int slot) { (void)a; (void)slot; return false; }
+_SOKOL_PRIVATE void _sgu_accel_native_shutdown(void) {}
+#endif
+
+/*--- Acceleration Structures: Public API ------------------------------------*/
+SOKOL_API_IMPL bool sg_ray_query_supported(void) {
+    return sg_isvalid() && _sgu_accel_native_supported();
+}
+
+SOKOL_API_IMPL sg_buffer sg_make_accel_input_buffer(const sg_buffer_desc* desc) {
+    sg_buffer invalid = { SG_INVALID_ID };
+    if (!desc || !sg_ray_query_supported() || _sg.cur_pass.in_pass) return invalid;
+    sg_buffer_desc d = sg_query_buffer_defaults(desc);
+    if (!d.usage.storage_buffer || d.usage.write_transient || d.usage.write_unsealed ||
+        d.usage.staging_buffer || d.usage.staging_index_buffer || d.gl_buffer ||
+        d.mtl_buffer || d.d3d11_buffer || d.wgpu_buffer || !d.size || d.size > INT32_MAX ||
+        (d.size & 3) || (d.data.ptr && d.data.size != d.size)) return invalid;
+    #if defined(SOKOL_VULKAN)
+    sg_buffer result = sg_alloc_buffer();
+    _sg_buffer_t* buf = _sg_lookup_buffer(result.id);
+    if (!buf) return result;
+    _sg_buffer_common_init(&buf->cmn, &d);
+    buf->slot.state = _sgu_vk_create_indirect_buffer(buf, &d, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
+    _sg_resource_stats_inc(buffers.inited);
+    _SG_TRACE_ARGS(init_buffer, result, &d);
+    return result;
+    #else
+    return sg_make_buffer(&d);
+    #endif
+}
+
+SOKOL_API_IMPL sg_accel sg_make_blas(const sg_blas_desc* desc) {
+    if (!desc || !sg_ray_query_supported()) return NULL;
+    const sg_blas_desc* d = desc;
+    if (d->vertex_count < 3 || d->vertex_stride < 12 || (d->vertex_stride & 3) ||
+        d->vertex_offset < 0 || (d->vertex_offset & 3)) return NULL;
+    if (d->index_format == SG_ACCEL_INDEXFORMAT_NONE) {
+        if (d->vertex_count % 3) return NULL;
+    } else if (d->index_count < 3 || (d->index_count % 3) || d->index_offset < 0 || (d->index_offset & 3)) {
+        return NULL;
+    }
+    sg_accel a = (sg_accel)calloc(1, sizeof(*a));
+    if (!a) return NULL;
+    a->blas = *d;
+    a->blas.label = NULL;
+    a->allow_update = d->allow_update;
+    if (!_sgu_accel_native_make(a, d->label)) {
+        _sgu_accel_native_destroy(a);
+        free(a);
+        return NULL;
+    }
+    return a;
+}
+
+SOKOL_API_IMPL sg_accel sg_make_tlas(const sg_tlas_desc* desc) {
+    if (!desc || !sg_ray_query_supported() || !desc->blas || desc->blas_count < 1 || desc->max_instances < 1) return NULL;
+    for (int i = 0; i < desc->blas_count; i++) {
+        if (!desc->blas[i] || desc->blas[i]->is_tlas || desc->blas[i]->destroy_requested) return NULL;
+    }
+    sg_accel a = (sg_accel)calloc(1, sizeof(*a));
+    if (!a) return NULL;
+    a->blas_list = (sg_accel*)malloc(sizeof(sg_accel) * (size_t)desc->blas_count);
+    if (!a->blas_list) { free(a); return NULL; }
+    memcpy(a->blas_list, desc->blas, sizeof(sg_accel) * (size_t)desc->blas_count);
+    a->is_tlas = true;
+    a->allow_update = desc->allow_update;
+    a->blas_count = desc->blas_count;
+    a->max_instances = desc->max_instances;
+    if (!_sgu_accel_native_make(a, desc->label)) {
+        _sgu_accel_native_destroy(a);
+        free(a->blas_list);
+        free(a);
+        return NULL;
+    }
+    for (int i = 0; i < a->blas_count; i++) a->blas_list[i]->refs++;
+    return a;
+}
+
+_SOKOL_PRIVATE void _sgu_accel_release(sg_accel a) {
+    _sgu_accel_native_destroy(a);
+    if (a->is_tlas) {
+        for (int i = 0; i < a->blas_count; i++) {
+            sg_accel blas = a->blas_list[i];
+            if (--blas->refs == 0 && blas->destroy_requested) _sgu_accel_release(blas);
+        }
+        free(a->blas_list);
+    }
+    free(a);
+}
+
+SOKOL_API_IMPL void sg_destroy_accel(sg_accel accel) {
+    if (!accel) return;
+    if (accel->refs > 0) {
+        accel->destroy_requested = true;
+        return;
+    }
+    _sgu_accel_release(accel);
+}
+
+_SOKOL_PRIVATE bool _sgu_accel_can_record(const sg_accel a, bool want_tlas) {
+    return a && a->is_tlas == want_tlas && !a->destroy_requested &&
+        sg_ray_query_supported() && !_sg.cur_pass.in_pass;
+}
+
+SOKOL_API_IMPL bool sg_build_blas(sg_accel blas) {
+    if (!_sgu_accel_can_record(blas, false)) return false;
+    if (!_sgu_accel_native_record(blas, 0, 0, false)) return false;
+    blas->built = true;
+    return true;
+}
+
+SOKOL_API_IMPL bool sg_refit_blas(sg_accel blas) {
+    if (!_sgu_accel_can_record(blas, false) || !blas->built || !blas->allow_update) return false;
+    return _sgu_accel_native_record(blas, 0, 0, true);
+}
+
+/* A TLAS owns one instance buffer slot per frame in flight, so it takes one
+   build or refit per frame. */
+_SOKOL_PRIVATE bool _sgu_accel_record_tlas(sg_accel tlas, const sg_accel_instance* instances, int count, bool refit) {
+    if (!_sgu_accel_can_record(tlas, true) || !instances || count < 1 || count > tlas->max_instances) return false;
+    if (refit && (!tlas->built || !tlas->allow_update || count != tlas->built_count)) return false;
+    if (tlas->recorded && tlas->last_frame == _sg.frame_index) return false;
+    for (int i = 0; i < count; i++) {
+        const int index = instances[i].blas_index;
+        if (index < 0 || index >= tlas->blas_count || !tlas->blas_list[index]->built) return false;
+    }
+    if (!_sgu_accel_native_record(tlas, instances, count, refit)) return false;
+    tlas->built = true;
+    tlas->built_count = count;
+    tlas->recorded = true;
+    tlas->last_frame = _sg.frame_index;
+    return true;
+}
+
+SOKOL_API_IMPL bool sg_build_tlas(sg_accel tlas, const sg_accel_instance* instances, int count) {
+    return _sgu_accel_record_tlas(tlas, instances, count, false);
+}
+
+SOKOL_API_IMPL bool sg_refit_tlas(sg_accel tlas, const sg_accel_instance* instances, int count) {
+    return _sgu_accel_record_tlas(tlas, instances, count, true);
+}
+
+SOKOL_API_IMPL bool sg_accel_built(sg_accel accel) {
+    return accel && accel->built;
+}
+
+SOKOL_API_IMPL sg_shader sg_make_shader_accel(const sg_shader_desc* desc, int slot_mask) {
+    sg_shader shader = sg_make_shader(desc);
+    #if defined(SOKOL_VULKAN)
+    if (slot_mask & 0xF) {
+        if (!sg_ray_query_supported() || !_sgu_vk_accel_patch_shader(shader, slot_mask & 0xF)) {
+            sg_destroy_shader(shader);
+            sg_shader invalid = { SG_INVALID_ID };
+            return invalid;
+        }
+    }
+    #else
+    (void)slot_mask;
+    #endif
+    return shader;
+}
+
+SOKOL_API_IMPL bool sg_accel_bind(sg_accel tlas, int slot) {
+    if (!tlas || !tlas->is_tlas || !tlas->built || slot < 0 || slot > 3 || !sg_ray_query_supported()) return false;
+    if (!_sg.cur_pass.valid || !_sg.cur_pass.in_pass || !_sg.cur_pass.is_compute) return false;
+    return _sgu_accel_native_bind(tlas, slot);
+}
+
+SOKOL_API_IMPL void sg_accel_shutdown(void) {
+    _sgu_accel_native_shutdown();
 }
 
 #endif /* SOKOL_GFX_UTILS_IMPL */

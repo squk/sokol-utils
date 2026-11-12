@@ -4,7 +4,7 @@ Extension utilities for the [sokol](https://github.com/floooh/sokol) headers.
 
 Currently, this repository contains:
 - `sokol_app_utils.h`: Additional functionality for `sokol_app.h`.
-- `sokol_gfx_utils.h`: Additional functionality for `sokol_gfx.h` (readback, indirect commands, and GPU pass timings).
+- `sokol_gfx_utils.h`: Additional functionality for `sokol_gfx.h` (readback, indirect commands, GPU pass timings, and ray query acceleration structures).
 
 ## Usage
 
@@ -167,3 +167,55 @@ shutdown. If it returns `false`, Vulkan could not confirm idle: receipts stay
 intact. Retry cleanup or stop graphics teardown; do not destroy the device.
 On success, surviving receipts report unknown and still need destruction.
 WebGPU requires the modern callback API and supported atomic operations.
+
+### Acceleration structures and ray queries
+
+```c
+bool sg_ray_query_supported(void);
+sg_buffer sg_make_accel_input_buffer(const sg_buffer_desc* desc);
+sg_accel sg_make_blas(const sg_blas_desc* desc);
+sg_accel sg_make_tlas(const sg_tlas_desc* desc);
+bool sg_build_blas(sg_accel blas);
+bool sg_refit_blas(sg_accel blas);
+bool sg_build_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
+bool sg_refit_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
+sg_shader sg_make_shader_accel(const sg_shader_desc* desc, int slot_mask);
+bool sg_accel_bind(sg_accel tlas, int slot);
+void sg_destroy_accel(sg_accel accel);
+void sg_accel_shutdown(void);
+```
+
+A bottom-level structure (BLAS) holds a triangle mesh of float3 positions. A
+top-level structure (TLAS) holds instances of BLASes: a row-major 3x4 transform,
+a 24-bit id, an 8-bit mask and a BLAS index. Compute shaders trace rays with
+ray queries. Metal and Vulkan support them. D3D11, WebGPU and GL report
+`sg_ray_query_supported() == false`. Sokol has no D3D12 backend, so Windows uses
+Vulkan.
+
+Create vertex and index buffers with `sg_make_accel_input_buffer` (they need
+`usage.storage_buffer`). A BLAS stores the buffer ids and reads the buffers at
+each build or refit. `sg_make_blas` and `sg_make_tlas` record no commands. Build
+or refit outside passes, in command order before the compute pass that reads
+the result; a TLAS takes one build or refit per frame. Refit needs
+`allow_update` and keeps topology and instance count. Compaction is not
+supported. The caller owns each `sg_accel`. A TLAS holds a reference on its
+BLASes, and `sg_destroy_accel` defers the free until the GPU has finished the
+frames that can use the structure. Call these functions on the sokol_gfx
+thread. Call `sg_accel_shutdown` after `sg_shutdown`, with the native device
+alive.
+
+`sg_accel_bind(tlas, slot)` uses the slot sokol-slang reflects (0..3). On Metal
+it sets `[[buffer(16 + slot)]]` on the compute encoder and marks the TLAS and
+its BLASes resident. On Vulkan, sokol_gfx does not know the binding: create the
+shader with `sg_make_shader_accel(desc, slot_mask)`, which adds set 1 binding
+`44 + slot` to its layout, and call `sg_accel_bind` after each
+`sg_apply_bindings` in the compute pass.
+
+Vulkan device setup: the application creates the `VkDevice` and must enable the
+extensions `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and
+`VK_KHR_deferred_host_operations`, and the features
+`VkPhysicalDeviceAccelerationStructureFeaturesKHR::accelerationStructure` and
+`VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery`, besides `bufferDeviceAddress`
+and descriptor buffers that sokol_gfx already needs. `sg_ray_query_supported`
+checks the GPU and entry points; it cannot see which features the application
+enabled.
