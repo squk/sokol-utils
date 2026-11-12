@@ -101,6 +101,13 @@ typedef struct sg_gpu_pass_timing {
     char label[SG_GPU_PASS_TIMING_LABEL_SIZE];
     uint64_t frame_index;
     double milliseconds;
+    /* Pass start and end in nanoseconds on the clock that
+       sg_gpu_pass_timings_clock_ns() reads. Zero when the backend cannot place
+       the pass on that clock, and always zero for the "Frame" entry.
+       end_ns - begin_ns equals milliseconds, so a pass whose vertex and
+       fragment stages run apart still reports only its own work. */
+    uint64_t begin_ns;
+    uint64_t end_ns;
 } sg_gpu_pass_timing;
 
 /* Requires a valid sg context and SOKOL_TRACE_HOOKS in the implementation.
@@ -122,6 +129,11 @@ SOKOL_GFX_UTILS_API_DECL bool sg_gpu_pass_timings_supported(void);
     "Frame" when available. Allow MAX_PASSES + 1 entries to receive all results.
 */
 SOKOL_GFX_UTILS_API_DECL int sg_gpu_pass_timings_poll(sg_gpu_pass_timing* timings, int max_timings);
+
+/* Reads the clock behind sg_gpu_pass_timing.begin_ns and end_ns, in
+   nanoseconds. Returns 0 when the backend does not support it. Callers pair
+   one reading with their own profiler clock to place pass timings on it. */
+SOKOL_GFX_UTILS_API_DECL uint64_t sg_gpu_pass_timings_clock_ns(void);
 
 /* Native receipts for sg_commit_tracked. These APIs run on the graphics
    context's owning thread, outside passes. A receipt covers preceding work
@@ -862,6 +874,7 @@ _SOKOL_PRIVATE int _sgu_mtl_gpu_timing_poll(sg_gpu_pass_timing* timings, int max
         _sgu_mtl_gpu_timing_release_frame(oldest);
         return result_count;
     }
+    const double nanoseconds_per_tick = milliseconds_per_tick * 1000000.0;
     const MTLCounterResultTimestamp* samples = (const MTLCounterResultTimestamp*)data.bytes;
     for (uint32_t index = 0; index < oldest->pass_count && result_count < max_timings; ++index) {
         const _sgu_mtl_gpu_pass_t* pass = &oldest->passes[index];
@@ -899,9 +912,26 @@ _SOKOL_PRIVATE int _sgu_mtl_gpu_timing_poll(sg_gpu_pass_timing* timings, int max
         timing->label[SG_GPU_PASS_TIMING_LABEL_SIZE - 1] = 0;
         timing->frame_index = oldest->frame_index;
         timing->milliseconds = (double)duration * milliseconds_per_tick;
+        // Start at the earliest stage start, on the CPU clock of sampleTimestamps.
+        // End after the summed stage time, not at the last stage end.
+        uint64_t first_start = starts[0];
+        if (first_start == 0 || (starts[1] != 0 && starts[1] < first_start)) first_start = starts[1];
+        const double offset_ns = ((double)first_start - (double)oldest->gpu_begin) * nanoseconds_per_tick;
+        const double begin_ns = (double)oldest->cpu_begin + offset_ns;
+        if (begin_ns > 0.0) {
+            timing->begin_ns = (uint64_t)begin_ns;
+            timing->end_ns = (uint64_t)(begin_ns + (double)duration * nanoseconds_per_tick);
+        }
     }
     _sgu_mtl_gpu_timing_release_frame(oldest);
     return result_count;
+}
+
+_SOKOL_PRIVATE uint64_t _sgu_mtl_gpu_timing_clock_ns(void) {
+    if (!_sg.mtl.device) return 0;
+    MTLTimestamp cpu = 0, gpu = 0;
+    [_sg.mtl.device sampleTimestamps:&cpu gpuTimestamp:&gpu];
+    return (uint64_t)cpu;
 }
 
 _SOKOL_PRIVATE void _sgu_mtl_gpu_timing_shutdown(void) {
@@ -1676,12 +1706,24 @@ SOKOL_API_IMPL int sg_gpu_pass_timings_poll(sg_gpu_pass_timing* timings, int max
     if (!_sgu_gpu_pass_timing_state.supported || !timings || max_timings <= 0) {
         return 0;
     }
+    memset(timings, 0, sizeof(sg_gpu_pass_timing) * (size_t)max_timings);
 #if defined(SOKOL_METAL)
     return _sgu_mtl_gpu_timing_poll(timings, max_timings);
 #elif defined(SOKOL_VULKAN)
     return _sgu_vk_gpu_timing_poll(timings, max_timings);
 #elif defined(SOKOL_D3D11)
     return _sgu_d3d11_gpu_timing_poll(timings, max_timings);
+#else
+    return 0;
+#endif
+}
+
+SOKOL_API_IMPL uint64_t sg_gpu_pass_timings_clock_ns(void) {
+    if (!_sgu_gpu_pass_timing_state.supported) {
+        return 0;
+    }
+#if defined(SOKOL_METAL)
+    return _sgu_mtl_gpu_timing_clock_ns();
 #else
     return 0;
 #endif
