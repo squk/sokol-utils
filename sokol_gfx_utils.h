@@ -226,8 +226,10 @@ SOKOL_GFX_UTILS_API_DECL bool sg_shutdown_submission_receipts(void);
     sg_make_shader_accel logs and returns an invalid shader when:
     - a slot is repeated or not below SG_ACCEL_MAX_SLOTS, or num_slots is out of
       range;
-    - Metal: an msl_buffer_n is negative, above 30, repeated, or equal to the
-      msl_buffer_n of a uniform block or storage buffer of the shader;
+    - Metal: an msl_buffer_n is below SG_MAX_UNIFORMBLOCK_BINDSLOTS (sokol_gfx
+      keeps the uniform buffer bound there for the whole pass), above 30,
+      repeated, or equal to the msl_buffer_n of a uniform block or storage
+      buffer of the shader;
     - Vulkan: a vk_binding_n is negative, repeated, or equal to the binding of a
       view or sampler of the shader. It must also be at least
       SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS of the sokol_gfx.h that
@@ -3069,9 +3071,14 @@ _SOKOL_PRIVATE void _sgu_vk_accel_shutdown(void) {
 _SOKOL_PRIVATE bool _sgu_mtl_accel_validate(const sg_shader_desc* desc, const sg_accel_layout_desc* layout) {
     for (int i = 0; i < layout->num_slots; i++) {
         const int n = layout->slots[i].msl_buffer_n;
-        if (n < 0 || n > _SGU_MTL_MAX_BUFFER_N) {
-            _sgu_accel_log("sg_make_shader_accel: slot %d msl_buffer_n %d is not in 0..%d",
-                layout->slots[i].slot, n, _SGU_MTL_MAX_BUFFER_N);
+        /* sokol_gfx binds the frame's uniform buffer at indices
+           0..SG_MAX_UNIFORMBLOCK_BINDSLOTS-1 once per pass, and sg_apply_uniforms
+           then only moves the offset (_sg_mtl_bind_uniform_buffers,
+           _sg_mtl_apply_uniforms). A TLAS at one of those indices would replace
+           the uniform buffer for every later shader of the pass. */
+        if (n < SG_MAX_UNIFORMBLOCK_BINDSLOTS || n > _SGU_MTL_MAX_BUFFER_N) {
+            _sgu_accel_log("sg_make_shader_accel: slot %d msl_buffer_n %d is not in %d..%d",
+                layout->slots[i].slot, n, SG_MAX_UNIFORMBLOCK_BINDSLOTS, _SGU_MTL_MAX_BUFFER_N);
             return false;
         }
         for (int j = 0; j < i; j++) {
@@ -3481,12 +3488,21 @@ _SOKOL_PRIVATE bool _sgu_mtl_accel_bind(const sg_accel a, int slot) {
         if (!slot_layout || slot_layout->msl_buffer_n < 0) return false;
         id<MTLComputeCommandEncoder> encoder = _sg.mtl.compute_cmd_encoder;
         id<MTLAccelerationStructure> tlas = _SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->native.as);
-        [encoder setAccelerationStructure:tlas atBufferIndex:(NSUInteger)slot_layout->msl_buffer_n];
+        const int buffer_n = slot_layout->msl_buffer_n;
+        [encoder setAccelerationStructure:tlas atBufferIndex:(NSUInteger)buffer_n];
+        /* sokol_gfx caches the storage buffer at each compute buffer index and
+           skips setBuffer, or sets only the offset, when the cache matches. The
+           TLAS now sits at buffer_n, so clear that entry: the next storage
+           buffer at buffer_n then gets a full setBuffer. Unreal clears its
+           buffer binding the same way when it sets an acceleration structure
+           (Engine/Source/Runtime/Apple/MetalRHI/Private/MetalStateCache.cpp:1446-1456,
+           MetalCommandEncoder.cpp:1185-1189). */
+        memset(&_sg.mtl.cache.cur_csbufs[buffer_n], 0, sizeof(_sg.mtl.cache.cur_csbufs[buffer_n]));
         [encoder useResource:tlas usage:MTLResourceUsageRead];
         for (int i = 0; i < a->blas_count; i++) {
             [encoder useResource:_SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->blas_list[i]->native.as) usage:MTLResourceUsageRead];
         }
-        _sgu_mtl_accel_report_bind(a, slot, slot_layout->msl_buffer_n);
+        _sgu_mtl_accel_report_bind(a, slot, buffer_n);
         return true;
     }
     (void)a; (void)slot;
