@@ -182,8 +182,12 @@ SOKOL_GFX_UTILS_API_DECL bool sg_shutdown_submission_receipts(void);
       at each build. A BLAS stores the sg_buffer ids and reads the buffers
       again at every build or refit. Do not destroy those buffers while a build
       that reads them can still be recorded.
+    - Input buffers may be streamed: make them with usage.write_unsealed,
+      fill them with sg_write_buffer_unsealed (or copies) and call
+      sg_seal_buffer. sg_make_blas, sg_build_blas and sg_refit_blas refuse a
+      buffer that is not sealed yet.
     - sg_make_blas reads the buffers to size the structure, so both must be
-      valid (initialized) when it runs. Index values are not range checked:
+      valid (sealed) when it runs. Index values are not range checked:
       an index at or above vertex_count reads past the vertex data on the GPU.
     - The caller owns each sg_accel and frees it with sg_destroy_accel. A TLAS
       holds a reference to each BLAS in its desc. A BLAS destroyed earlier
@@ -308,7 +312,9 @@ typedef struct sg_accel_instance {
 SOKOL_GFX_UTILS_API_DECL bool sg_ray_query_supported(void);
 /* Like sg_make_indirect_buffer: needs usage.storage_buffer, returns an invalid
    buffer when ray queries are unsupported. On Vulkan the buffer also gets
-   build-input usage. The caller destroys it with sg_destroy_buffer. */
+   build-input usage. usage.write_unsealed is accepted without initial data:
+   the buffer then starts UNSEALED, as from sg_make_buffer, and is ready for a
+   BLAS after sg_seal_buffer. The caller destroys it with sg_destroy_buffer. */
 SOKOL_GFX_UTILS_API_DECL sg_buffer sg_make_accel_input_buffer(const sg_buffer_desc* desc);
 /* Return NULL on failure. */
 SOKOL_GFX_UTILS_API_DECL sg_accel sg_make_blas(const sg_blas_desc* desc);
@@ -3562,7 +3568,10 @@ SOKOL_API_IMPL sg_buffer sg_make_accel_input_buffer(const sg_buffer_desc* desc) 
     sg_buffer invalid = { SG_INVALID_ID };
     if (!desc || !sg_ray_query_supported() || _sg.cur_pass.in_pass) return invalid;
     sg_buffer_desc d = sg_query_buffer_defaults(desc);
-    if (!d.usage.storage_buffer || d.usage.write_transient || d.usage.write_unsealed ||
+    /* An unsealed buffer is filled in parts by sg_write_buffer_unsealed and
+       starts with no data, as sg_make_buffer's unsealed buffers do. */
+    if (!d.usage.storage_buffer || d.usage.write_transient ||
+        (d.usage.write_unsealed && (!d.usage.immutable || d.data.ptr)) ||
         d.usage.staging_buffer || d.usage.staging_index_buffer || d.gl_buffer ||
         d.mtl_buffer || d.d3d11_buffer || d.wgpu_buffer || !d.size || d.size > INT32_MAX ||
         (d.size & 3) || (d.data.ptr && d.data.size != d.size)) return invalid;
@@ -3571,7 +3580,18 @@ SOKOL_API_IMPL sg_buffer sg_make_accel_input_buffer(const sg_buffer_desc* desc) 
     _sg_buffer_t* buf = _sg_lookup_buffer(result.id);
     if (!buf) return result;
     _sg_buffer_common_init(&buf->cmn, &d);
+    /* A build reads its inputs through device addresses, so the buffer needs
+       build-input usage from creation. storage_buffer already adds
+       SHADER_DEVICE_ADDRESS (_sg_vk_buffer_usage). Unreal gives every buffer
+       both bits when the device has ray tracing
+       (Engine/Source/Runtime/VulkanRHI/Private/VulkanBuffer.cpp:110-120). */
     buf->slot.state = _sgu_vk_create_indirect_buffer(buf, &d, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
+    /* Same state change as sokol_gfx's _sg_init_buffer: sg_write_buffer_unsealed
+       and sg_seal_buffer accept only UNSEALED buffers. Vulkan sealing records
+       nothing (_sg_vk_seal_buffer), so this buffer needs no extra step there. */
+    if (d.usage.write_unsealed && buf->slot.state == SG_RESOURCESTATE_VALID) {
+        buf->slot.state = SG_RESOURCESTATE_UNSEALED;
+    }
     _sg_resource_stats_inc(buffers.inited);
     _SG_TRACE_ARGS(init_buffer, result, &d);
     return result;
