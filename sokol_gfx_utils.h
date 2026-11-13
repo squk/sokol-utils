@@ -2953,15 +2953,15 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_patch_shader(sg_shader id, const sg_accel_layo
     pl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pl_info.setLayoutCount = 2;
     pl_info.pSetLayouts = set_layouts;
-    VkPipelineLayout layout = 0;
-    if (vkCreatePipelineLayout(dev, &pl_info, 0, &layout) != VK_SUCCESS) {
+    VkPipelineLayout pipeline_layout = 0;
+    if (vkCreatePipelineLayout(dev, &pl_info, 0, &pipeline_layout) != VK_SUCCESS) {
         _SG_ERROR(VULKAN_CREATE_PIPELINE_LAYOUT_FAILED);
         vkDestroyDescriptorSetLayout(dev, dsl, 0);
         return false;
     }
     vkDestroyPipelineLayout(dev, shd->vk.pip_layout, 0);
     vkDestroyDescriptorSetLayout(dev, shd->vk.view_smp_dsl, 0);
-    shd->vk.pip_layout = layout;
+    shd->vk.pip_layout = pipeline_layout;
     shd->vk.view_smp_dsl = dsl;
     _sg.vk.ext.get_descriptor_set_layout_size(dev, dsl, &shd->vk.view_smp_dset_size);
     for (int i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
