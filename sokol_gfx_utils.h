@@ -2409,7 +2409,7 @@ _SOKOL_PRIVATE int _sgu_accel_triangle_count(const sg_accel blas) {
    these messages, so item 0 carries the text. */
 _SOKOL_PRIVATE void _sgu_accel_log(const char* fmt, ...) {
     if (!_sg.desc.logger.func) return;
-    char msg[256];
+    char msg[512];  /* the accel report lines carry a full instance transform */
     va_list args;
     va_start(args, fmt);
     vsnprintf(msg, sizeof(msg), fmt, args);
@@ -3297,6 +3297,110 @@ _SOKOL_PRIVATE void _sgu_mtl_accel_destroy(sg_accel a) {
     memset(&a->native, 0, sizeof(a->native));
 }
 
+/* One-shot report of the first TLAS build and the binds that follow it. It
+   settles from one run whether the GPU built the structures and whether the
+   compute encoder gets the same TLAS. After the first full TLAS build, the
+   same encoder writes the compacted sizes of the TLAS and of its first
+   _SGU_MTL_ACCEL_REPORT_BLAS BLASes into a shared buffer. A compacted size is
+   0 for a structure that was never built. The command buffer's completed
+   handler, which runs on a Metal thread, only copies the sizes and the status;
+   the next sg_accel_bind logs them on the sokol thread. */
+#define _SGU_MTL_ACCEL_REPORT_BLAS (8)
+static struct {
+    bool build_logged;          /* the first TLAS build was logged and armed */
+    bool bind_logged;           /* the first bind after that build was logged */
+    bool result_logged;         /* the GPU result was logged */
+    void* tlas;                 /* id<MTLAccelerationStructure> of the reported build, not retained */
+    void* sizes;                /* retained id<MTLBuffer>, uint32_t per structure */
+    int blas_reported;
+    volatile int done;          /* set by the completed handler */
+    volatile int status;        /* MTLCommandBufferStatus */
+    volatile long error_code;   /* NSError code, 0 for none */
+    uint32_t compacted[1 + _SGU_MTL_ACCEL_REPORT_BLAS];
+} _sgu_mtl_accel_report;
+
+/* Logs the CPU side of the first TLAS build and arms the GPU readback on its
+   encoder. Called after the build is encoded and before endEncoding. */
+_SOKOL_PRIVATE void _sgu_mtl_accel_report_build(sg_accel a, int count, uint32_t ring,
+    id<MTLAccelerationStructureCommandEncoder> encoder) API_AVAILABLE(macos(12.0), ios(15.0)) {
+    _sgu_mtl_accel_report.build_logged = true;
+    id<MTLAccelerationStructure> tlas = _SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->native.as);
+    id<MTLBuffer> instances = _SGU_MTL_OBJ(id<MTLBuffer>, a->native.instances[ring]);
+    _sgu_accel_log("accel report: TLAS %p size %llu, %d of %d instances, %d BLASes, ring %u, frame %u, "
+        "instance stride %d, instance buffer %llu bytes", (void*)tlas, (unsigned long long)tlas.size, count,
+        a->max_instances, a->blas_count, ring, _sg.frame_index,
+        (int)sizeof(MTLAccelerationStructureUserIDInstanceDescriptor), (unsigned long long)instances.length);
+    const MTLAccelerationStructureUserIDInstanceDescriptor* d =
+        (const MTLAccelerationStructureUserIDInstanceDescriptor*)[instances contents];
+    for (int i = 0; i < count && i < 2; i++) {
+        const MTLPackedFloat4x3* m = &d[i].transformationMatrix;
+        _sgu_accel_log("accel report: instance %d blas %u user %u mask 0x%x options 0x%x ift %u "
+            "c0 (%g %g %g) c1 (%g %g %g) c2 (%g %g %g) c3 (%g %g %g)", i, d[i].accelerationStructureIndex,
+            d[i].userID, d[i].mask, (unsigned)d[i].options, d[i].intersectionFunctionTableOffset,
+            m->columns[0].x, m->columns[0].y, m->columns[0].z, m->columns[1].x, m->columns[1].y, m->columns[1].z,
+            m->columns[2].x, m->columns[2].y, m->columns[2].z, m->columns[3].x, m->columns[3].y, m->columns[3].z);
+    }
+    for (int i = 0; i < a->blas_count; i++) {
+        const sg_accel b = a->blas_list[i];
+        _sg_buffer_t* vb = 0;
+        _sg_buffer_t* ib = 0;
+        const bool inputs = _sgu_accel_blas_buffers(b, &vb, &ib);
+        _sgu_accel_log("accel report: BLAS %d %p size %llu built %d triangles %d vertices %d stride %d offset %d "
+            "index format %d count %d offset %d, inputs %s (vertex buffer %d bytes)", i, b->native.as,
+            (unsigned long long)_SGU_MTL_OBJ(id<MTLAccelerationStructure>, b->native.as).size, (int)b->built,
+            _sgu_accel_triangle_count(b), b->blas.vertex_count, b->blas.vertex_stride, b->blas.vertex_offset,
+            (int)b->blas.index_format, b->blas.index_count, b->blas.index_offset, inputs ? "valid" : "INVALID",
+            vb ? (int)vb->cmn.size : -1);
+    }
+    const int blas_n = a->blas_count < _SGU_MTL_ACCEL_REPORT_BLAS ? a->blas_count : _SGU_MTL_ACCEL_REPORT_BLAS;
+    id<MTLBuffer> sizes = [_sg.mtl.device newBufferWithLength:sizeof(uint32_t) * (1 + _SGU_MTL_ACCEL_REPORT_BLAS)
+        options:MTLResourceStorageModeShared];
+    if (nil == sizes) return;
+    memset([sizes contents], 0, sizes.length);
+    [encoder writeCompactedAccelerationStructureSize:tlas toBuffer:sizes offset:0];
+    for (int i = 0; i < blas_n; i++) {
+        [encoder writeCompactedAccelerationStructureSize:_SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->blas_list[i]->native.as)
+            toBuffer:sizes offset:(NSUInteger)(sizeof(uint32_t) * (size_t)(1 + i))];
+    }
+    _sgu_mtl_accel_report.tlas = a->native.as;
+    _sgu_mtl_accel_report.sizes = _SGU_MTL_RETAIN(sizes);
+    _sgu_mtl_accel_report.blas_reported = blas_n;
+    /* The block holds its own reference to sizes, so sg_accel_shutdown may
+       release the report's reference first. */
+    [_sg.mtl.cmd_buffer addCompletedHandler:^(id<MTLCommandBuffer> cmd_buf) {
+        /* Metal thread: copy only, the sokol thread logs. */
+        const uint32_t* src = (const uint32_t*)[sizes contents];
+        for (int i = 0; i < 1 + _SGU_MTL_ACCEL_REPORT_BLAS; i++) _sgu_mtl_accel_report.compacted[i] = src[i];
+        _sgu_mtl_accel_report.status = (int)cmd_buf.status;
+        _sgu_mtl_accel_report.error_code = cmd_buf.error ? (long)cmd_buf.error.code : 0;
+        __atomic_store_n(&_sgu_mtl_accel_report.done, 1, __ATOMIC_RELEASE);
+    }];
+    _SGU_MTL_DROP(sizes);
+}
+
+/* Logs the first bind after the reported build, then the GPU result once the
+   completed handler has run. Called from sg_accel_bind on the sokol thread. */
+_SOKOL_PRIVATE void _sgu_mtl_accel_report_bind(const sg_accel a, int slot, int buffer_n) {
+    if (!_sgu_mtl_accel_report.build_logged) return;
+    if (!_sgu_mtl_accel_report.bind_logged) {
+        _sgu_mtl_accel_report.bind_logged = true;
+        _sgu_accel_log("accel report: first bind TLAS %p (reported build %p, %s) slot %d buffer %d, built %d, "
+            "%d BLASes resident, frame %u", a->native.as, _sgu_mtl_accel_report.tlas,
+            a->native.as == _sgu_mtl_accel_report.tlas ? "same" : "DIFFERENT", slot, buffer_n, (int)a->built,
+            a->blas_count, _sg.frame_index);
+    }
+    if (_sgu_mtl_accel_report.result_logged || !__atomic_load_n(&_sgu_mtl_accel_report.done, __ATOMIC_ACQUIRE)) return;
+    _sgu_mtl_accel_report.result_logged = true;
+    _sgu_accel_log("accel report: build command buffer status %d (4 completed, 5 error) error %ld, "
+        "TLAS compacted size %u (0 means never built)", _sgu_mtl_accel_report.status,
+        _sgu_mtl_accel_report.error_code, _sgu_mtl_accel_report.compacted[0]);
+    for (int i = 0; i < _sgu_mtl_accel_report.blas_reported; i++) {
+        _sgu_accel_log("accel report: BLAS %d compacted size %u", i, _sgu_mtl_accel_report.compacted[1 + i]);
+    }
+    _sgu_mtl_accel_defer(_sgu_mtl_accel_report.sizes);
+    _sgu_mtl_accel_report.sizes = 0;
+}
+
 /* Records a build or refit on an acceleration structure encoder in the frame's
    command buffer. Encoders run in order, so later compute passes see the result. */
 _SOKOL_PRIVATE bool _sgu_mtl_accel_record(sg_accel a, const sg_accel_instance* inst, int count, bool refit) {
@@ -3354,6 +3458,9 @@ _SOKOL_PRIVATE bool _sgu_mtl_accel_record(sg_accel a, const sg_accel_instance* i
         } else {
             [encoder buildAccelerationStructure:as descriptor:desc scratchBuffer:scratch scratchBufferOffset:scratch_offset];
         }
+        if (a->is_tlas && !refit && !_sgu_mtl_accel_report.build_logged) {
+            _sgu_mtl_accel_report_build(a, count, _sg.mtl.cur_frame_rotate_index, encoder);
+        }
         [encoder endEncoding];
         return true;
     }
@@ -3379,6 +3486,7 @@ _SOKOL_PRIVATE bool _sgu_mtl_accel_bind(const sg_accel a, int slot) {
         for (int i = 0; i < a->blas_count; i++) {
             [encoder useResource:_SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->blas_list[i]->native.as) usage:MTLResourceUsageRead];
         }
+        _sgu_mtl_accel_report_bind(a, slot, slot_layout->msl_buffer_n);
         return true;
     }
     (void)a; (void)slot;
@@ -3388,6 +3496,8 @@ _SOKOL_PRIVATE bool _sgu_mtl_accel_bind(const sg_accel a, int slot) {
 _SOKOL_PRIVATE void _sgu_mtl_accel_shutdown(void) {
     for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) _sgu_mtl_accel_defer(_sgu_mtl_accel_scratch.buf[i]);
     memset(&_sgu_mtl_accel_scratch, 0, sizeof(_sgu_mtl_accel_scratch));
+    _sgu_mtl_accel_defer(_sgu_mtl_accel_report.sizes);
+    memset(&_sgu_mtl_accel_report, 0, sizeof(_sgu_mtl_accel_report));
     _sgu_mtl_accel_collect(true);
     free(_sgu_mtl_accel_garbage.items);
     memset(&_sgu_mtl_accel_garbage, 0, sizeof(_sgu_mtl_accel_garbage));
