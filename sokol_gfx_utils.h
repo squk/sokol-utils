@@ -3571,7 +3571,7 @@ SOKOL_API_IMPL sg_buffer sg_make_accel_input_buffer(const sg_buffer_desc* desc) 
     /* An unsealed buffer is filled in parts by sg_write_buffer_unsealed and
        starts with no data, as sg_make_buffer's unsealed buffers do. */
     if (!d.usage.storage_buffer || d.usage.write_transient ||
-        (d.usage.write_unsealed && (!d.usage.immutable || d.data.ptr)) ||
+        (d.usage.write_unsealed && d.data.ptr) ||
         d.usage.staging_buffer || d.usage.staging_index_buffer || d.gl_buffer ||
         d.mtl_buffer || d.d3d11_buffer || d.wgpu_buffer || !d.size || d.size > INT32_MAX ||
         (d.size & 3) || (d.data.ptr && d.data.size != d.size)) return invalid;
