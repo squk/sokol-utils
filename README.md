@@ -4,7 +4,7 @@ Extension utilities for the [sokol](https://github.com/floooh/sokol) headers.
 
 Currently, this repository contains:
 - `sokol_app_utils.h`: Additional functionality for `sokol_app.h`.
-- `sokol_gfx_utils.h`: Additional functionality for `sokol_gfx.h` (readback, indirect commands, GPU pass timings, and ray query acceleration structures).
+- `sokol_gfx_utils.h`: Additional functionality for `sokol_gfx.h` (readback, indirect commands, GPU pass timings, ray query acceleration structures, and fragment-stage storage images).
 
 ## Usage
 

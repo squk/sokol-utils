@@ -362,6 +362,123 @@ SOKOL_GFX_UTILS_API_DECL sg_shader sg_make_shader_accel(const sg_shader_desc* de
 SOKOL_GFX_UTILS_API_DECL bool sg_accel_bind(sg_accel tlas, int slot);
 SOKOL_GFX_UTILS_API_DECL void sg_accel_shutdown(void);
 
+/*
+    Storage images written by fragment shaders.
+
+    sokol_gfx allows storage images only in compute shaders and compute passes.
+    Per-pixel order-independent transparency writes a sample list from the
+    translucent pixel shader through raster-ordered images (Unreal:
+    Engine/Shaders/Private/OITCommon.ush, AddOITSample_MLAB). This section adds
+    fragment-stage storage images to render passes. Metal and Vulkan support
+    it. D3D11, WebGPU and GL report no support. Read-write storage buffers need
+    none of this: sokol_gfx already binds them on the fragment stage.
+
+    Raster order. The shader decides it, not the runtime: Slang lowers
+    RasterizerOrderedTexture2D to a fragment shader interlock (SPIR-V
+    FragmentShaderPixelInterlockEXT), and SPIRV-Cross turns that into
+    [[raster_order_group(0)]] for Metal. sokol-slang reports such a program
+    with layout "raster_ordered": true. Before using one, check
+    sg_fragment_storage_raster_order_supported:
+    - Metal: MTLDevice.rasterOrderGroupsSupported.
+    - Vulkan: VK_EXT_fragment_shader_interlock with
+      fragmentShaderPixelInterlock. The application must enable both when it
+      creates the VkDevice.
+    Without raster order, fragments of overlapping draws write in no fixed
+    order; only atomics keep such writes well defined.
+
+    Vulkan device setup. The application creates the VkDevice and must enable
+    VkPhysicalDeviceFeatures::fragmentStoresAndAtomics, plus the interlock
+    extension and feature above for raster-ordered shaders. As with ray
+    queries, the queries see what the GPU offers, not what the application
+    enabled.
+
+    Binding. sokol-slang reflects fragment storage images as a separate slot
+    namespace 0..SG_FRAGMENT_STORAGE_MAX_SLOTS-1 (layout
+    "fragment_storage_images") with the native index of each slot:
+    msl_texture_n and spirv_set1_binding_n. They are not in the sg_shader_desc,
+    so sokol_gfx does not reject them. Pass the numbers unchanged in an
+    sg_fragment_storage_layout_desc to sg_make_shader_fragment_storage, which
+    records them per shader until the shader is destroyed.
+    sg_make_shader_fragment_storage logs and returns an invalid shader when:
+    - the shader is a compute shader, the backend has no support, a slot is
+      repeated or not below SG_FRAGMENT_STORAGE_MAX_SLOTS, or num_slots is out
+      of range;
+    - Metal: an msl_texture_n is negative, above 127, repeated, or equal to the
+      msl_texture_n of a fragment texture or storage image of the shader. Apple
+      GPUs bind 128 textures per stage; sokol-slang places these slots at 32
+      and up, past every sokol_gfx view index;
+    - Vulkan: a vk_binding_n breaks the rules of sg_make_shader_accel above
+      (negative, repeated, below SG_MAX_VIEW_BINDSLOTS +
+      SG_MAX_SAMPLER_BINDSLOTS, or equal to a view or sampler binding).
+
+    Image state. Storage image views come from sg_make_view with .storage_image
+    and an image made with usage.storage_image. Formats follow the backend's
+    storage image rules (Metal: MTLReadWriteTextureTier for read_write access).
+    - Vulkan cannot change image layouts inside a render pass. Call
+      sg_fragment_storage_begin(view) outside passes before every render pass
+      that writes the image: it moves the image to GENERAL and makes earlier
+      writes visible to fragment shaders, including writes of the previous
+      render pass. Call sg_fragment_storage_end(view) outside passes after the
+      last such pass: it makes fragment writes visible and returns the image to
+      sokol_gfx's texture state, so later texture or compute use works. Between
+      begin and end, do not bind the image through sokol_gfx in render passes.
+    - Metal tracks hazards between encoders itself; begin and end only check
+      the view. Inside one render pass, writes reach later draws in order only
+      with raster order groups.
+
+    Draw. Call sg_fragment_storage_bind in a render pass after sg_apply_pipeline
+    and sg_apply_bindings, with a view for every slot the shader's layout
+    lists, before sg_apply_uniforms and the draw. Call it again after every
+    later sg_apply_bindings.
+    - Metal: setFragmentTexture at the recorded index. sokol_gfx caches
+      fragment textures by index, so the matching cache entry is cleared.
+    - Vulkan: writes the storage image descriptors into the descriptor buffer
+      chunk of the last sg_apply_bindings, found as in sg_accel_bind. A shader
+      without sokol_gfx views and samplers gets a chunk of its own, bound at
+      the graphics bind point.
+    Call sg_fragment_storage_shutdown after sg_shutdown.
+*/
+#define SG_FRAGMENT_STORAGE_MAX_SLOTS (4)
+
+/* Where one fragment storage image slot sits in a shader. The shader compiler
+   decides these numbers and writes them into its reflection data. Set the
+   field of a backend the shader does not target to -1. */
+typedef struct sg_fragment_storage_slot_layout {
+    uint8_t slot;       /* fragment storage slot index, < SG_FRAGMENT_STORAGE_MAX_SLOTS */
+    int msl_texture_n;  /* Metal: [[texture(n)]] index of the fragment function; -1 when unused */
+    int vk_binding_n;   /* Vulkan: binding number in descriptor set 1; -1 when unused */
+} sg_fragment_storage_slot_layout;
+
+typedef struct sg_fragment_storage_layout_desc {
+    int num_slots;      /* 0..SG_FRAGMENT_STORAGE_MAX_SLOTS */
+    sg_fragment_storage_slot_layout slots[SG_FRAGMENT_STORAGE_MAX_SLOTS];
+} sg_fragment_storage_layout_desc;
+
+/* Storage image views by fragment storage slot. Slots the shader does not use
+   stay SG_INVALID_ID. */
+typedef struct sg_fragment_storage_bindings {
+    sg_view images[SG_FRAGMENT_STORAGE_MAX_SLOTS];
+} sg_fragment_storage_bindings;
+
+/* Metal: always. Vulkan: the GPU offers fragmentStoresAndAtomics. */
+SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_supported(void);
+/* See Raster order above. False when sg_fragment_storage_supported is false. */
+SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_raster_order_supported(void);
+/* Like sg_make_shader for a render shader. layout lists the fragment storage
+   slots (NULL means none). The layout is copied. */
+SOKOL_GFX_UTILS_API_DECL sg_shader sg_make_shader_fragment_storage(const sg_shader_desc* desc, const sg_fragment_storage_layout_desc* layout);
+/* Outside passes. Return false when the view is not a valid storage image view
+   or the backend has no support. */
+SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_begin(sg_view image);
+SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_end(sg_view image);
+/* Returns false outside a render pass, when the current shader was not made
+   with sg_make_shader_fragment_storage, when a slot of its layout has no valid
+   storage image view, (Vulkan) when a view's image is not between
+   sg_fragment_storage_begin and sg_fragment_storage_end, or when the last
+   sg_apply_bindings failed. Binds nothing on failure. */
+SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_bind(const sg_fragment_storage_bindings* bindings);
+SOKOL_GFX_UTILS_API_DECL void sg_fragment_storage_shutdown(void);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
@@ -2862,24 +2979,25 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_record(sg_accel a, const sg_accel_instance* in
     return true;
 }
 
-/* Checks the Vulkan binding numbers of a layout against the shader desc. */
-_SOKOL_PRIVATE bool _sgu_vk_accel_validate(const sg_shader_desc* desc, const sg_accel_layout_desc* layout) {
+/* Checks the Vulkan binding numbers of a layout against the shader desc. fn
+   names the public function in log messages. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_validate(const char* fn, const sg_shader_desc* desc, const sg_accel_layout_desc* layout) {
     const int floor_n = SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS;
     for (int i = 0; i < layout->num_slots; i++) {
         const int n = layout->slots[i].vk_binding_n;
         if (n < 0) {
-            _sgu_accel_log("sg_make_shader_accel: slot %d has no Vulkan binding (vk_binding_n %d)", layout->slots[i].slot, n);
+            _sgu_accel_log("%s: slot %d has no Vulkan binding (vk_binding_n %d)", fn, layout->slots[i].slot, n);
             return false;
         }
         if (n < floor_n) {
-            _sgu_accel_log("sg_make_shader_accel: slot %d vk_binding_n %d is below %d (SG_MAX_VIEW_BINDSLOTS + "
+            _sgu_accel_log("%s: slot %d vk_binding_n %d is below %d (SG_MAX_VIEW_BINDSLOTS + "
                 "SG_MAX_SAMPLER_BINDSLOTS of this runtime). The shader compiler and the runtime use different "
-                "sokol_gfx.h versions", layout->slots[i].slot, n, floor_n);
+                "sokol_gfx.h versions", fn, layout->slots[i].slot, n, floor_n);
             return false;
         }
         for (int j = 0; j < i; j++) {
             if (layout->slots[j].vk_binding_n == n) {
-                _sgu_accel_log("sg_make_shader_accel: slots %d and %d share vk_binding_n %d",
+                _sgu_accel_log("%s: slots %d and %d share vk_binding_n %d", fn,
                     layout->slots[j].slot, layout->slots[i].slot, n);
                 return false;
             }
@@ -2891,14 +3009,14 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_validate(const sg_shader_desc* desc, const sg_
                 (v->storage_buffer.stage != SG_SHADERSTAGE_NONE && v->storage_buffer.spirv_set1_binding_n == n) ||
                 (v->storage_image.stage != SG_SHADERSTAGE_NONE && v->storage_image.spirv_set1_binding_n == n);
             if (hit) {
-                _sgu_accel_log("sg_make_shader_accel: slot %d vk_binding_n %d collides with view %d",
+                _sgu_accel_log("%s: slot %d vk_binding_n %d collides with view %d", fn,
                     layout->slots[i].slot, n, j);
                 return false;
             }
         }
         for (int j = 0; j < SG_MAX_SAMPLER_BINDSLOTS; j++) {
             if (desc->samplers[j].stage != SG_SHADERSTAGE_NONE && desc->samplers[j].spirv_set1_binding_n == n) {
-                _sgu_accel_log("sg_make_shader_accel: slot %d vk_binding_n %d collides with sampler %d",
+                _sgu_accel_log("%s: slot %d vk_binding_n %d collides with sampler %d", fn,
                     layout->slots[i].slot, n, j);
                 return false;
             }
@@ -2907,17 +3025,23 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_validate(const sg_shader_desc* desc, const sg_
     return true;
 }
 
+/* Most bindings that sokol_gfx does not know and that _sgu_vk_patch_set1 adds
+   to one shader: acceleration structures or fragment storage images. */
+#define _SGU_VK_MAX_EXTRA_BINDINGS (8)
+
 /* Rebuilds the set 1 layout and pipeline layout of a new shader with extra
-   acceleration structure bindings at the numbers the layout gives.
-   sg_make_shader_accel checked that they meet no view or sampler binding. The
-   offsets of the existing bindings are read again from the new layout.
-   No pipeline uses the layouts yet, so the old ones can be destroyed at once.
-   Returns false and keeps the shader unchanged on failure. */
-_SOKOL_PRIVATE bool _sgu_vk_accel_patch_shader(sg_shader id, const sg_accel_layout_desc* layout) {
+   bindings that sokol_gfx does not know (acceleration structures for
+   sg_make_shader_accel, fragment storage images for
+   sg_make_shader_fragment_storage). The caller checked that they meet no view
+   or sampler binding. The offsets of the existing bindings are read again from
+   the new layout. No pipeline uses the layouts yet, so the old ones can be
+   destroyed at once. Returns false and keeps the shader unchanged on failure. */
+_SOKOL_PRIVATE bool _sgu_vk_patch_set1(sg_shader id, const VkDescriptorSetLayoutBinding* extra, int extra_count) {
     _sg_shader_t* shd = _sg_lookup_shader(id.id);
-    if (!shd || shd->slot.state != SG_RESOURCESTATE_VALID || !shd->vk.compute_func.module) return false;
+    if (!shd || shd->slot.state != SG_RESOURCESTATE_VALID) return false;
+    if (extra_count < 0 || extra_count > _SGU_VK_MAX_EXTRA_BINDINGS) return false;
     VkDevice dev = _sg.vk.dev;
-    VkDescriptorSetLayoutBinding entries[SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS + SG_ACCEL_MAX_SLOTS];
+    VkDescriptorSetLayoutBinding entries[SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS + _SGU_VK_MAX_EXTRA_BINDINGS];
     memset(entries, 0, sizeof(entries));
     uint32_t n = 0;
     for (int i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
@@ -2938,13 +3062,7 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_patch_shader(sg_shader id, const sg_accel_layo
         e->descriptorCount = 1;
         e->stageFlags = _sg_vk_shader_stage(shd->cmn.samplers[i].stage);
     }
-    for (int i = 0; i < layout->num_slots; i++) {
-        VkDescriptorSetLayoutBinding* e = &entries[n++];
-        e->binding = (uint32_t)layout->slots[i].vk_binding_n;
-        e->descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-        e->descriptorCount = 1;
-        e->stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
+    for (int i = 0; i < extra_count; i++) entries[n++] = extra[i];
     _SG_STRUCT(VkDescriptorSetLayoutCreateInfo, dsl_info);
     dsl_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dsl_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
@@ -2986,8 +3104,23 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_patch_shader(sg_shader id, const sg_accel_layo
     return true;
 }
 
+/* Adds the acceleration structure bindings of a compute shader. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_patch_shader(sg_shader id, const sg_accel_layout_desc* layout) {
+    const _sg_shader_t* shd = _sg_lookup_shader(id.id);
+    if (!shd || !shd->vk.compute_func.module) return false;
+    VkDescriptorSetLayoutBinding extra[SG_ACCEL_MAX_SLOTS];
+    memset(extra, 0, sizeof(extra));
+    for (int i = 0; i < layout->num_slots; i++) {
+        extra[i].binding = (uint32_t)layout->slots[i].vk_binding_n;
+        extra[i].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        extra[i].descriptorCount = 1;
+        extra[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    return _sgu_vk_patch_set1(id, extra, layout->num_slots);
+}
+
 /* True when the shader has no view or sampler, so sokol_gfx records no chunk
-   for it that sg_accel_bind could reuse. */
+   for it that sg_accel_bind or sg_fragment_storage_bind could reuse. */
 _SOKOL_PRIVATE bool _sgu_vk_accel_shader_has_no_views(const _sg_shader_t* shd) {
     for (int i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
         if (shd->cmn.views[i].stage != SG_SHADERSTAGE_NONE) return false;
@@ -3744,7 +3877,7 @@ SOKOL_API_IMPL sg_shader sg_make_shader_accel(const sg_shader_desc* desc, const 
     if (!layout) layout = &none;
     if (!desc || !_sgu_accel_validate_slots(layout)) return invalid;
     #if defined(SOKOL_VULKAN)
-    if (!_sgu_vk_accel_validate(desc, layout)) return invalid;
+    if (!_sgu_vk_accel_validate("sg_make_shader_accel", desc, layout)) return invalid;
     #elif defined(SOKOL_METAL)
     if (!_sgu_mtl_accel_validate(desc, layout)) return invalid;
     #endif
@@ -3786,6 +3919,384 @@ SOKOL_API_IMPL void sg_accel_shutdown(void) {
     _sgu_accel_native_shutdown();
     memset(&_sgu_accel_shaders, 0, sizeof(_sgu_accel_shaders));
     _sgu_accel_down = true;
+}
+
+/*--- Fragment Storage Images: Common ----------------------------------------*/
+
+/* The layouts that sg_make_shader_fragment_storage recorded, one entry per
+   shader. sg_fragment_storage_bind reads them. Entries of destroyed shaders
+   are dropped on the next add. */
+#define _SGU_FSTORE_MAX_SHADERS (64)
+static struct {
+    uint32_t id[_SGU_FSTORE_MAX_SHADERS];
+    sg_fragment_storage_layout_desc layout[_SGU_FSTORE_MAX_SHADERS];
+    int count;
+} _sgu_fstore_shaders;
+
+_SOKOL_PRIVATE void _sgu_fstore_prune_shaders(void) {
+    int keep = 0;
+    for (int i = 0; i < _sgu_fstore_shaders.count; i++) {
+        if (!_sg_lookup_shader(_sgu_fstore_shaders.id[i])) continue;
+        _sgu_fstore_shaders.id[keep] = _sgu_fstore_shaders.id[i];
+        _sgu_fstore_shaders.layout[keep] = _sgu_fstore_shaders.layout[i];
+        keep++;
+    }
+    _sgu_fstore_shaders.count = keep;
+}
+
+_SOKOL_PRIVATE const sg_fragment_storage_layout_desc* _sgu_fstore_find_layout(uint32_t shader_id) {
+    for (int i = 0; i < _sgu_fstore_shaders.count; i++) {
+        if (_sgu_fstore_shaders.id[i] == shader_id) return &_sgu_fstore_shaders.layout[i];
+    }
+    return 0;
+}
+
+_SOKOL_PRIVATE bool _sgu_fstore_validate_slots(const sg_fragment_storage_layout_desc* layout) {
+    if (layout->num_slots < 0 || layout->num_slots > SG_FRAGMENT_STORAGE_MAX_SLOTS) {
+        _sgu_accel_log("sg_make_shader_fragment_storage: num_slots %d is not in 0..%d",
+            layout->num_slots, SG_FRAGMENT_STORAGE_MAX_SLOTS);
+        return false;
+    }
+    for (int i = 0; i < layout->num_slots; i++) {
+        const int slot = layout->slots[i].slot;
+        if (slot >= SG_FRAGMENT_STORAGE_MAX_SLOTS) {
+            _sgu_accel_log("sg_make_shader_fragment_storage: slot %d is not below %d", slot, SG_FRAGMENT_STORAGE_MAX_SLOTS);
+            return false;
+        }
+        for (int j = 0; j < i; j++) {
+            if (layout->slots[j].slot == slot) {
+                _sgu_accel_log("sg_make_shader_fragment_storage: slot %d is listed twice", slot);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* Returns the storage image view and its image, or 0 when id names no valid
+   storage image view. */
+_SOKOL_PRIVATE _sg_view_t* _sgu_fstore_view(sg_view id, _sg_image_t** out_img) {
+    _sg_view_t* view = _sg_lookup_view(id.id);
+    if (!view || view->slot.state != SG_RESOURCESTATE_VALID || view->cmn.type != SG_VIEWTYPE_STORAGEIMAGE) return 0;
+    _sg_image_t* img = _sg_image_ref_ptr(&view->cmn.img.ref);
+    if (!img || img->slot.state != SG_RESOURCESTATE_VALID) return 0;
+    if (out_img) *out_img = img;
+    return view;
+}
+
+/*--- Fragment Storage Images: Vulkan ----------------------------------------*/
+#if defined(SOKOL_VULKAN)
+
+static struct {
+    bool init;
+    VkDevice device;
+    bool supported;
+    bool raster_order;
+} _sgu_vk_fstore_state;
+
+_SOKOL_PRIVATE void _sgu_vk_fstore_query(void) {
+    if (_sgu_vk_fstore_state.init && _sgu_vk_fstore_state.device == _sg.vk.dev) return;
+    memset(&_sgu_vk_fstore_state, 0, sizeof(_sgu_vk_fstore_state));
+    if (!_sg.vk.valid || !_sg.vk.dev) return;
+    _sgu_vk_fstore_state.init = true;
+    _sgu_vk_fstore_state.device = _sg.vk.dev;
+    _SG_STRUCT(VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT, interlock);
+    interlock.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT;
+    _SG_STRUCT(VkPhysicalDeviceFeatures2, features);
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    static const char* const extensions[1] = { VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME };
+    const bool has_interlock = _sgu_vk_accel_has_extensions(extensions, 1);
+    if (has_interlock) features.pNext = &interlock;
+    vkGetPhysicalDeviceFeatures2(_sg.vk.phys_dev, &features);
+    _sgu_vk_fstore_state.supported = features.features.fragmentStoresAndAtomics;
+    _sgu_vk_fstore_state.raster_order = _sgu_vk_fstore_state.supported && has_interlock &&
+        interlock.fragmentShaderPixelInterlock;
+}
+
+/* Same checks as _sgu_vk_accel_validate, for the fragment storage bindings. */
+_SOKOL_PRIVATE bool _sgu_vk_fstore_validate(const sg_shader_desc* desc, const sg_fragment_storage_layout_desc* layout) {
+    sg_accel_layout_desc as_accel;
+    memset(&as_accel, 0, sizeof(as_accel));
+    as_accel.num_slots = layout->num_slots;
+    for (int i = 0; i < layout->num_slots; i++) {
+        as_accel.slots[i].slot = layout->slots[i].slot;
+        as_accel.slots[i].msl_buffer_n = -1;
+        as_accel.slots[i].vk_binding_n = layout->slots[i].vk_binding_n;
+    }
+    return _sgu_vk_accel_validate("sg_make_shader_fragment_storage", desc, &as_accel);
+}
+
+_SOKOL_PRIVATE bool _sgu_vk_fstore_patch_shader(sg_shader id, const sg_fragment_storage_layout_desc* layout) {
+    VkDescriptorSetLayoutBinding extra[SG_FRAGMENT_STORAGE_MAX_SLOTS];
+    memset(extra, 0, sizeof(extra));
+    for (int i = 0; i < layout->num_slots; i++) {
+        extra[i].binding = (uint32_t)layout->slots[i].vk_binding_n;
+        extra[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        extra[i].descriptorCount = 1;
+        extra[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    return _sgu_vk_patch_set1(id, extra, layout->num_slots);
+}
+
+/* Moves the image between sokol_gfx's texture state and GENERAL for fragment
+   storage access. sokol_gfx's own barrier helpers place storage image access
+   on the compute stage only (_sg_vk_stage_mask), so this barrier names the
+   fragment stage itself and then records the state sokol_gfx expects in
+   cur_access. Unreal's transition to UAVGraphics does the same for pixel
+   shader UAVs (Engine/Source/Runtime/VulkanRHI/Private/VulkanBarriers.cpp,
+   GetVkStageAndAccessFlags, ERHIAccess::UAVGraphics). */
+_SOKOL_PRIVATE bool _sgu_vk_fstore_barrier(_sg_image_t* img, bool begin) {
+    _sg_vk_acquire_frame_command_buffers();
+    VkCommandBuffer cmd = _sg.vk.frame.cmd_buf;
+    if (!cmd) return false;
+    const _sg_vk_access_t old_access = img->vk.cur_access;
+    const _sg_vk_access_t new_access = begin ? _SG_VK_ACCESS_STORAGEIMAGE : _sg_vk_default_image_access_mask(img);
+    _SG_STRUCT(VkImageMemoryBarrier2, barrier);
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = _sg_vk_src_stage_mask(old_access);
+    barrier.srcAccessMask = _sg_vk_src_access_mask(old_access);
+    if (old_access & _SG_VK_ACCESS_STORAGEIMAGE) {
+        /* Earlier fragment writes from a render pass after a begin. */
+        barrier.srcStageMask |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    }
+    barrier.oldLayout = _sg_vk_image_layout(old_access);
+    if (begin) {
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    } else {
+        barrier.dstStageMask = _sg_vk_dst_stage_mask(new_access);
+        barrier.dstAccessMask = _sg_vk_dst_access_mask(new_access);
+    }
+    barrier.newLayout = _sg_vk_image_layout(new_access);
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = img->vk.img;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+    barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+    _SG_STRUCT(VkDependencyInfo, dep_info);
+    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep_info.imageMemoryBarrierCount = 1;
+    dep_info.pImageMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dep_info);
+    img->vk.cur_access = new_access;
+    return true;
+}
+
+/* Copies each view's storage image descriptor, which sokol_gfx recorded at
+   view creation with layout GENERAL, into the descriptor buffer chunk. The
+   chunk is found as in _sgu_vk_accel_bind. */
+_SOKOL_PRIVATE bool _sgu_vk_fstore_bind(const _sg_shader_t* shd, const sg_fragment_storage_layout_desc* layout,
+    _sg_view_t* const* views) {
+    if (!shd->vk.view_smp_dset_size || !_sg.vk.bind.cur_mem_ptr || _sg.vk.bind.overflown) return false;
+    for (int i = 0; i < layout->num_slots; i++) {
+        const _sg_image_t* img = _sg_image_ref_ptr(&views[i]->cmn.img.ref);
+        if (img->vk.cur_access != _SG_VK_ACCESS_STORAGEIMAGE || layout->slots[i].vk_binding_n < 0) return false;
+    }
+    const bool own_chunk = _sgu_vk_accel_shader_has_no_views(shd);
+    VkDeviceSize chunk_offset = 0;
+    if (own_chunk) {
+        chunk_offset = _sg_vk_shared_buffer_alloc(&_sg.vk.bind, (uint32_t)shd->vk.view_smp_dset_size);
+        if (_sg.vk.bind.overflown) {
+            _SG_ERROR(VULKAN_DESCRIPTOR_BUFFER_OVERFLOW);
+            return false;
+        }
+    } else {
+        const uint32_t chunk_size = _sg_roundup_pow2_u32((uint32_t)shd->vk.view_smp_dset_size, _sg.vk.bind.align);
+        if (_sg.vk.bind.offset < chunk_size) return false;
+        chunk_offset = _sg.vk.bind.offset - chunk_size;
+    }
+    uint8_t* chunk = _sg_vk_shared_buffer_ptr(&_sg.vk.bind, chunk_offset);
+    for (int i = 0; i < layout->num_slots; i++) {
+        VkDeviceSize binding_offset = 0;
+        _sg.vk.ext.get_descriptor_set_layout_binding_offset(_sg.vk.dev, shd->vk.view_smp_dsl,
+            (uint32_t)layout->slots[i].vk_binding_n, &binding_offset);
+        memcpy(chunk + binding_offset, views[i]->vk.descriptor_data, views[i]->vk.descriptor_size);
+    }
+    if (own_chunk) {
+        const uint32_t dbuf_index = 0;
+        _sg.vk.ext.cmd_set_descriptor_buffer_offsets(_sg.vk.frame.cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            shd->vk.pip_layout, _SG_VK_VIEW_SMP_DESCRIPTORSET_INDEX, 1, &dbuf_index, &chunk_offset);
+    }
+    return true;
+}
+
+#endif /* SOKOL_VULKAN */
+
+/*--- Fragment Storage Images: Metal -----------------------------------------*/
+#if defined(SOKOL_METAL)
+
+/* Highest texture index of a stage's argument table on Apple GPUs. */
+#define _SGU_MTL_MAX_TEXTURE_N (127)
+
+_SOKOL_PRIVATE bool _sgu_mtl_fstore_validate(const sg_shader_desc* desc, const sg_fragment_storage_layout_desc* layout) {
+    for (int i = 0; i < layout->num_slots; i++) {
+        const int n = layout->slots[i].msl_texture_n;
+        if (n < 0 || n > _SGU_MTL_MAX_TEXTURE_N) {
+            _sgu_accel_log("sg_make_shader_fragment_storage: slot %d msl_texture_n %d is not in 0..%d",
+                layout->slots[i].slot, n, _SGU_MTL_MAX_TEXTURE_N);
+            return false;
+        }
+        for (int j = 0; j < i; j++) {
+            if (layout->slots[j].msl_texture_n == n) {
+                _sgu_accel_log("sg_make_shader_fragment_storage: slots %d and %d share msl_texture_n %d",
+                    layout->slots[j].slot, layout->slots[i].slot, n);
+                return false;
+            }
+        }
+        for (int j = 0; j < SG_MAX_VIEW_BINDSLOTS; j++) {
+            const sg_shader_view* v = &desc->views[j];
+            const bool hit =
+                (v->texture.stage == SG_SHADERSTAGE_FRAGMENT && v->texture.msl_texture_n == n) ||
+                (v->storage_image.stage == SG_SHADERSTAGE_FRAGMENT && v->storage_image.msl_texture_n == n);
+            if (hit) {
+                _sgu_accel_log("sg_make_shader_fragment_storage: slot %d msl_texture_n %d collides with view %d",
+                    layout->slots[i].slot, n, j);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* Sets each view's texture on the fragment stage. sokol_gfx skips
+   setFragmentTexture when its cache says the index already holds a texture,
+   so the cache entry of each index is cleared: the next sokol_gfx texture
+   there then gets a full set. */
+_SOKOL_PRIVATE bool _sgu_mtl_fstore_bind(const sg_fragment_storage_layout_desc* layout, _sg_view_t* const* views) {
+    id<MTLRenderCommandEncoder> encoder = _sg.mtl.render_cmd_encoder;
+    if (nil == encoder) return false;
+    for (int i = 0; i < layout->num_slots; i++) {
+        if (layout->slots[i].msl_texture_n < 0) return false;
+    }
+    for (int i = 0; i < layout->num_slots; i++) {
+        const int n = layout->slots[i].msl_texture_n;
+        const _sg_image_t* img = _sg_image_ref_ptr(&views[i]->cmn.img.ref);
+        const int active_slot = img->cmn.active_slot;
+        [encoder setFragmentTexture:_sg_mtl_id(views[i]->mtl.tex_view[active_slot]) atIndex:(NSUInteger)n];
+        if (n < _SG_MTL_MAX_STAGE_TEXTURE_BINDINGS) {
+            memset(&_sg.mtl.cache.cur_fstexs[n], 0, sizeof(_sg.mtl.cache.cur_fstexs[n]));
+        }
+    }
+    return true;
+}
+
+#endif /* SOKOL_METAL */
+
+/*--- Fragment Storage Images: Public API ------------------------------------*/
+
+SOKOL_API_IMPL bool sg_fragment_storage_supported(void) {
+    if (!sg_isvalid()) return false;
+    #if defined(SOKOL_VULKAN)
+    _sgu_vk_fstore_query();
+    return _sgu_vk_fstore_state.supported;
+    #elif defined(SOKOL_METAL)
+    return true;
+    #else
+    return false;
+    #endif
+}
+
+SOKOL_API_IMPL bool sg_fragment_storage_raster_order_supported(void) {
+    if (!sg_fragment_storage_supported()) return false;
+    #if defined(SOKOL_VULKAN)
+    return _sgu_vk_fstore_state.raster_order;
+    #elif defined(SOKOL_METAL)
+    return _sg.mtl.device.rasterOrderGroupsSupported;
+    #else
+    return false;
+    #endif
+}
+
+SOKOL_API_IMPL sg_shader sg_make_shader_fragment_storage(const sg_shader_desc* desc, const sg_fragment_storage_layout_desc* layout) {
+    const sg_shader invalid = { SG_INVALID_ID };
+    sg_fragment_storage_layout_desc none;
+    memset(&none, 0, sizeof(none));
+    if (!layout) layout = &none;
+    if (!desc || !_sgu_fstore_validate_slots(layout)) return invalid;
+    if (layout->num_slots == 0) return sg_make_shader(desc);
+    if (desc->compute_func.source || desc->compute_func.bytecode.ptr) {
+        _sgu_accel_log("sg_make_shader_fragment_storage: a compute shader has no fragment stage");
+        return invalid;
+    }
+    if (!sg_fragment_storage_supported()) {
+        _sgu_accel_log("sg_make_shader_fragment_storage: the backend has no fragment storage images");
+        return invalid;
+    }
+    #if defined(SOKOL_VULKAN)
+    if (!_sgu_vk_fstore_validate(desc, layout)) return invalid;
+    #elif defined(SOKOL_METAL)
+    if (!_sgu_mtl_fstore_validate(desc, layout)) return invalid;
+    #endif
+    _sgu_fstore_prune_shaders();
+    if (_sgu_fstore_shaders.count >= _SGU_FSTORE_MAX_SHADERS) {
+        _sgu_accel_log("sg_make_shader_fragment_storage: more than %d live shaders with fragment storage images",
+            _SGU_FSTORE_MAX_SHADERS);
+        return invalid;
+    }
+    sg_shader shader = sg_make_shader(desc);
+    if (shader.id == SG_INVALID_ID) return shader;
+    #if defined(SOKOL_VULKAN)
+    if (!_sgu_vk_fstore_patch_shader(shader, layout)) {
+        sg_destroy_shader(shader);
+        return invalid;
+    }
+    #endif
+    _sgu_fstore_shaders.id[_sgu_fstore_shaders.count] = shader.id;
+    _sgu_fstore_shaders.layout[_sgu_fstore_shaders.count] = *layout;
+    _sgu_fstore_shaders.count++;
+    return shader;
+}
+
+_SOKOL_PRIVATE bool _sgu_fstore_transition(sg_view image, bool begin) {
+    if (!sg_fragment_storage_supported() || _sg.cur_pass.in_pass) return false;
+    _sg_image_t* img = 0;
+    if (!_sgu_fstore_view(image, &img)) return false;
+    #if defined(SOKOL_VULKAN)
+    return _sgu_vk_fstore_barrier(img, begin);
+    #else
+    (void)begin;
+    return true;
+    #endif
+}
+
+SOKOL_API_IMPL bool sg_fragment_storage_begin(sg_view image) {
+    return _sgu_fstore_transition(image, true);
+}
+
+SOKOL_API_IMPL bool sg_fragment_storage_end(sg_view image) {
+    return _sgu_fstore_transition(image, false);
+}
+
+SOKOL_API_IMPL bool sg_fragment_storage_bind(const sg_fragment_storage_bindings* bindings) {
+    if (!bindings || !sg_fragment_storage_supported()) return false;
+    if (!_sg.cur_pass.valid || !_sg.cur_pass.in_pass || _sg.cur_pass.is_compute || _sg_skipdraw_any()) return false;
+    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+    if (!pip) return false;
+    const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+    if (!shd) return false;
+    const sg_fragment_storage_layout_desc* layout = _sgu_fstore_find_layout(shd->slot.id);
+    if (!layout) return false;
+    _sg_view_t* views[SG_FRAGMENT_STORAGE_MAX_SLOTS];
+    for (int i = 0; i < layout->num_slots; i++) {
+        views[i] = _sgu_fstore_view(bindings->images[layout->slots[i].slot], 0);
+        if (!views[i]) return false;
+    }
+    #if defined(SOKOL_VULKAN)
+    return _sgu_vk_fstore_bind(shd, layout, views);
+    #elif defined(SOKOL_METAL)
+    return _sgu_mtl_fstore_bind(layout, views);
+    #else
+    (void)views;
+    return false;
+    #endif
+}
+
+SOKOL_API_IMPL void sg_fragment_storage_shutdown(void) {
+    memset(&_sgu_fstore_shaders, 0, sizeof(_sgu_fstore_shaders));
+    #if defined(SOKOL_VULKAN)
+    memset(&_sgu_vk_fstore_state, 0, sizeof(_sgu_vk_fstore_state));
+    #endif
 }
 
 #endif /* SOKOL_GFX_UTILS_IMPL */
