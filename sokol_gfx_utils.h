@@ -325,6 +325,13 @@ SOKOL_GFX_UTILS_API_DECL void sg_destroy_accel(sg_accel accel);
    count of its last build. */
 SOKOL_GFX_UTILS_API_DECL bool sg_build_blas(sg_accel blas);
 SOKOL_GFX_UTILS_API_DECL bool sg_refit_blas(sg_accel blas);
+/* Points a BLAS at another vertex buffer for its next build or refit. Stride,
+   vertex count and topology stay, so a refit may follow: Unreal patches each
+   skinned segment's vertex buffer to the skin cache's current output, then
+   refits (SkeletalRenderGPUSkin.cpp:1372-1387). The buffer must come from
+   sg_make_accel_input_buffer, be sealed and hold every vertex from
+   vertex_offset. Returns false and keeps the old buffer otherwise. */
+SOKOL_GFX_UTILS_API_DECL bool sg_blas_set_vertex_buffer(sg_accel blas, sg_buffer vertex_buffer, int vertex_offset);
 SOKOL_GFX_UTILS_API_DECL bool sg_build_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
 SOKOL_GFX_UTILS_API_DECL bool sg_refit_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
 SOKOL_GFX_UTILS_API_DECL bool sg_accel_built(sg_accel accel);
@@ -3688,6 +3695,16 @@ SOKOL_API_IMPL bool sg_build_blas(sg_accel blas) {
 SOKOL_API_IMPL bool sg_refit_blas(sg_accel blas) {
     if (!_sgu_accel_can_record(blas, false) || !blas->built || !blas->allow_update) return false;
     return _sgu_accel_native_record(blas, 0, 0, true);
+}
+
+SOKOL_API_IMPL bool sg_blas_set_vertex_buffer(sg_accel blas, sg_buffer vertex_buffer, int vertex_offset) {
+    if (!blas || blas->is_tlas || blas->destroy_requested || vertex_offset < 0 || (vertex_offset & 3)) return false;
+    const sg_blas_desc* d = &blas->blas;
+    const int64_t vbytes = (int64_t)d->vertex_stride * (int64_t)(d->vertex_count - 1) + 12;
+    if (!_sgu_accel_input_buffer(vertex_buffer, vertex_offset, vbytes)) return false;
+    blas->blas.vertex_buffer = vertex_buffer;
+    blas->blas.vertex_offset = vertex_offset;
+    return true;
 }
 
 /* A TLAS owns one instance buffer slot per frame in flight, so it takes one
