@@ -3303,6 +3303,15 @@ _SOKOL_PRIVATE bool _sgu_mtl_accel_record(sg_accel a, const sg_accel_instance* i
     if (@available(macOS 12.0, iOS 15.0, *)) @autoreleasepool {
         _sgu_mtl_accel_collect(false);
         if (!_sgu_mtl_accel_acquire_cmd_buffer()) return false;
+        /* sg_copy_buffer_to_buffer and the other sg_copy_* calls leave sokol_gfx's
+           blit encoder open until the next pass or sg_commit. A command buffer
+           takes one active encoder at a time, so an acceleration structure
+           encoder made while it is open records nothing that runs, and every
+           ray then misses. Close it first, as Unreal ends the active encoder
+           before acceleration structure encoding
+           (Engine/Source/Runtime/Apple/MetalRHI/Private/MetalRayTracing.cpp:2426-2436).
+           sokol_gfx opens a new one at the next copy. */
+        _sg_mtl_finish_blit_cmd_encoder();
         MTLAccelerationStructureDescriptor* desc = nil;
         if (a->is_tlas) {
             const uint32_t ring = _sg.mtl.cur_frame_rotate_index;
