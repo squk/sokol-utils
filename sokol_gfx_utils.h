@@ -2537,16 +2537,28 @@ _SOKOL_PRIVATE int _sgu_accel_triangle_count(const sg_accel blas) {
     return (blas->blas.index_format == SG_ACCEL_INDEXFORMAT_NONE ? blas->blas.vertex_count : blas->blas.index_count) / 3;
 }
 
-/* Sends an error to the sokol logger of sg_setup. sokol_gfx has no log item for
-   these messages, so item 0 carries the text. */
-_SOKOL_PRIVATE void _sgu_accel_log(const char* fmt, ...) {
+/* Sends text at the caller's level. sokol_gfx has no log item for these
+   messages, so item 0 carries the text. */
+_SOKOL_PRIVATE void _sgu_accel_logv(uint32_t level, const char* fmt, va_list args) {
     if (!_sg.desc.logger.func) return;
     char msg[512];  /* the accel report lines carry a full instance transform */
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    _sg.desc.logger.func("sg_gfx_utils", level, 0, msg, 0, 0, _sg.desc.logger.user_data);
+}
+
+_SOKOL_PRIVATE void _sgu_accel_log_level(uint32_t level, const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, args);
+    _sgu_accel_logv(level, fmt, args);
     va_end(args);
-    _sg.desc.logger.func("sg_gfx_utils", 1, 0, msg, 0, 0, _sg.desc.logger.user_data);
+}
+
+/* Validation failures keep the error level. Reports choose their level. */
+_SOKOL_PRIVATE void _sgu_accel_log(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    _sgu_accel_logv(1, fmt, args);
+    va_end(args);
 }
 
 /* The layouts that sg_make_shader_accel recorded, one entry per shader. Vulkan
@@ -3479,7 +3491,7 @@ _SOKOL_PRIVATE void _sgu_mtl_accel_report_build(sg_accel a, int count, uint32_t 
     _sgu_mtl_accel_report.build_logged = true;
     id<MTLAccelerationStructure> tlas = _SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->native.as);
     id<MTLBuffer> instances = _SGU_MTL_OBJ(id<MTLBuffer>, a->native.instances[ring]);
-    _sgu_accel_log("accel report: TLAS %p size %llu, %d of %d instances, %d BLASes, ring %u, frame %u, "
+    _sgu_accel_log_level(3, "accel report: TLAS %p size %llu, %d of %d instances, %d BLASes, ring %u, frame %u, "
         "instance stride %d, instance buffer %llu bytes", (void*)tlas, (unsigned long long)tlas.size, count,
         a->max_instances, a->blas_count, ring, _sg.frame_index,
         (int)sizeof(MTLAccelerationStructureUserIDInstanceDescriptor), (unsigned long long)instances.length);
@@ -3487,7 +3499,7 @@ _SOKOL_PRIVATE void _sgu_mtl_accel_report_build(sg_accel a, int count, uint32_t 
         (const MTLAccelerationStructureUserIDInstanceDescriptor*)[instances contents];
     for (int i = 0; i < count && i < 2; i++) {
         const MTLPackedFloat4x3* m = &d[i].transformationMatrix;
-        _sgu_accel_log("accel report: instance %d blas %u user %u mask 0x%x options 0x%x ift %u "
+        _sgu_accel_log_level(3, "accel report: instance %d blas %u user %u mask 0x%x options 0x%x ift %u "
             "c0 (%g %g %g) c1 (%g %g %g) c2 (%g %g %g) c3 (%g %g %g)", i, d[i].accelerationStructureIndex,
             d[i].userID, d[i].mask, (unsigned)d[i].options, d[i].intersectionFunctionTableOffset,
             m->columns[0].x, m->columns[0].y, m->columns[0].z, m->columns[1].x, m->columns[1].y, m->columns[1].z,
@@ -3498,7 +3510,7 @@ _SOKOL_PRIVATE void _sgu_mtl_accel_report_build(sg_accel a, int count, uint32_t 
         _sg_buffer_t* vb = 0;
         _sg_buffer_t* ib = 0;
         const bool inputs = _sgu_accel_blas_buffers(b, &vb, &ib);
-        _sgu_accel_log("accel report: BLAS %d %p size %llu built %d triangles %d vertices %d stride %d offset %d "
+        _sgu_accel_log_level(3, "accel report: BLAS %d %p size %llu built %d triangles %d vertices %d stride %d offset %d "
             "index format %d count %d offset %d, inputs %s (vertex buffer %d bytes)", i, b->native.as,
             (unsigned long long)_SGU_MTL_OBJ(id<MTLAccelerationStructure>, b->native.as).size, (int)b->built,
             _sgu_accel_triangle_count(b), b->blas.vertex_count, b->blas.vertex_stride, b->blas.vertex_offset,
@@ -3537,18 +3549,20 @@ _SOKOL_PRIVATE void _sgu_mtl_accel_report_bind(const sg_accel a, int slot, int b
     if (!_sgu_mtl_accel_report.build_logged) return;
     if (!_sgu_mtl_accel_report.bind_logged) {
         _sgu_mtl_accel_report.bind_logged = true;
-        _sgu_accel_log("accel report: first bind TLAS %p (reported build %p, %s) slot %d buffer %d, built %d, "
+        _sgu_accel_log_level(3, "accel report: first bind TLAS %p (reported build %p, %s) slot %d buffer %d, built %d, "
             "%d BLASes resident, frame %u", a->native.as, _sgu_mtl_accel_report.tlas,
             a->native.as == _sgu_mtl_accel_report.tlas ? "same" : "DIFFERENT", slot, buffer_n, (int)a->built,
             a->blas_count, _sg.frame_index);
     }
     if (_sgu_mtl_accel_report.result_logged || !__atomic_load_n(&_sgu_mtl_accel_report.done, __ATOMIC_ACQUIRE)) return;
     _sgu_mtl_accel_report.result_logged = true;
-    _sgu_accel_log("accel report: build command buffer status %d (4 completed, 5 error) error %ld, "
+    const uint32_t result_level = _sgu_mtl_accel_report.status == MTLCommandBufferStatusError ||
+        _sgu_mtl_accel_report.error_code != 0 ? 1 : 3;
+    _sgu_accel_log_level(result_level, "accel report: build command buffer status %d (4 completed, 5 error) error %ld, "
         "TLAS compacted size %u (0 means never built)", _sgu_mtl_accel_report.status,
         _sgu_mtl_accel_report.error_code, _sgu_mtl_accel_report.compacted[0]);
     for (int i = 0; i < _sgu_mtl_accel_report.blas_reported; i++) {
-        _sgu_accel_log("accel report: BLAS %d compacted size %u", i, _sgu_mtl_accel_report.compacted[1 + i]);
+        _sgu_accel_log_level(3, "accel report: BLAS %d compacted size %u", i, _sgu_mtl_accel_report.compacted[1 + i]);
     }
     _sgu_mtl_accel_defer(_sgu_mtl_accel_report.sizes);
     _sgu_mtl_accel_report.sizes = 0;
