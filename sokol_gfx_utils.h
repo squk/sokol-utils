@@ -1917,7 +1917,18 @@ _SOKOL_PRIVATE sg_submission_status _sgu_mtl_completion_poll(const _sgu_mtl_comp
     id<MTLCommandBuffer> command_buffer = (id<MTLCommandBuffer>)marker->command_buffer;
 #endif
     if (command_buffer.status == MTLCommandBufferStatusCompleted) return SG_SUBMISSION_COMPLETE;
-    if (command_buffer.status == MTLCommandBufferStatusError) return SG_SUBMISSION_FAILED;
+    if (command_buffer.status == MTLCommandBufferStatusError) {
+        /* Poll on the caller's thread. Collection releases this marker after
+           failure, so the native error is logged once for each failed buffer. */
+        if (_sg.desc.logger.func) {
+            NSString* message = [NSString stringWithFormat:@"Metal command buffer '%@' failed: %@",
+                command_buffer.label ? command_buffer.label : @"<unlabeled>",
+                command_buffer.error ? command_buffer.error.description : @"no native error supplied"];
+            _sg.desc.logger.func("sg_gfx_utils", 1, 0, message.UTF8String,
+                __LINE__, __FILE__, _sg.desc.logger.user_data);
+        }
+        return SG_SUBMISSION_FAILED;
+    }
     return SG_SUBMISSION_PENDING;
 }
 _SOKOL_PRIVATE void _sgu_mtl_completion_destroy(_sgu_mtl_completion_t* marker) {
