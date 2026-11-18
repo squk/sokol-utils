@@ -479,7 +479,8 @@ SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_end(sg_view image);
 SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_bind(const sg_fragment_storage_bindings* bindings);
 SOKOL_GFX_UTILS_API_DECL void sg_fragment_storage_shutdown(void);
 
-/* Async compute queue and cross-queue timeline synchronization (Metal and Vulkan). */
+/* Async compute queue and cross-queue timeline synchronization (Metal and Vulkan;
+   D3D11 has a single immediate ID3D11DeviceContext and no async compute queue). */
 SOKOL_GFX_UTILS_API_DECL bool sg_async_compute_setup(void);
 SOKOL_GFX_UTILS_API_DECL void sg_async_compute_shutdown(void);
 SOKOL_GFX_UTILS_API_DECL bool sg_async_compute_supported(void);
@@ -4692,6 +4693,19 @@ void sg_graphics_wait_async_compute(uint64_t token) {
     submit_info.pWaitSemaphoreInfos = &wait_info;
     vkQueueSubmit2(_sg.vk.queue, 1, &submit_info, VK_NULL_HANDLE);
 }
+
+#elif defined(SOKOL_D3D11)
+/* D3D11 exposes a single immediate ID3D11DeviceContext without a separate
+   hardware async compute queue, so async compute is unsupported here. */
+bool sg_async_compute_setup(void) { return false; }
+void sg_async_compute_shutdown(void) {}
+bool sg_async_compute_supported(void) { return false; }
+bool sg_begin_async_compute_pass(const char* label) { (void)label; return false; }
+void sg_end_async_compute_pass(void) {}
+uint64_t sg_async_compute_commit(void) { return 0; }
+uint64_t sg_graphics_signal_async_compute(void) { return 0; }
+void sg_async_compute_wait_graphics(uint64_t token) { (void)token; }
+void sg_graphics_wait_async_compute(uint64_t token) { (void)token; }
 
 #else
 bool sg_async_compute_setup(void) { return false; }
