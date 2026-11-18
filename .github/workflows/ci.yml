@@ -46,7 +46,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libasound2-dev libvulkan-dev
+          sudo apt-get install -y cmake g++ libx11-dev libxi-dev libxcursor-dev libxrandr-dev libgl1-mesa-dev libasound2-dev libvulkan-dev
       - name: Configure
         working-directory: sokol-utils
         run: cmake -S tests -B build/ci -DSOKOL_BACKEND=${{ matrix.platform.backend }} -DCMAKE_BUILD_TYPE=${{ matrix.config }}
@@ -83,6 +83,10 @@ jobs:
           persist-credentials: false
       - name: Install Emscripten
         run: |
+          if ! command -v cmake >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y cmake
+          fi
           ./emsdk/emsdk install 4.0.19
           ./emsdk/emsdk activate 4.0.19
       - name: Build C and C++ for WebGL2

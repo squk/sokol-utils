@@ -1,45 +1,43 @@
 # sokol-utils
 
-Extension utilities for the [sokol](https://github.com/floooh/sokol) headers.
+Extension utilities for the [sokol](https://github.com/floooh/sokol) single-header libraries.
 
-Currently, this repository contains:
-- `sokol_app_utils.h`: Additional functionality for `sokol_app.h`.
-- `sokol_gfx_utils.h`: Additional functionality for `sokol_gfx.h` (readback, indirect commands, GPU pass timings, ray query acceleration structures, and fragment-stage storage images).
+- [`sokol_app_utils.h`](sokol_app_utils.h): Window, display, cursor, swap-interval, and macOS background/swapchain helpers for `sokol_app.h`.
+- [`sokol_gfx_utils.h`](sokol_gfx_utils.h): Image readback, indirect commands, GPU pass timings, submission completion receipts, ray-query acceleration structures, fragment-stage storage images, and async compute helpers for `sokol_gfx.h`.
 
 ## Usage
 
-This project's tests assumes that the [sokol](https://github.com/floooh/sokol) repository is located in the parent directory (`../sokol`).
-
-Include the utility headers *after* the corresponding sokol header implementation. To create the implementation, define the corresponding `_IMPL` macro in exactly one C or C++ file.
-
-### sokol_app_utils.h
+The tests assume `sokol` is checked out at `../sokol`. Include each utility header *after* the corresponding sokol header implementation, defining `_IMPL` in one C or C++ file:
 
 ```c
 #define SOKOL_IMPL
 #include "sokol_app.h"
-
 #define SOKOL_APP_UTILS_IMPL
 #include "sokol_app_utils.h"
 ```
 
-### sokol_gfx_utils.h
-
 ```c
 #define SOKOL_IMPL
 #include "sokol_gfx.h"
-
 #define SOKOL_GFX_UTILS_IMPL
 #include "sokol_gfx_utils.h"
 ```
 
-## CI
+## Testing & CI
 
-[GitHub Actions](.github/workflows/ci.yml) builds and tests Debug/Release on Linux,
-macOS, and Windows, and compiles WebGL2. GPU and browser runtime tests are not covered.
+- **macOS (GLCore & Metal):** `./tests/test_macos.sh`
+- **Linux (GLCore):** `./tests/test_linux.sh`
+- **GitHub Actions locally via [`act`](https://nektosact.com):**
+  ```sh
+  act push -j native --matrix config:Debug -P ubuntu-24.04=catthehacker/ubuntu:act-24.04 -P windows-2025= --container-architecture linux/amd64
+  act push -j web --matrix config:Debug -P ubuntu-24.04=catthehacker/ubuntu:act-24.04 --container-architecture linux/amd64
+  ```
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) builds and runs compile + functional tests in Debug/Release on Linux (`SOKOL_GLCORE`, `SOKOL_VULKAN`), macOS (`SOKOL_GLCORE`, `SOKOL_METAL`), Windows (`SOKOL_D3D11`), and builds WebGL2 (`SOKOL_GLES3`). GPU and browser runtime tests are not covered.
 
 ## API
 
-### sokol_app_utils.h
+### `sokol_app_utils.h`
 
 ```c
 void sapp_set_window_position(int x, int y);
@@ -69,28 +67,14 @@ bool sapp_get_macos_background(void);
 sapp_swapchain sapp_acquire_swapchain_checked(void);
 ```
 
-*Note: Most of these functions are only supported on desktop platforms (Windows, macOS, Linux).*
+- Most functions are desktop-only (Windows, macOS, Linux).
+- Mouse positions are relative to the upper-left corner of the content area in framebuffer pixels (matching `sapp_event.mouse_x`/`mouse_y`); setting while locked or unsupported is a no-op.
+- On macOS, a custom frame timer is used when `swap_interval == 0` or running without an app bundle (since `CADisplayLink` cannot run unthrottled or for CLI launches).
+- `sapp_acquire_swapchain_checked()` returns an invalid swapchain when the window is covered or no drawable is free (use instead of `sapp_acquire_swapchain()`/`sglue_swapchain()`). `sapp_set_macos_background(true)` before `sapp_run()` opens the window behind other windows without activating the app.
 
-Mouse positions are relative to the upper-left corner of the window's content
-area and use framebuffer pixels, matching `sapp_event.mouse_x` and
-`sapp_event.mouse_y`. The getter returns Sokol's last event position so it has
-the same capture behavior as mouse events: dragging may report coordinates
-outside the content area, movement without capture stops at leave, and the
-absolute position remains frozen while the mouse is locked. A warp is reflected
-by the getter when Sokol receives the resulting native mouse event. Setting the
-position while the mouse is locked, or on an unsupported platform, is a no-op.
+### `sokol_gfx_utils.h`
 
-On macOS, sokol-utils runs frames from its own timer when the swap interval is
-0 or the program runs without an app bundle. CADisplayLink cannot run
-unthrottled, and AppKit does not schedule it for command-line launches. It
-replaces methods of sokol_app.h's private classes when the program loads.
-`sapp_acquire_swapchain_checked()` returns an invalid swapchain while the window
-is covered or no drawable is free; call it instead of `sapp_acquire_swapchain()`
-(which `sglue_swapchain()` uses). `sapp_set_macos_background(true)` before
-`sapp_run()` opens the window behind other windows without activating the app
-and keeps rendering while it is covered.
-
-### sokol_gfx_utils.h
+#### Image readback & GPU pass timings
 
 ```c
 void* sg_readback_request(sg_image img);
@@ -115,60 +99,18 @@ bool sg_gpu_pass_timings_supported(void);
 int sg_gpu_pass_timings_poll(sg_gpu_pass_timing* timings, int max_timings);
 ```
 
-GPU timing uses the same public API on Metal, Vulkan, and D3D11. Call setup
-with a valid Sokol graphics context, before installing other trace hooks.
-Call the timing functions on Sokol's render thread.
-Define `SOKOL_TRACE_HOOKS` in the implementation. Unsupported backends or
-unavailable timestamp queries make setup return `false`.
+- Supported on Metal, Vulkan, and D3D11; requires `SOKOL_TRACE_HOOKS` defined in the implementation.
+- Call setup with a valid context before installing other trace hooks, and call timing functions on Sokol's render thread.
+- `sg_gpu_pass_timings_poll()` never waits or flushes; provide space for `SG_GPU_PASS_TIMING_MAX_PASSES + 1` results. `Frame` comes first, followed by labeled passes (passes can overlap; do not sum them).
+- Call `sg_gpu_pass_timings_shutdown()` after `sg_shutdown()` has drained in-flight work, while the native device still exists.
 
-Enable recording as needed and poll for the oldest completed frame. Polling
-never waits for the GPU or flushes pending commands. Provide space for
-`SG_GPU_PASS_TIMING_MAX_PASSES + 1` results. Query storage stays bounded;
-recording drops samples when readback falls behind. Call shutdown after
-`sg_shutdown` has drained in-flight work, while the native device still exists.
+#### Submission completion
 
-The `Frame` result, when available, comes first. It measures the whole Metal
-command buffer, the Vulkan
-render command buffer, or the interval from D3D11's first pass through commit.
-Vulkan staging uploads use a separate command buffer and are excluded.
-Remaining results describe labeled render or compute passes. Passes can overlap;
-do not sum them to infer frame time. D3D11 rejects disjoint clock samples.
-Vulkan checks the submission fence before reading query availability, so a
-reused query pool cannot return the previous frame's timestamps as new data.
+- Replace `sg_commit()` with `sg_commit_tracked()` to obtain an `sg_submission_receipt`. Poll with `sg_query_submission_receipt()` (`SG_SUBMISSION_UNKNOWN`, `SG_SUBMISSION_PENDING`, `SG_SUBMISSION_COMPLETE`, `SG_SUBMISSION_FAILED`), and destroy every receipt (including pending) with `sg_destroy_submission_receipt()`.
+- Supported on Metal, Vulkan, D3D11, GL/GLES, and WebGPU (`sg_submission_completion_supported()`). `SG_SUBMISSION_RECEIPT_CAPACITY` defaults to 64; exhausted capacity returns a null receipt while still committing.
+- Call on the graphics thread outside passes. Call `sg_shutdown_submission_receipts()` before `sg_shutdown()` or switching backends (if Vulkan returns `false`, retry cleanup before destroying the device).
 
-Backend integration stays inside the utility implementation and its native
-adapter; it adds no public backend-specific API. Metal's adapter attaches stage
-counters to the render or compute encoder descriptor before encoder creation.
-Render durations combine vertex and fragment intervals, excluding gaps and
-counting overlap once. Devices without stage counters report only `Frame`.
-Vulkan's adapter brackets Sokol's render command buffer and resets query pools
-only after Sokol has finished the slot's earlier work. The adapter must share
-the utility implementation's translation unit to call its private helpers.
-
-### Submission completion
-
-Replace `sg_commit()` with `sg_commit_tracked()` to get an opaque
-`sg_submission_receipt`. Query it with `sg_query_submission_receipt()`; results
-are `SG_SUBMISSION_UNKNOWN`, `SG_SUBMISSION_PENDING`, `SG_SUBMISSION_COMPLETE`,
-or `SG_SUBMISSION_FAILED`. Destroy each receipt with
-`sg_destroy_submission_receipt()`, including pending receipts.
-
-Metal tracks the actual command buffer. Vulkan adds a fence on Sokol's queue;
-D3D11 uses an event query, GL/GLES a sync object, and WebGPU a queue callback.
-`sg_submission_completion_supported()` checks the current backend. Unsupported
-tracking, allocation failure, or exhausted capacity returns a null receipt;
-the tracked call still commits. `SG_SUBMISSION_RECEIPT_CAPACITY` defaults to 64.
-Completion covers this Sokol queue/context, not other queues or output validity.
-
-Call these functions on the graphics thread, outside passes. Polling and receipt
-destruction never wait. Call `sg_shutdown_submission_receipts()` before
-`sg_shutdown()` or a backend switch; Vulkan may wait during this explicit
-shutdown. If it returns `false`, Vulkan could not confirm idle: receipts stay
-intact. Retry cleanup or stop graphics teardown; do not destroy the device.
-On success, surviving receipts report unknown and still need destruction.
-WebGPU requires the modern callback API and supported atomic operations.
-
-### Acceleration structures and ray queries
+#### Acceleration structures & ray queries
 
 ```c
 bool sg_ray_query_supported(void);
@@ -185,61 +127,7 @@ void sg_destroy_accel(sg_accel accel);
 void sg_accel_shutdown(void);
 ```
 
-A bottom-level structure (BLAS) holds a triangle mesh of float3 positions. A
-top-level structure (TLAS) holds instances of BLASes: a row-major 3x4 transform,
-a 24-bit id, an 8-bit mask and a BLAS index. Compute shaders trace rays with
-ray queries. Metal and Vulkan support them. D3D11, WebGPU and GL report
-`sg_ray_query_supported() == false`. Sokol has no D3D12 backend, so Windows uses
-Vulkan.
-
-Create vertex and index buffers with `sg_make_accel_input_buffer` (they need
-`usage.storage_buffer`). A BLAS stores the buffer ids and reads the buffers at
-each build or refit. `sg_make_blas` and `sg_make_tlas` record no commands. Build
-or refit outside passes, in command order before the compute pass that reads
-the result; a TLAS takes one build or refit per frame. Refit needs
-`allow_update` and keeps topology and instance count. Compaction is not
-supported. The caller owns each `sg_accel`. A TLAS holds a reference on its
-BLASes, and `sg_destroy_accel` defers the free until the GPU has finished the
-frames that can use the structure. Call these functions on the sokol_gfx
-thread. Call `sg_accel_shutdown` after `sg_shutdown`, with the native device
-alive.
-
-Builds share one grow-only scratch buffer per frame in flight. The mask of an
-instance must be non-zero (`0xFF` hits always). `sg_make_blas` needs both
-buffers valid, and index values are not range checked. The index offset is a
-multiple of the index size. `sg_make_blas` and `sg_make_tlas` return NULL when
-the structure exceeds a Vulkan device limit. `sg_destroy_accel` after
-`sg_accel_shutdown` does nothing: destroy every structure first.
-
-The shader compiler (sokol-slang) decides where each acceleration structure slot
-(0..`SG_ACCEL_MAX_SLOTS - 1`) lives and writes `msl_buffer_n` and
-`spirv_set1_binding_n` per slot into its reflection data. Pass those numbers to
-`sg_make_shader_accel` in an `sg_accel_layout_desc` (`num_slots` and one
-`sg_accel_slot_layout` of `slot`, `msl_buffer_n`, `vk_binding_n` each; use -1
-for a backend the shader does not target). The runtime assumes no index. It logs
-and returns an invalid shader when a slot or index repeats or is out of range,
-when a Metal index equals a uniform block or storage buffer index, or when a
-Vulkan binding equals a view or sampler binding or lies below
-`SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS` (a sign that compiler and
-runtime use different `sokol_gfx.h` versions). It keeps the layout until the
-shader is destroyed.
-
-`sg_accel_bind(tlas, slot)` uses the recorded numbers. On Metal it sets
-the structure at the recorded `[[buffer(n)]]` on the compute encoder and marks
-the TLAS and its BLASes resident; call it in every compute pass that traces. On
-Vulkan, sokol_gfx does not know the binding: `sg_make_shader_accel` adds it to
-the set 1 layout, and call
-`sg_accel_bind` after each `sg_apply_bindings` in the compute pass. A shader
-with no views or samplers gets its own descriptor chunk. Otherwise
-`sg_accel_bind` writes into the chunk of the last `sg_apply_bindings`: no
-`sg_dispatch` or `sg_apply_uniforms` may sit between the two calls.
-
-Vulkan device setup: the application creates the `VkDevice` and must enable the
-extensions `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and
-`VK_KHR_deferred_host_operations`, and the features
-`VkPhysicalDeviceAccelerationStructureFeaturesKHR::accelerationStructure` and
-`VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery`, besides `bufferDeviceAddress`
-and descriptor buffers that sokol_gfx already needs. `sg_ray_query_supported`
-checks that the GPU lists the extensions, offers the features and that the entry
-points load; it cannot see what the application enabled, so the application
-must enable them whenever the GPU offers them.
+- Supported on Metal and Vulkan (`sg_ray_query_supported()`). Call on the `sokol_gfx` thread; call `sg_accel_shutdown()` after `sg_shutdown()` while the native device is alive, after destroying all `sg_accel` structures.
+- Create vertex/index buffers with `sg_make_accel_input_buffer()` (`usage.storage_buffer`). Build or refit outside passes before the compute pass that traces; refit requires `allow_update` and keeps topology/instance count. Instance masks must be non-zero (`0xFF` hits all).
+- Pass `sokol-slang` reflection indices (`msl_buffer_n`, `spirv_set1_binding_n`, or `-1` for untargeted backends) to `sg_make_shader_accel()`. On Metal, call `sg_accel_bind()` in every compute pass; on Vulkan, call it after `sg_apply_bindings()` with no `sg_dispatch()` or `sg_apply_uniforms()` in between.
+- On Vulkan, the application's `VkDevice` must enable `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`, `VK_KHR_deferred_host_operations`, and the `accelerationStructure` and `rayQuery` features.

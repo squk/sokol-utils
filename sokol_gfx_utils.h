@@ -1850,7 +1850,7 @@ SOKOL_API_IMPL bool sg_gpu_pass_timings_setup(void) {
     if (!sg_isvalid()) return false;
 #if !defined(SOKOL_TRACE_HOOKS)
     return false;
-#endif
+#else
     if (_sgu_gpu_pass_timing_state.setup) {
         return _sgu_gpu_pass_timing_state.supported;
     }
@@ -1875,6 +1875,7 @@ SOKOL_API_IMPL bool sg_gpu_pass_timings_setup(void) {
     hooks.commit = _sgu_gpu_timing_trace_commit;
     _sgu_gpu_pass_timing_state.previous_hooks = sg_install_trace_hooks(&hooks);
     return true;
+#endif
 }
 
 SOKOL_API_IMPL void sg_gpu_pass_timings_shutdown(void) {
@@ -4580,7 +4581,7 @@ bool sg_async_compute_setup(void) {
 
     _SG_STRUCT(VkCommandPoolCreateInfo, gfx_pool_info);
     gfx_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    gfx_pool_info.flags = VK_COMMAND_POOL_CREATE_COMMAND_BUFFER_BIT;
+    gfx_pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     gfx_pool_info.queueFamilyIndex = _sg.vk.queue_family_index;
     if (vkCreateCommandPool(_sg.vk.dev, &gfx_pool_info, NULL, &_sgu_async_vk.gfx_cmd_pool) != VK_SUCCESS) {
         vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.cmd_pool, NULL);

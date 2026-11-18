@@ -4,7 +4,8 @@
 #include "sokol_gfx_utils.h"
 
 void use_gfx_utils(void) {
-    sg_readback_request((sg_image){0});
+    sg_image img = {};
+    sg_readback_request(img);
     sg_blas_desc blas_desc = {};
     sg_tlas_desc tlas_desc = {};
     sg_accel_instance instance = {};

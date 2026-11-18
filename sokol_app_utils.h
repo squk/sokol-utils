@@ -858,7 +858,9 @@ _SOKOL_PRIVATE void _sapp_win32_set_swap_interval(int interval) {
     }
     #endif
     #if defined(SOKOL_VULKAN)
-    _sapp_vk_recreate_swapchain();
+    if (_sapp.vk.device) {
+        _sapp_vk_recreate_swapchain();
+    }
     #endif
 }
 /* window style and visibility: the style sokol_app creates, less the
@@ -1164,7 +1166,9 @@ _SOKOL_PRIVATE void _sapp_linux_set_swap_interval(int interval) {
     eglSwapInterval(_sapp.egl.display, interval);
     #endif
     #if defined(SOKOL_VULKAN)
-    _sapp_vk_recreate_swapchain();
+    if (_sapp.vk.device) {
+        _sapp_vk_recreate_swapchain();
+    }
     #endif
 }
 #endif /* _SAPP_LINUX */
