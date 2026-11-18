@@ -4409,7 +4409,6 @@ bool sg_begin_async_compute_pass(const char* label) {
     if (!_sg.mtl.cur_ub_base_ptr && _sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index]) {
         _sg.mtl.cur_ub_base_ptr = (uint8_t*)[_sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index] contents];
     }
-    [encoder setBuffer:_sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index] offset:0 atIndex:0];
     _sgu_async_mtl.saved_encoder = _sg.mtl.compute_cmd_encoder;
     memcpy(_sgu_async_mtl.saved_pass, &_sg.cur_pass, sizeof(_sg.cur_pass));
     _sgu_async_mtl.saved_pip = _sg.cur_pip;
@@ -4419,6 +4418,8 @@ bool sg_begin_async_compute_pass(const char* label) {
     _sg.cur_pass.valid = true;
     _sg.cur_pass.is_compute = true;
     memset(&_sg.cur_pip, 0, sizeof(_sg.cur_pip));
+    _sg_mtl_clear_state_cache();
+    _sg_mtl_bind_uniform_buffers();
     _sgu_async_mtl.in_pass = true;
     return true;
 }
@@ -4448,10 +4449,11 @@ uint64_t sg_async_compute_commit(void) {
 
 uint64_t sg_graphics_signal_async_compute(void) {
     if (!sg_async_compute_supported()) return 0;
-    if (!_sg.mtl.cmd_buffer) {
-        _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBuffer];
-        if (!_sg.mtl.cmd_buffer) return 0;
-    }
+    /* Use Sokol's frame semaphore and end pending uploads before the event. */
+    if (_sg.cur_pass.in_pass) return 0;
+    _sg_mtl_acquire_cmd_buffer();
+    if (!_sg.mtl.cmd_buffer) return 0;
+    _sg_mtl_finish_blit_cmd_encoder();
     const uint64_t token = _sgu_async_mtl.next_token++;
     if (_sgu_async_mtl.next_token == 0) _sgu_async_mtl.next_token = 1;
     [_sg.mtl.cmd_buffer encodeSignalEvent:_sgu_async_mtl.event value:token];
@@ -4469,10 +4471,10 @@ void sg_async_compute_wait_graphics(uint64_t token) {
 
 void sg_graphics_wait_async_compute(uint64_t token) {
     if (!sg_async_compute_supported() || token == 0) return;
-    if (!_sg.mtl.cmd_buffer) {
-        _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBuffer];
-        if (!_sg.mtl.cmd_buffer) return;
-    }
+    SOKOL_ASSERT(!_sg.cur_pass.in_pass);
+    _sg_mtl_acquire_cmd_buffer();
+    if (!_sg.mtl.cmd_buffer) return;
+    _sg_mtl_finish_blit_cmd_encoder();
     [_sg.mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.event value:token];
 }
 
