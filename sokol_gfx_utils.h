@@ -4347,8 +4347,9 @@ typedef struct _sgu_async_compute_mtl_state {
     id<MTLEvent> event;
     id<MTLCommandBuffer> cmd_buffer;
     id<MTLComputeCommandEncoder> saved_encoder;
-    _sg_pass_state_t saved_pass;
-    sg_pipeline saved_pip;
+    /* Sokol keeps cur_pass anonymous; preserve its bytes without a second layout. */
+    unsigned char saved_pass[sizeof(_sg.cur_pass)];
+    _sg_pipeline_ref_t saved_pip;
     uint64_t next_token;
     uint64_t pending_gfx_wait;
 } _sgu_async_compute_mtl_state;
@@ -4410,14 +4411,14 @@ bool sg_begin_async_compute_pass(const char* label) {
     }
     [encoder setBuffer:_sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index] offset:0 atIndex:0];
     _sgu_async_mtl.saved_encoder = _sg.mtl.compute_cmd_encoder;
-    _sgu_async_mtl.saved_pass = _sg.cur_pass;
+    memcpy(_sgu_async_mtl.saved_pass, &_sg.cur_pass, sizeof(_sg.cur_pass));
     _sgu_async_mtl.saved_pip = _sg.cur_pip;
     _sg.mtl.compute_cmd_encoder = encoder;
     memset(&_sg.cur_pass, 0, sizeof(_sg.cur_pass));
     _sg.cur_pass.in_pass = true;
     _sg.cur_pass.valid = true;
     _sg.cur_pass.is_compute = true;
-    _sg.cur_pip.id = SG_INVALID_ID;
+    memset(&_sg.cur_pip, 0, sizeof(_sg.cur_pip));
     _sgu_async_mtl.in_pass = true;
     return true;
 }
@@ -4428,7 +4429,7 @@ void sg_end_async_compute_pass(void) {
         [_sg.mtl.compute_cmd_encoder endEncoding];
     }
     _sg.mtl.compute_cmd_encoder = _sgu_async_mtl.saved_encoder;
-    _sg.cur_pass = _sgu_async_mtl.saved_pass;
+    memcpy(&_sg.cur_pass, _sgu_async_mtl.saved_pass, sizeof(_sg.cur_pass));
     _sg.cur_pip = _sgu_async_mtl.saved_pip;
     _sgu_async_mtl.saved_encoder = nil;
     _sgu_async_mtl.in_pass = false;
@@ -4448,7 +4449,7 @@ uint64_t sg_async_compute_commit(void) {
 uint64_t sg_graphics_signal_async_compute(void) {
     if (!sg_async_compute_supported()) return 0;
     if (!_sg.mtl.cmd_buffer) {
-        _sg.mtl.cmd_buffer = [_sg.mtl.command_queue commandBuffer];
+        _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBuffer];
         if (!_sg.mtl.cmd_buffer) return 0;
     }
     const uint64_t token = _sgu_async_mtl.next_token++;
@@ -4469,7 +4470,7 @@ void sg_async_compute_wait_graphics(uint64_t token) {
 void sg_graphics_wait_async_compute(uint64_t token) {
     if (!sg_async_compute_supported() || token == 0) return;
     if (!_sg.mtl.cmd_buffer) {
-        _sg.mtl.cmd_buffer = [_sg.mtl.command_queue commandBuffer];
+        _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBuffer];
         if (!_sg.mtl.cmd_buffer) return;
     }
     [_sg.mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.event value:token];
