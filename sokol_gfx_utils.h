@@ -240,8 +240,7 @@ SOKOL_GFX_UTILS_API_DECL bool sg_shutdown_submission_receipts(void);
       this header is built with. A smaller number means the shader compiler
       and the runtime were built against different sokol_gfx.h versions; the
       error names both numbers.
-    This header targets the sokol_gfx.h that goBot vendors (it reads
-    _sg_skipdraw_any), not older sokol versions.
+    This header targets current sokol_gfx.h internals, not older sokol versions.
     - Metal: sg_accel_bind(tlas, slot) sets the structure at the recorded
       [[buffer(n)]] on the compute encoder and marks the TLAS and its BLASes
       resident. Metal keeps no binding across encoders: call it in every
@@ -689,9 +688,13 @@ SOKOL_API_IMPL void sg_indirect_barrier(void) {
     #endif
 }
 
+_SOKOL_PRIVATE bool _sgu_skip_draw(void) {
+    return !_sg.cur_pass.valid || !_sg.next_draw_valid;
+}
+
 _SOKOL_PRIVATE _sg_buffer_t* _sgu_indirect_args(sg_buffer args, int offset, int size, bool compute) {
     if (!sg_indirect_supported() || !_sg.cur_pass.valid || !_sg.cur_pass.in_pass ||
-        _sg.cur_pass.is_compute != compute || _sg_skipdraw_any() || offset < 0 || (offset & 3)) return 0;
+        _sg.cur_pass.is_compute != compute || _sgu_skip_draw() || offset < 0 || (offset & 3)) return 0;
     _sg_buffer_t* buf = _sg_lookup_buffer(args.id);
     if (!buf || buf->slot.state != SG_RESOURCESTATE_VALID || !buf->cmn.usage.storage_buffer ||
         size > buf->cmn.size || offset > buf->cmn.size - size) return 0;
@@ -1284,6 +1287,22 @@ _SOKOL_PRIVATE int _sgu_vk_gpu_timing_poll(sg_gpu_pass_timing* timings, int max_
 
 /*--- GPU Pass Timings: D3D11 ----------------------------------------------*/
 #if defined(SOKOL_D3D11)
+#if defined(__cplusplus)
+#define _sgu_d3d11_CreateQuery(self, desc, q) (self)->CreateQuery(desc, q)
+#define _sgu_d3d11_Begin(self, async) (self)->Begin(async)
+#define _sgu_d3d11_End(self, async) (self)->End(async)
+#define _sgu_d3d11_GetData(self, async, data, size, flags) (self)->GetData(async, data, size, flags)
+#define _sgu_d3d11_GetDesc2D(self, desc) (self)->GetDesc(desc)
+#define _sgu_d3d11_CopyResource(self, dst, src) (self)->CopyResource(dst, src)
+#else
+#define _sgu_d3d11_CreateQuery(self, desc, q) (self)->lpVtbl->CreateQuery(self, desc, q)
+#define _sgu_d3d11_Begin(self, async) (self)->lpVtbl->Begin(self, (ID3D11Asynchronous*)(async))
+#define _sgu_d3d11_End(self, async) (self)->lpVtbl->End(self, (ID3D11Asynchronous*)(async))
+#define _sgu_d3d11_GetData(self, async, data, size, flags) (self)->lpVtbl->GetData(self, (ID3D11Asynchronous*)(async), data, size, flags)
+#define _sgu_d3d11_GetDesc2D(self, desc) (self)->lpVtbl->GetDesc(self, desc)
+#define _sgu_d3d11_CopyResource(self, dst, src) (self)->lpVtbl->CopyResource(self, (ID3D11Resource*)(dst), (ID3D11Resource*)(src))
+#endif
+
 #define _SGU_D3D11_GPU_TIMING_FRAMES (4)
 typedef struct {
     ID3D11Query* disjoint;
@@ -1306,19 +1325,19 @@ _SOKOL_PRIVATE bool _sgu_d3d11_gpu_timing_make_query(ID3D11Query** query, D3D11_
     D3D11_QUERY_DESC desc;
     memset(&desc, 0, sizeof(desc));
     desc.Query = type;
-    return SUCCEEDED(_sgu_d3d11_gpu_timing.device->CreateQuery(&desc, query));
+    return SUCCEEDED(_sgu_d3d11_CreateQuery(_sgu_d3d11_gpu_timing.device, &desc, query));
 }
 
 _SOKOL_PRIVATE void _sgu_d3d11_gpu_timing_shutdown(void) {
     for (int i = 0; i < _SGU_D3D11_GPU_TIMING_FRAMES; ++i) {
         _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[i];
-        if (frame->disjoint) frame->disjoint->Release();
+        if (frame->disjoint) _sg_d3d11_Release(frame->disjoint);
         for (int j = 0; j < 2 + SG_GPU_PASS_TIMING_MAX_PASSES * 2; ++j) {
-            if (frame->queries[j]) frame->queries[j]->Release();
+            if (frame->queries[j]) _sg_d3d11_Release(frame->queries[j]);
         }
     }
-    if (_sgu_d3d11_gpu_timing.context) _sgu_d3d11_gpu_timing.context->Release();
-    if (_sgu_d3d11_gpu_timing.device) _sgu_d3d11_gpu_timing.device->Release();
+    if (_sgu_d3d11_gpu_timing.context) _sg_d3d11_Release(_sgu_d3d11_gpu_timing.context);
+    if (_sgu_d3d11_gpu_timing.device) _sg_d3d11_Release(_sgu_d3d11_gpu_timing.device);
     memset(&_sgu_d3d11_gpu_timing, 0, sizeof(_sgu_d3d11_gpu_timing));
     _sgu_d3d11_gpu_timing.current_slot = -1;
 }
@@ -1331,8 +1350,8 @@ _SOKOL_PRIVATE bool _sgu_d3d11_gpu_timing_initialize(void) {
         _sgu_d3d11_gpu_timing.context = NULL;
         return false;
     }
-    _sgu_d3d11_gpu_timing.device->AddRef();
-    _sgu_d3d11_gpu_timing.context->AddRef();
+    _sg_d3d11_AddRef(_sgu_d3d11_gpu_timing.device);
+    _sg_d3d11_AddRef(_sgu_d3d11_gpu_timing.context);
     _sgu_d3d11_gpu_timing.current_slot = -1;
     for (int i = 0; i < _SGU_D3D11_GPU_TIMING_FRAMES; ++i) {
         _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[i];
@@ -1361,8 +1380,8 @@ _SOKOL_PRIVATE void _sgu_d3d11_gpu_timing_begin_pass(const sg_pass* pass) {
         _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[slot];
         frame->frame_index = _sg.frame_index;
         frame->pass_count = 0;
-        context->Begin(frame->disjoint);
-        context->End(frame->queries[0]);
+        _sgu_d3d11_Begin(context, frame->disjoint);
+        _sgu_d3d11_End(context, frame->queries[0]);
     }
     _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[slot];
     frame->active_pass = -1;
@@ -1375,7 +1394,7 @@ _SOKOL_PRIVATE void _sgu_d3d11_gpu_timing_begin_pass(const sg_pass* pass) {
     frame->labels[index][SG_GPU_PASS_TIMING_LABEL_SIZE - 1] = 0;
     frame->active_pass = (int)index;
     ++frame->pass_count;
-    context->End(frame->queries[2 + index * 2]);
+    _sgu_d3d11_End(context, frame->queries[2 + index * 2]);
 }
 
 _SOKOL_PRIVATE void _sgu_d3d11_gpu_timing_end_pass(void) {
@@ -1383,7 +1402,7 @@ _SOKOL_PRIVATE void _sgu_d3d11_gpu_timing_end_pass(void) {
     if (slot < 0) return;
     _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[slot];
     if (frame->active_pass < 0) return;
-    _sgu_d3d11_gpu_timing.context->End(frame->queries[3 + (uint32_t)frame->active_pass * 2]);
+    _sgu_d3d11_End(_sgu_d3d11_gpu_timing.context, frame->queries[3 + (uint32_t)frame->active_pass * 2]);
     frame->active_pass = -1;
 }
 
@@ -1391,8 +1410,8 @@ _SOKOL_PRIVATE void _sgu_d3d11_gpu_timing_commit(void) {
     const int slot = _sgu_d3d11_gpu_timing.current_slot;
     if (slot < 0) return;
     _sgu_d3d11_gpu_timing_frame_t* frame = &_sgu_d3d11_gpu_timing.frames[slot];
-    _sgu_d3d11_gpu_timing.context->End(frame->queries[1]);
-    _sgu_d3d11_gpu_timing.context->End(frame->disjoint);
+    _sgu_d3d11_End(_sgu_d3d11_gpu_timing.context, frame->queries[1]);
+    _sgu_d3d11_End(_sgu_d3d11_gpu_timing.context, frame->disjoint);
     frame->pending = true;
     _sgu_d3d11_gpu_timing.current_slot = -1;
 }
@@ -1406,13 +1425,13 @@ _SOKOL_PRIVATE int _sgu_d3d11_gpu_timing_poll(sg_gpu_pass_timing* timings, int m
     if (!oldest) return 0;
     ID3D11DeviceContext* context = _sgu_d3d11_gpu_timing.context;
     D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
-    HRESULT status = context->GetData(oldest->disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    HRESULT status = _sgu_d3d11_GetData(context, oldest->disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH);
     if (status == S_FALSE) return 0;
     if (FAILED(status) || disjoint.Disjoint || !disjoint.Frequency) { oldest->pending = false; return 0; }
     uint64_t results[2 + SG_GPU_PASS_TIMING_MAX_PASSES * 2];
     const uint32_t queries = 2 + oldest->pass_count * 2;
     for (uint32_t i = 0; i < queries; ++i) {
-        status = context->GetData(oldest->queries[i], &results[i], sizeof(results[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        status = _sgu_d3d11_GetData(context, oldest->queries[i], &results[i], sizeof(results[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH);
         if (status == S_FALSE) return 0;
         if (FAILED(status)) { oldest->pending = false; return 0; }
     }
@@ -1694,19 +1713,19 @@ _SOKOL_PRIVATE void* _sgu_d3d11_readback_request(sg_image img) {
     ID3D11Texture2D* src_tex = img_ptr->d3d11.tex2d;
 
     D3D11_TEXTURE2D_DESC desc;
-    src_tex->GetDesc(&desc);
+    _sgu_d3d11_GetDesc2D(src_tex, &desc);
     desc.Usage = D3D11_USAGE_STAGING;
     desc.BindFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     desc.MiscFlags = 0;
 
     ID3D11Texture2D* staging_tex = NULL;
-    HRESULT hr = dev->CreateTexture2D(&desc, NULL, &staging_tex);
+    HRESULT hr = _sg_d3d11_CreateTexture2D(dev, &desc, NULL, &staging_tex);
     if (FAILED(hr)) {
         return NULL;
     }
 
-    ctx->CopyResource(staging_tex, src_tex);
+    _sgu_d3d11_CopyResource(ctx, staging_tex, src_tex);
 
     _sgu_d3d11_readback_request_t* req = (_sgu_d3d11_readback_request_t*) malloc(sizeof(_sgu_d3d11_readback_request_t));
     req->staging_tex = staging_tex;
@@ -1720,9 +1739,9 @@ _SOKOL_PRIVATE bool _sgu_d3d11_readback_is_ready(void* request) {
     _sgu_d3d11_readback_request_t* req = (_sgu_d3d11_readback_request_t*)request;
     ID3D11DeviceContext* ctx = _sg.d3d11.ctx;
     D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = ctx->Map(req->staging_tex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    HRESULT hr = _sg_d3d11_Map(ctx, (ID3D11Resource*)req->staging_tex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
     if (hr == S_OK) {
-        ctx->Unmap(req->staging_tex, 0);
+        _sg_d3d11_Unmap(ctx, (ID3D11Resource*)req->staging_tex, 0);
         return true;
     }
     return false;
@@ -1734,9 +1753,9 @@ _SOKOL_PRIVATE void _sgu_d3d11_readback_wait(void* request) {
     int timeout_ms = GFX_READBACK_TIMEOUT_MS;
     while (timeout_ms > 0) {
         D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = ctx->Map(req->staging_tex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        HRESULT hr = _sg_d3d11_Map(ctx, (ID3D11Resource*)req->staging_tex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
         if (hr == S_OK) {
-            ctx->Unmap(req->staging_tex, 0);
+            _sg_d3d11_Unmap(ctx, (ID3D11Resource*)req->staging_tex, 0);
             break;
         }
         timeout_ms--;
@@ -1747,7 +1766,7 @@ _SOKOL_PRIVATE void _sgu_d3d11_readback_copy_data(void* request, void* out_pixel
     _sgu_d3d11_readback_request_t* req = (_sgu_d3d11_readback_request_t*)request;
     ID3D11DeviceContext* ctx = _sg.d3d11.ctx;
     D3D11_MAPPED_SUBRESOURCE mapped;
-    if (SUCCEEDED(ctx->Map(req->staging_tex, 0, D3D11_MAP_READ, 0, &mapped))) {
+    if (SUCCEEDED(_sg_d3d11_Map(ctx, (ID3D11Resource*)req->staging_tex, 0, D3D11_MAP_READ, 0, &mapped))) {
         if (mapped.RowPitch == (UINT)req->bytes_per_row) {
             memcpy(out_pixels, mapped.pData, (size_t)req->height * (size_t)req->bytes_per_row);
         } else {
@@ -1755,13 +1774,13 @@ _SOKOL_PRIVATE void _sgu_d3d11_readback_copy_data(void* request, void* out_pixel
                 memcpy((uint8_t*)out_pixels + (size_t)i * (size_t)req->bytes_per_row, (uint8_t*)mapped.pData + (size_t)i * (size_t)mapped.RowPitch, (size_t)req->bytes_per_row);
             }
         }
-        ctx->Unmap(req->staging_tex, 0);
+        _sg_d3d11_Unmap(ctx, (ID3D11Resource*)req->staging_tex, 0);
     }
 }
 
 _SOKOL_PRIVATE void _sgu_d3d11_readback_destroy(void* request) {
     _sgu_d3d11_readback_request_t* req = (_sgu_d3d11_readback_request_t*)request;
-    req->staging_tex->Release();
+    _sg_d3d11_Release(req->staging_tex);
     free(req);
 }
 
@@ -3174,7 +3193,7 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_shader_has_no_views(const _sg_shader_t* shd) {
    old one, and finding the old one is the same guess. */
 _SOKOL_PRIVATE bool _sgu_vk_accel_bind(const sg_accel a, int slot) {
     const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
-    if (!pip || _sg_skipdraw_any()) return false;
+    if (!pip || _sgu_skip_draw()) return false;
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
     if (!shd || !shd->vk.view_smp_dset_size || !_sg.vk.bind.cur_mem_ptr || _sg.vk.bind.overflown) return false;
     const sg_accel_slot_layout* slot_layout = _sgu_accel_find_slot(shd->slot.id, slot);
@@ -4307,7 +4326,7 @@ SOKOL_API_IMPL bool sg_fragment_storage_end(sg_view image) {
 
 SOKOL_API_IMPL bool sg_fragment_storage_bind(const sg_fragment_storage_bindings* bindings) {
     if (!bindings || !sg_fragment_storage_supported()) return false;
-    if (!_sg.cur_pass.valid || !_sg.cur_pass.in_pass || _sg.cur_pass.is_compute || _sg_skipdraw_any()) return false;
+    if (!_sg.cur_pass.valid || !_sg.cur_pass.in_pass || _sg.cur_pass.is_compute || _sgu_skip_draw()) return false;
     const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
     if (!pip) return false;
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
@@ -4496,8 +4515,8 @@ typedef struct _sgu_async_compute_vk_state {
     uint32_t gfx_cmd_cursor;
     VkCommandBuffer active_cmd;
     VkCommandBuffer saved_cmd;
-    _sg_pass_state_t saved_pass;
-    sg_pipeline saved_pip;
+    uint8_t saved_pass[sizeof(_sg.cur_pass)];
+    _sg_pipeline_ref_t saved_pip;
     VkSemaphore timeline;
     uint64_t next_token;
     uint64_t pending_gfx_wait;
@@ -4542,13 +4561,13 @@ bool sg_async_compute_setup(void) {
     if (!_sgu_async_vk.queue) return false;
     _sgu_async_vk.queue_family_index = chosen_family;
 
-    VkCommandPoolCreateInfo pool_info = {0};
+    _SG_STRUCT(VkCommandPoolCreateInfo, pool_info);
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pool_info.queueFamilyIndex = chosen_family;
     if (vkCreateCommandPool(_sg.vk.dev, &pool_info, NULL, &_sgu_async_vk.cmd_pool) != VK_SUCCESS) return false;
 
-    VkCommandBufferAllocateInfo alloc_info = {0};
+    _SG_STRUCT(VkCommandBufferAllocateInfo, alloc_info);
     alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     alloc_info.commandPool = _sgu_async_vk.cmd_pool;
     alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -4559,7 +4578,7 @@ bool sg_async_compute_setup(void) {
         return false;
     }
 
-    VkCommandPoolCreateInfo gfx_pool_info = {0};
+    _SG_STRUCT(VkCommandPoolCreateInfo, gfx_pool_info);
     gfx_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     gfx_pool_info.flags = VK_COMMAND_POOL_CREATE_COMMAND_BUFFER_BIT;
     gfx_pool_info.queueFamilyIndex = _sg.vk.queue_family_index;
@@ -4569,7 +4588,7 @@ bool sg_async_compute_setup(void) {
         return false;
     }
 
-    VkCommandBufferAllocateInfo gfx_alloc = {0};
+    _SG_STRUCT(VkCommandBufferAllocateInfo, gfx_alloc);
     gfx_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     gfx_alloc.commandPool = _sgu_async_vk.gfx_cmd_pool;
     gfx_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -4582,11 +4601,11 @@ bool sg_async_compute_setup(void) {
         return false;
     }
 
-    VkSemaphoreTypeCreateInfo type_info = {0};
+    _SG_STRUCT(VkSemaphoreTypeCreateInfo, type_info);
     type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
     type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     type_info.initialValue = 0;
-    VkSemaphoreCreateInfo sem_info = {0};
+    _SG_STRUCT(VkSemaphoreCreateInfo, sem_info);
     sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     sem_info.pNext = &type_info;
     if (vkCreateSemaphore(_sg.vk.dev, &sem_info, NULL, &_sgu_async_vk.timeline) != VK_SUCCESS) {
@@ -4622,7 +4641,7 @@ bool sg_begin_async_compute_pass(const char* label) {
         const uint32_t slot = _sgu_async_vk.cmd_cursor % _SGU_ASYNC_VK_CMD_POOL_COUNT;
         _sgu_async_vk.cmd_cursor++;
         if (_sgu_async_vk.cmd_tokens[slot] > 0) {
-            VkSemaphoreWaitInfo wait_info = {0};
+            _SG_STRUCT(VkSemaphoreWaitInfo, wait_info);
             wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
             wait_info.semaphoreCount = 1;
             wait_info.pSemaphores = &_sgu_async_vk.timeline;
@@ -4632,7 +4651,7 @@ bool sg_begin_async_compute_pass(const char* label) {
         }
         VkCommandBuffer cmd = _sgu_async_vk.cmd_buffers[slot];
         if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return false;
-        VkCommandBufferBeginInfo begin_info = {0};
+        _SG_STRUCT(VkCommandBufferBeginInfo, begin_info);
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) return false;
@@ -4640,14 +4659,14 @@ bool sg_begin_async_compute_pass(const char* label) {
         _sgu_async_vk.active_cmd = cmd;
     }
     _sgu_async_vk.saved_cmd = _sg.vk.frame.cmd_buf;
-    _sgu_async_vk.saved_pass = _sg.cur_pass;
+    memcpy(_sgu_async_vk.saved_pass, &_sg.cur_pass, sizeof(_sg.cur_pass));
     _sgu_async_vk.saved_pip = _sg.cur_pip;
     _sg.vk.frame.cmd_buf = _sgu_async_vk.active_cmd;
     memset(&_sg.cur_pass, 0, sizeof(_sg.cur_pass));
     _sg.cur_pass.in_pass = true;
     _sg.cur_pass.valid = true;
     _sg.cur_pass.is_compute = true;
-    _sg.cur_pip.id = SG_INVALID_ID;
+    memset(&_sg.cur_pip, 0, sizeof(_sg.cur_pip));
     _sgu_async_vk.in_pass = true;
     return true;
 }
@@ -4655,7 +4674,7 @@ bool sg_begin_async_compute_pass(const char* label) {
 void sg_end_async_compute_pass(void) {
     if (!_sgu_async_vk.in_pass) return;
     _sg.vk.frame.cmd_buf = _sgu_async_vk.saved_cmd;
-    _sg.cur_pass = _sgu_async_vk.saved_pass;
+    memcpy(&_sg.cur_pass, _sgu_async_vk.saved_pass, sizeof(_sg.cur_pass));
     _sg.cur_pip = _sgu_async_vk.saved_pip;
     _sgu_async_vk.in_pass = false;
 }
@@ -4670,23 +4689,23 @@ uint64_t sg_async_compute_commit(void) {
     const uint64_t token = _sgu_async_vk.next_token++;
     if (_sgu_async_vk.next_token == 0) _sgu_async_vk.next_token = 1;
 
-    VkSemaphoreSubmitInfo wait_info = {0};
+    _SG_STRUCT(VkSemaphoreSubmitInfo, wait_info);
     wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     wait_info.semaphore = _sgu_async_vk.timeline;
     wait_info.value = _sgu_async_vk.pending_gfx_wait;
     wait_info.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
 
-    VkCommandBufferSubmitInfo cmd_info = {0};
+    _SG_STRUCT(VkCommandBufferSubmitInfo, cmd_info);
     cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
     cmd_info.commandBuffer = _sgu_async_vk.active_cmd;
 
-    VkSemaphoreSubmitInfo sig_info = {0};
+    _SG_STRUCT(VkSemaphoreSubmitInfo, sig_info);
     sig_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     sig_info.semaphore = _sgu_async_vk.timeline;
     sig_info.value = token;
     sig_info.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
 
-    VkSubmitInfo2 submit_info = {0};
+    _SG_STRUCT(VkSubmitInfo2, submit_info);
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
     submit_info.waitSemaphoreInfoCount = (_sgu_async_vk.pending_gfx_wait > 0) ? 1 : 0;
     submit_info.pWaitSemaphoreInfos = (_sgu_async_vk.pending_gfx_wait > 0) ? &wait_info : NULL;
@@ -4704,13 +4723,13 @@ uint64_t sg_async_compute_commit(void) {
 
 static bool _sgu_vk_flush_graphics_cmd(VkSemaphoreSubmitInfo* wait_info, VkSemaphoreSubmitInfo* sig_info) {
     const bool has_cmd = (_sg.vk.frame.cmd_buf != VK_NULL_HANDLE);
-    VkCommandBufferSubmitInfo cmd_info = {0};
+    _SG_STRUCT(VkCommandBufferSubmitInfo, cmd_info);
     if (has_cmd) {
         if (vkEndCommandBuffer(_sg.vk.frame.cmd_buf) != VK_SUCCESS) return false;
         cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
         cmd_info.commandBuffer = _sg.vk.frame.cmd_buf;
     }
-    VkSubmitInfo2 submit_info = {0};
+    _SG_STRUCT(VkSubmitInfo2, submit_info);
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
     submit_info.waitSemaphoreInfoCount = wait_info ? 1 : 0;
     submit_info.pWaitSemaphoreInfos = wait_info;
@@ -4723,7 +4742,7 @@ static bool _sgu_vk_flush_graphics_cmd(VkSemaphoreSubmitInfo* wait_info, VkSemap
         VkCommandBuffer next_cmd = _sgu_async_vk.gfx_cmd_buffers[_sgu_async_vk.gfx_cmd_cursor % _SGU_ASYNC_VK_CMD_POOL_COUNT];
         _sgu_async_vk.gfx_cmd_cursor++;
         if (vkResetCommandBuffer(next_cmd, 0) != VK_SUCCESS) return false;
-        VkCommandBufferBeginInfo begin_info = {0};
+        _SG_STRUCT(VkCommandBufferBeginInfo, begin_info);
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (vkBeginCommandBuffer(next_cmd, &begin_info) != VK_SUCCESS) return false;
@@ -4737,7 +4756,7 @@ uint64_t sg_graphics_signal_async_compute(void) {
     if (!sg_async_compute_supported()) return 0;
     const uint64_t token = _sgu_async_vk.next_token++;
     if (_sgu_async_vk.next_token == 0) _sgu_async_vk.next_token = 1;
-    VkSemaphoreSubmitInfo sig_info = {0};
+    _SG_STRUCT(VkSemaphoreSubmitInfo, sig_info);
     sig_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     sig_info.semaphore = _sgu_async_vk.timeline;
     sig_info.value = token;
@@ -4753,7 +4772,7 @@ void sg_async_compute_wait_graphics(uint64_t token) {
 
 void sg_graphics_wait_async_compute(uint64_t token) {
     if (!sg_async_compute_supported() || token == 0) return;
-    VkSemaphoreSubmitInfo wait_info = {0};
+    _SG_STRUCT(VkSemaphoreSubmitInfo, wait_info);
     wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     wait_info.semaphore = _sgu_async_vk.timeline;
     wait_info.value = token;
@@ -4769,8 +4788,8 @@ typedef struct _sgu_async_compute_d3d11_state {
     bool has_commands;
     ID3D11DeviceContext* deferred_ctx;
     ID3D11DeviceContext* saved_ctx;
-    _sg_pass_state_t saved_pass;
-    sg_pipeline saved_pip;
+    uint8_t saved_pass[sizeof(_sg.cur_pass)];
+    _sg_pipeline_ref_t saved_pip;
     uint64_t next_token;
 } _sgu_async_compute_d3d11_state;
 
@@ -4815,14 +4834,14 @@ bool sg_begin_async_compute_pass(const char* label) {
     if (!sg_async_compute_supported()) return false;
     if (_sgu_async_d3d11.in_pass || _sg.cur_pass.in_pass) return false;
     _sgu_async_d3d11.saved_ctx = _sg.d3d11.ctx;
-    _sgu_async_d3d11.saved_pass = _sg.cur_pass;
+    memcpy(_sgu_async_d3d11.saved_pass, &_sg.cur_pass, sizeof(_sg.cur_pass));
     _sgu_async_d3d11.saved_pip = _sg.cur_pip;
     _sg.d3d11.ctx = _sgu_async_d3d11.deferred_ctx;
     memset(&_sg.cur_pass, 0, sizeof(_sg.cur_pass));
     _sg.cur_pass.in_pass = true;
     _sg.cur_pass.valid = true;
     _sg.cur_pass.is_compute = true;
-    _sg.cur_pip.id = SG_INVALID_ID;
+    memset(&_sg.cur_pip, 0, sizeof(_sg.cur_pip));
     _sgu_async_d3d11.in_pass = true;
     _sgu_async_d3d11.has_commands = true;
     return true;
@@ -4831,7 +4850,7 @@ bool sg_begin_async_compute_pass(const char* label) {
 void sg_end_async_compute_pass(void) {
     if (!_sgu_async_d3d11.in_pass) return;
     _sg.d3d11.ctx = _sgu_async_d3d11.saved_ctx;
-    _sg.cur_pass = _sgu_async_d3d11.saved_pass;
+    memcpy(&_sg.cur_pass, _sgu_async_d3d11.saved_pass, sizeof(_sg.cur_pass));
     _sg.cur_pip = _sgu_async_d3d11.saved_pip;
     _sgu_async_d3d11.saved_ctx = NULL;
     _sgu_async_d3d11.in_pass = false;

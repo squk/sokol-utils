@@ -1177,10 +1177,10 @@ _SOKOL_PRIVATE void _sapp_linux_set_swap_interval(int interval) {
 /* the canvas is the window: hidden keeps its place in the page */
 EM_JS(void, _sapp_emsc_set_canvas_visible, (int visible), {
   if (Module.canvas) Module.canvas.style.visibility = visible ? "" : "hidden";
-});
+})
 EM_JS(int, _sapp_emsc_canvas_visible, (void), {
   return Module.canvas && Module.canvas.style.visibility === "hidden" ? 0 : 1;
-});
+})
 #endif
 
 /* window style and visibility */
@@ -1262,6 +1262,9 @@ SOKOL_API_IMPL void sapp_set_window_position(int x, int y) {
   _sapp_win32_set_window_position(x, y);
 #elif defined(_SAPP_LINUX)
   _sapp_x11_set_window_position(x, y);
+#else
+  (void)x;
+  (void)y;
 #endif
 }
 
@@ -1272,6 +1275,9 @@ SOKOL_API_IMPL void sapp_set_window_size(int w, int h) {
   _sapp_win32_set_window_size(w, h);
 #elif defined(_SAPP_LINUX)
   _sapp_x11_set_window_size(w, h);
+#else
+  (void)w;
+  (void)h;
 #endif
 }
 
@@ -1282,6 +1288,9 @@ SOKOL_API_IMPL void sapp_get_window_position(int *x, int *y) {
   _sapp_win32_get_window_position(x, y);
 #elif defined(_SAPP_LINUX)
   _sapp_x11_get_window_position(x, y);
+#else
+  (void)x;
+  (void)y;
 #endif
 }
 
@@ -1292,6 +1301,9 @@ SOKOL_API_IMPL void sapp_get_window_size(int *w, int *h) {
   _sapp_win32_get_window_size(w, h);
 #elif defined(_SAPP_LINUX)
   _sapp_x11_get_window_size(w, h);
+#else
+  (void)w;
+  (void)h;
 #endif
 }
 
@@ -1399,6 +1411,8 @@ SOKOL_API_IMPL void sapp_set_display(int index) {
   _sapp_win32_set_display(index);
 #elif defined(_SAPP_LINUX)
   _sapp_x11_set_display(index);
+#else
+  (void)index;
 #endif
 }
 
