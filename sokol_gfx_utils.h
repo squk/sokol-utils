@@ -4486,7 +4486,12 @@ typedef struct _sgu_async_compute_vk_state {
     VkQueue queue;
     VkCommandPool cmd_pool;
     VkCommandBuffer cmd_buffers[_SGU_ASYNC_VK_CMD_POOL_COUNT];
+    uint64_t cmd_tokens[_SGU_ASYNC_VK_CMD_POOL_COUNT];
     uint32_t cmd_cursor;
+    uint32_t active_slot;
+    VkCommandPool gfx_cmd_pool;
+    VkCommandBuffer gfx_cmd_buffers[_SGU_ASYNC_VK_CMD_POOL_COUNT];
+    uint32_t gfx_cmd_cursor;
     VkCommandBuffer active_cmd;
     VkCommandBuffer saved_cmd;
     _sg_pass_state_t saved_pass;
@@ -4552,6 +4557,29 @@ bool sg_async_compute_setup(void) {
         return false;
     }
 
+    VkCommandPoolCreateInfo gfx_pool_info = {0};
+    gfx_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    gfx_pool_info.flags = VK_COMMAND_POOL_CREATE_COMMAND_BUFFER_BIT;
+    gfx_pool_info.queueFamilyIndex = _sg.vk.queue_family_index;
+    if (vkCreateCommandPool(_sg.vk.dev, &gfx_pool_info, NULL, &_sgu_async_vk.gfx_cmd_pool) != VK_SUCCESS) {
+        vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.cmd_pool, NULL);
+        _sgu_async_vk.cmd_pool = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkCommandBufferAllocateInfo gfx_alloc = {0};
+    gfx_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    gfx_alloc.commandPool = _sgu_async_vk.gfx_cmd_pool;
+    gfx_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    gfx_alloc.commandBufferCount = _SGU_ASYNC_VK_CMD_POOL_COUNT;
+    if (vkAllocateCommandBuffers(_sg.vk.dev, &gfx_alloc, _sgu_async_vk.gfx_cmd_buffers) != VK_SUCCESS) {
+        vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.gfx_cmd_pool, NULL);
+        vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.cmd_pool, NULL);
+        _sgu_async_vk.gfx_cmd_pool = VK_NULL_HANDLE;
+        _sgu_async_vk.cmd_pool = VK_NULL_HANDLE;
+        return false;
+    }
+
     VkSemaphoreTypeCreateInfo type_info = {0};
     type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
     type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -4573,6 +4601,7 @@ void sg_async_compute_shutdown(void) {
     if (_sgu_async_vk.in_pass) sg_end_async_compute_pass();
     if (_sg.vk.dev) {
         if (_sgu_async_vk.timeline) vkDestroySemaphore(_sg.vk.dev, _sgu_async_vk.timeline, NULL);
+        if (_sgu_async_vk.gfx_cmd_pool) vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.gfx_cmd_pool, NULL);
         if (_sgu_async_vk.cmd_pool) vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.cmd_pool, NULL);
     }
     memset(&_sgu_async_vk, 0, sizeof(_sgu_async_vk));
@@ -4588,13 +4617,24 @@ bool sg_begin_async_compute_pass(const char* label) {
     if (!sg_async_compute_supported()) return false;
     if (_sgu_async_vk.in_pass || _sg.cur_pass.in_pass) return false;
     if (!_sgu_async_vk.active_cmd) {
-        VkCommandBuffer cmd = _sgu_async_vk.cmd_buffers[_sgu_async_vk.cmd_cursor % _SGU_ASYNC_VK_CMD_POOL_COUNT];
+        const uint32_t slot = _sgu_async_vk.cmd_cursor % _SGU_ASYNC_VK_CMD_POOL_COUNT;
         _sgu_async_vk.cmd_cursor++;
+        if (_sgu_async_vk.cmd_tokens[slot] > 0) {
+            VkSemaphoreWaitInfo wait_info = {0};
+            wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+            wait_info.semaphoreCount = 1;
+            wait_info.pSemaphores = &_sgu_async_vk.timeline;
+            wait_info.pValues = &_sgu_async_vk.cmd_tokens[slot];
+            vkWaitSemaphores(_sg.vk.dev, &wait_info, UINT64_MAX);
+            _sgu_async_vk.cmd_tokens[slot] = 0;
+        }
+        VkCommandBuffer cmd = _sgu_async_vk.cmd_buffers[slot];
         if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return false;
         VkCommandBufferBeginInfo begin_info = {0};
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) return false;
+        _sgu_async_vk.active_slot = slot;
         _sgu_async_vk.active_cmd = cmd;
     }
     _sgu_async_vk.saved_cmd = _sg.vk.frame.cmd_buf;
@@ -4656,7 +4696,39 @@ uint64_t sg_async_compute_commit(void) {
     _sgu_async_vk.pending_gfx_wait = 0;
     _sgu_async_vk.active_cmd = VK_NULL_HANDLE;
     if (vkQueueSubmit2(_sgu_async_vk.queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) return 0;
+    _sgu_async_vk.cmd_tokens[_sgu_async_vk.active_slot] = token;
     return token;
+}
+
+static bool _sgu_vk_flush_graphics_cmd(VkSemaphoreSubmitInfo* wait_info, VkSemaphoreSubmitInfo* sig_info) {
+    const bool has_cmd = (_sg.vk.frame.cmd_buf != VK_NULL_HANDLE);
+    VkCommandBufferSubmitInfo cmd_info = {0};
+    if (has_cmd) {
+        if (vkEndCommandBuffer(_sg.vk.frame.cmd_buf) != VK_SUCCESS) return false;
+        cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+        cmd_info.commandBuffer = _sg.vk.frame.cmd_buf;
+    }
+    VkSubmitInfo2 submit_info = {0};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit_info.waitSemaphoreInfoCount = wait_info ? 1 : 0;
+    submit_info.pWaitSemaphoreInfos = wait_info;
+    submit_info.commandBufferInfoCount = has_cmd ? 1 : 0;
+    submit_info.pCommandBufferInfos = has_cmd ? &cmd_info : NULL;
+    submit_info.signalSemaphoreInfoCount = sig_info ? 1 : 0;
+    submit_info.pSignalSemaphoreInfos = sig_info;
+    if (vkQueueSubmit2(_sg.vk.queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) return false;
+    if (has_cmd) {
+        VkCommandBuffer next_cmd = _sgu_async_vk.gfx_cmd_buffers[_sgu_async_vk.gfx_cmd_cursor % _SGU_ASYNC_VK_CMD_POOL_COUNT];
+        _sgu_async_vk.gfx_cmd_cursor++;
+        if (vkResetCommandBuffer(next_cmd, 0) != VK_SUCCESS) return false;
+        VkCommandBufferBeginInfo begin_info = {0};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(next_cmd, &begin_info) != VK_SUCCESS) return false;
+        _sg.vk.frame.cmd_buf = next_cmd;
+        _sg.vk.uniforms.dirty = true;
+    }
+    return true;
 }
 
 uint64_t sg_graphics_signal_async_compute(void) {
@@ -4668,11 +4740,7 @@ uint64_t sg_graphics_signal_async_compute(void) {
     sig_info.semaphore = _sgu_async_vk.timeline;
     sig_info.value = token;
     sig_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    VkSubmitInfo2 submit_info = {0};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-    submit_info.signalSemaphoreInfoCount = 1;
-    submit_info.pSignalSemaphoreInfos = &sig_info;
-    if (vkQueueSubmit2(_sg.vk.queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) return 0;
+    if (!_sgu_vk_flush_graphics_cmd(NULL, &sig_info)) return 0;
     return token;
 }
 
@@ -4688,11 +4756,7 @@ void sg_graphics_wait_async_compute(uint64_t token) {
     wait_info.semaphore = _sgu_async_vk.timeline;
     wait_info.value = token;
     wait_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    VkSubmitInfo2 submit_info = {0};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-    submit_info.waitSemaphoreInfoCount = 1;
-    submit_info.pWaitSemaphoreInfos = &wait_info;
-    vkQueueSubmit2(_sg.vk.queue, 1, &submit_info, VK_NULL_HANDLE);
+    _sgu_vk_flush_graphics_cmd(&wait_info, NULL);
 }
 
 #elif defined(SOKOL_D3D11)
