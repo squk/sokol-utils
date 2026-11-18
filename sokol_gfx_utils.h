@@ -479,8 +479,8 @@ SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_end(sg_view image);
 SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_bind(const sg_fragment_storage_bindings* bindings);
 SOKOL_GFX_UTILS_API_DECL void sg_fragment_storage_shutdown(void);
 
-/* Async compute queue and cross-queue timeline synchronization (Metal and Vulkan;
-   D3D11 has a single immediate ID3D11DeviceContext and no async compute queue). */
+/* Async compute queue and cross-queue timeline synchronization
+   (Metal MTLEvent, Vulkan timeline semaphore, D3D11 deferred context). */
 SOKOL_GFX_UTILS_API_DECL bool sg_async_compute_setup(void);
 SOKOL_GFX_UTILS_API_DECL void sg_async_compute_shutdown(void);
 SOKOL_GFX_UTILS_API_DECL bool sg_async_compute_supported(void);
@@ -4695,15 +4695,115 @@ void sg_graphics_wait_async_compute(uint64_t token) {
 }
 
 #elif defined(SOKOL_D3D11)
-/* D3D11 exposes a single immediate ID3D11DeviceContext without a separate
-   hardware async compute queue, so async compute is unsupported here. */
-bool sg_async_compute_setup(void) { return false; }
-void sg_async_compute_shutdown(void) {}
-bool sg_async_compute_supported(void) { return false; }
-bool sg_begin_async_compute_pass(const char* label) { (void)label; return false; }
-void sg_end_async_compute_pass(void) {}
-uint64_t sg_async_compute_commit(void) { return 0; }
-uint64_t sg_graphics_signal_async_compute(void) { return 0; }
+typedef struct _sgu_async_compute_d3d11_state {
+    bool initialized;
+    bool supported;
+    bool in_pass;
+    bool has_commands;
+    ID3D11DeviceContext* deferred_ctx;
+    ID3D11DeviceContext* saved_ctx;
+    _sg_pass_state_t saved_pass;
+    sg_pipeline saved_pip;
+    uint64_t next_token;
+} _sgu_async_compute_d3d11_state;
+
+static _sgu_async_compute_d3d11_state _sgu_async_d3d11;
+
+bool sg_async_compute_setup(void) {
+    if (_sgu_async_d3d11.initialized) return _sgu_async_d3d11.supported;
+    _sgu_async_d3d11.initialized = true;
+    _sgu_async_d3d11.supported = false;
+    _sgu_async_d3d11.next_token = 1;
+    if (!_sg.valid || !_sg.d3d11.dev || !_sg.d3d11.ctx) return false;
+#if defined(__cplusplus)
+    HRESULT hr = _sg.d3d11.dev->CreateDeferredContext(0, &_sgu_async_d3d11.deferred_ctx);
+#else
+    HRESULT hr = _sg.d3d11.dev->lpVtbl->CreateDeferredContext(_sg.d3d11.dev, 0, &_sgu_async_d3d11.deferred_ctx);
+#endif
+    if (SUCCEEDED(hr) && _sgu_async_d3d11.deferred_ctx) {
+        _sgu_async_d3d11.supported = true;
+    }
+    return _sgu_async_d3d11.supported;
+}
+
+void sg_async_compute_shutdown(void) {
+    if (_sgu_async_d3d11.in_pass) sg_end_async_compute_pass();
+    if (_sgu_async_d3d11.deferred_ctx) {
+#if defined(__cplusplus)
+        _sgu_async_d3d11.deferred_ctx->Release();
+#else
+        _sgu_async_d3d11.deferred_ctx->lpVtbl->Release(_sgu_async_d3d11.deferred_ctx);
+#endif
+    }
+    memset(&_sgu_async_d3d11, 0, sizeof(_sgu_async_d3d11));
+}
+
+bool sg_async_compute_supported(void) {
+    if (!_sgu_async_d3d11.initialized) sg_async_compute_setup();
+    return _sgu_async_d3d11.supported;
+}
+
+bool sg_begin_async_compute_pass(const char* label) {
+    (void)label;
+    if (!sg_async_compute_supported()) return false;
+    if (_sgu_async_d3d11.in_pass || _sg.cur_pass.in_pass) return false;
+    _sgu_async_d3d11.saved_ctx = _sg.d3d11.ctx;
+    _sgu_async_d3d11.saved_pass = _sg.cur_pass;
+    _sgu_async_d3d11.saved_pip = _sg.cur_pip;
+    _sg.d3d11.ctx = _sgu_async_d3d11.deferred_ctx;
+    memset(&_sg.cur_pass, 0, sizeof(_sg.cur_pass));
+    _sg.cur_pass.in_pass = true;
+    _sg.cur_pass.valid = true;
+    _sg.cur_pass.is_compute = true;
+    _sg.cur_pip.id = SG_INVALID_ID;
+    _sgu_async_d3d11.in_pass = true;
+    _sgu_async_d3d11.has_commands = true;
+    return true;
+}
+
+void sg_end_async_compute_pass(void) {
+    if (!_sgu_async_d3d11.in_pass) return;
+    _sg.d3d11.ctx = _sgu_async_d3d11.saved_ctx;
+    _sg.cur_pass = _sgu_async_d3d11.saved_pass;
+    _sg.cur_pip = _sgu_async_d3d11.saved_pip;
+    _sgu_async_d3d11.saved_ctx = NULL;
+    _sgu_async_d3d11.in_pass = false;
+}
+
+uint64_t sg_async_compute_commit(void) {
+    if (_sgu_async_d3d11.in_pass) sg_end_async_compute_pass();
+    if (!_sgu_async_d3d11.has_commands || !_sgu_async_d3d11.deferred_ctx || !_sg.d3d11.ctx) return 0;
+    _sgu_async_d3d11.has_commands = false;
+    ID3D11CommandList* cmd_list = NULL;
+#if defined(__cplusplus)
+    HRESULT hr = _sgu_async_d3d11.deferred_ctx->FinishCommandList(FALSE, &cmd_list);
+    if (SUCCEEDED(hr) && cmd_list) {
+        _sg.d3d11.ctx->ExecuteCommandList(cmd_list, TRUE);
+        cmd_list->Release();
+    } else {
+        return 0;
+    }
+#else
+    HRESULT hr = _sgu_async_d3d11.deferred_ctx->lpVtbl->FinishCommandList(_sgu_async_d3d11.deferred_ctx, FALSE, &cmd_list);
+    if (SUCCEEDED(hr) && cmd_list) {
+        _sg.d3d11.ctx->lpVtbl->ExecuteCommandList(_sg.d3d11.ctx, cmd_list, TRUE);
+        cmd_list->lpVtbl->Release(cmd_list);
+    } else {
+        return 0;
+    }
+#endif
+    const uint64_t token = _sgu_async_d3d11.next_token++;
+    if (_sgu_async_d3d11.next_token == 0) _sgu_async_d3d11.next_token = 1;
+    return token;
+}
+
+uint64_t sg_graphics_signal_async_compute(void) {
+    if (!sg_async_compute_supported()) return 0;
+    const uint64_t token = _sgu_async_d3d11.next_token++;
+    if (_sgu_async_d3d11.next_token == 0) _sgu_async_d3d11.next_token = 1;
+    return token;
+}
+
 void sg_async_compute_wait_graphics(uint64_t token) { (void)token; }
 void sg_graphics_wait_async_compute(uint64_t token) { (void)token; }
 
