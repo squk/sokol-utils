@@ -479,6 +479,17 @@ SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_end(sg_view image);
 SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_bind(const sg_fragment_storage_bindings* bindings);
 SOKOL_GFX_UTILS_API_DECL void sg_fragment_storage_shutdown(void);
 
+/* Async compute queue and cross-queue timeline synchronization (Metal and Vulkan). */
+SOKOL_GFX_UTILS_API_DECL bool sg_async_compute_setup(void);
+SOKOL_GFX_UTILS_API_DECL void sg_async_compute_shutdown(void);
+SOKOL_GFX_UTILS_API_DECL bool sg_async_compute_supported(void);
+SOKOL_GFX_UTILS_API_DECL bool sg_begin_async_compute_pass(const char* label);
+SOKOL_GFX_UTILS_API_DECL void sg_end_async_compute_pass(void);
+SOKOL_GFX_UTILS_API_DECL uint64_t sg_async_compute_commit(void);
+SOKOL_GFX_UTILS_API_DECL uint64_t sg_graphics_signal_async_compute(void);
+SOKOL_GFX_UTILS_API_DECL void sg_async_compute_wait_graphics(uint64_t token);
+SOKOL_GFX_UTILS_API_DECL void sg_graphics_wait_async_compute(uint64_t token);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
@@ -4323,5 +4334,375 @@ SOKOL_API_IMPL void sg_fragment_storage_shutdown(void) {
     memset(&_sgu_vk_fstore_state, 0, sizeof(_sgu_vk_fstore_state));
     #endif
 }
+
+/*-- ASYNC COMPUTE QUEUE -----------------------------------------------------*/
+
+#if defined(SOKOL_METAL)
+typedef struct _sgu_async_compute_mtl_state {
+    bool initialized;
+    bool supported;
+    bool in_pass;
+    id<MTLCommandQueue> queue;
+    id<MTLEvent> event;
+    id<MTLCommandBuffer> cmd_buffer;
+    id<MTLComputeCommandEncoder> saved_encoder;
+    _sg_pass_state_t saved_pass;
+    sg_pipeline saved_pip;
+    uint64_t next_token;
+    uint64_t pending_gfx_wait;
+} _sgu_async_compute_mtl_state;
+
+static _sgu_async_compute_mtl_state _sgu_async_mtl;
+
+bool sg_async_compute_setup(void) {
+    if (_sgu_async_mtl.initialized) return _sgu_async_mtl.supported;
+    _sgu_async_mtl.initialized = true;
+    _sgu_async_mtl.supported = false;
+    _sgu_async_mtl.next_token = 1;
+    if (!_sg.valid || !_sg.mtl.device) return false;
+    if (@available(macOS 10.14, iOS 12.0, *)) {
+        _sgu_async_mtl.queue = [_sg.mtl.device newCommandQueue];
+        _sgu_async_mtl.event = [_sg.mtl.device newEvent];
+        if (_sgu_async_mtl.queue && _sgu_async_mtl.event) {
+            _sgu_async_mtl.queue.label = @"sg-async-compute-queue";
+            _sgu_async_mtl.supported = true;
+        } else {
+            _SG_OBJC_RELEASE(_sgu_async_mtl.queue);
+            _SG_OBJC_RELEASE(_sgu_async_mtl.event);
+        }
+    }
+    return _sgu_async_mtl.supported;
+}
+
+void sg_async_compute_shutdown(void) {
+    if (_sgu_async_mtl.in_pass) sg_end_async_compute_pass();
+    if (_sgu_async_mtl.cmd_buffer) {
+        [_sgu_async_mtl.cmd_buffer commit];
+        _sgu_async_mtl.cmd_buffer = nil;
+    }
+    _SG_OBJC_RELEASE(_sgu_async_mtl.event);
+    _SG_OBJC_RELEASE(_sgu_async_mtl.queue);
+    memset(&_sgu_async_mtl, 0, sizeof(_sgu_async_mtl));
+}
+
+bool sg_async_compute_supported(void) {
+    if (!_sgu_async_mtl.initialized) sg_async_compute_setup();
+    return _sgu_async_mtl.supported;
+}
+
+bool sg_begin_async_compute_pass(const char* label) {
+    if (!sg_async_compute_supported()) return false;
+    if (_sgu_async_mtl.in_pass || _sg.cur_pass.in_pass) return false;
+    if (!_sgu_async_mtl.cmd_buffer) {
+        _sgu_async_mtl.cmd_buffer = [_sgu_async_mtl.queue commandBuffer];
+        if (!_sgu_async_mtl.cmd_buffer) return false;
+        if (_sgu_async_mtl.pending_gfx_wait > 0) {
+            [_sgu_async_mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.event value:_sgu_async_mtl.pending_gfx_wait];
+            _sgu_async_mtl.pending_gfx_wait = 0;
+        }
+    }
+    id<MTLComputeCommandEncoder> encoder = [_sgu_async_mtl.cmd_buffer computeCommandEncoder];
+    if (!encoder) return false;
+    if (label && label[0]) encoder.label = [NSString stringWithUTF8String:label];
+    if (!_sg.mtl.cur_ub_base_ptr && _sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index]) {
+        _sg.mtl.cur_ub_base_ptr = (uint8_t*)[_sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index] contents];
+    }
+    [encoder setBuffer:_sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index] offset:0 atIndex:0];
+    _sgu_async_mtl.saved_encoder = _sg.mtl.compute_cmd_encoder;
+    _sgu_async_mtl.saved_pass = _sg.cur_pass;
+    _sgu_async_mtl.saved_pip = _sg.cur_pip;
+    _sg.mtl.compute_cmd_encoder = encoder;
+    memset(&_sg.cur_pass, 0, sizeof(_sg.cur_pass));
+    _sg.cur_pass.in_pass = true;
+    _sg.cur_pass.valid = true;
+    _sg.cur_pass.is_compute = true;
+    _sg.cur_pip.id = SG_INVALID_ID;
+    _sgu_async_mtl.in_pass = true;
+    return true;
+}
+
+void sg_end_async_compute_pass(void) {
+    if (!_sgu_async_mtl.in_pass) return;
+    if (_sg.mtl.compute_cmd_encoder) {
+        [_sg.mtl.compute_cmd_encoder endEncoding];
+    }
+    _sg.mtl.compute_cmd_encoder = _sgu_async_mtl.saved_encoder;
+    _sg.cur_pass = _sgu_async_mtl.saved_pass;
+    _sg.cur_pip = _sgu_async_mtl.saved_pip;
+    _sgu_async_mtl.saved_encoder = nil;
+    _sgu_async_mtl.in_pass = false;
+}
+
+uint64_t sg_async_compute_commit(void) {
+    if (_sgu_async_mtl.in_pass) sg_end_async_compute_pass();
+    if (!_sgu_async_mtl.cmd_buffer) return 0;
+    const uint64_t token = _sgu_async_mtl.next_token++;
+    if (_sgu_async_mtl.next_token == 0) _sgu_async_mtl.next_token = 1;
+    [_sgu_async_mtl.cmd_buffer encodeSignalEvent:_sgu_async_mtl.event value:token];
+    [_sgu_async_mtl.cmd_buffer commit];
+    _sgu_async_mtl.cmd_buffer = nil;
+    return token;
+}
+
+uint64_t sg_graphics_signal_async_compute(void) {
+    if (!sg_async_compute_supported()) return 0;
+    if (!_sg.mtl.cmd_buffer) {
+        _sg.mtl.cmd_buffer = [_sg.mtl.command_queue commandBuffer];
+        if (!_sg.mtl.cmd_buffer) return 0;
+    }
+    const uint64_t token = _sgu_async_mtl.next_token++;
+    if (_sgu_async_mtl.next_token == 0) _sgu_async_mtl.next_token = 1;
+    [_sg.mtl.cmd_buffer encodeSignalEvent:_sgu_async_mtl.event value:token];
+    return token;
+}
+
+void sg_async_compute_wait_graphics(uint64_t token) {
+    if (!sg_async_compute_supported() || token == 0) return;
+    if (_sgu_async_mtl.cmd_buffer && !_sgu_async_mtl.in_pass) {
+        [_sgu_async_mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.event value:token];
+    } else if (token > _sgu_async_mtl.pending_gfx_wait) {
+        _sgu_async_mtl.pending_gfx_wait = token;
+    }
+}
+
+void sg_graphics_wait_async_compute(uint64_t token) {
+    if (!sg_async_compute_supported() || token == 0) return;
+    if (!_sg.mtl.cmd_buffer) {
+        _sg.mtl.cmd_buffer = [_sg.mtl.command_queue commandBuffer];
+        if (!_sg.mtl.cmd_buffer) return;
+    }
+    [_sg.mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.event value:token];
+}
+
+#elif defined(SOKOL_VULKAN)
+#define _SGU_ASYNC_VK_CMD_POOL_COUNT (8)
+typedef struct _sgu_async_compute_vk_state {
+    bool initialized;
+    bool supported;
+    bool in_pass;
+    uint32_t queue_family_index;
+    VkQueue queue;
+    VkCommandPool cmd_pool;
+    VkCommandBuffer cmd_buffers[_SGU_ASYNC_VK_CMD_POOL_COUNT];
+    uint32_t cmd_cursor;
+    VkCommandBuffer active_cmd;
+    VkCommandBuffer saved_cmd;
+    _sg_pass_state_t saved_pass;
+    sg_pipeline saved_pip;
+    VkSemaphore timeline;
+    uint64_t next_token;
+    uint64_t pending_gfx_wait;
+} _sgu_async_compute_vk_state;
+
+static _sgu_async_compute_vk_state _sgu_async_vk;
+
+bool sg_async_compute_setup(void) {
+    if (_sgu_async_vk.initialized) return _sgu_async_vk.supported;
+    _sgu_async_vk.initialized = true;
+    _sgu_async_vk.supported = false;
+    _sgu_async_vk.next_token = 1;
+    if (!_sg.valid || !_sg.vk.dev || !_sg.vk.phys_dev) return false;
+
+    uint32_t count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(_sg.vk.phys_dev, &count, NULL);
+    if (count == 0 || count > 64) return false;
+    VkQueueFamilyProperties props[64];
+    vkGetPhysicalDeviceQueueFamilyProperties(_sg.vk.phys_dev, &count, props);
+
+    uint32_t chosen_family = UINT32_MAX;
+    uint32_t chosen_index = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if ((props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+            chosen_family = i;
+            chosen_index = 0;
+            break;
+        }
+    }
+    if (chosen_family == UINT32_MAX) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if ((props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && props[i].queueCount > 1) {
+                chosen_family = i;
+                chosen_index = (i == _sg.vk.queue_family_index) ? 1 : 0;
+                break;
+            }
+        }
+    }
+    if (chosen_family == UINT32_MAX) return false;
+
+    vkGetDeviceQueue(_sg.vk.dev, chosen_family, chosen_index, &_sgu_async_vk.queue);
+    if (!_sgu_async_vk.queue) return false;
+    _sgu_async_vk.queue_family_index = chosen_family;
+
+    VkCommandPoolCreateInfo pool_info = {0};
+    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pool_info.queueFamilyIndex = chosen_family;
+    if (vkCreateCommandPool(_sg.vk.dev, &pool_info, NULL, &_sgu_async_vk.cmd_pool) != VK_SUCCESS) return false;
+
+    VkCommandBufferAllocateInfo alloc_info = {0};
+    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    alloc_info.commandPool = _sgu_async_vk.cmd_pool;
+    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc_info.commandBufferCount = _SGU_ASYNC_VK_CMD_POOL_COUNT;
+    if (vkAllocateCommandBuffers(_sg.vk.dev, &alloc_info, _sgu_async_vk.cmd_buffers) != VK_SUCCESS) {
+        vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.cmd_pool, NULL);
+        _sgu_async_vk.cmd_pool = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkSemaphoreTypeCreateInfo type_info = {0};
+    type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    type_info.initialValue = 0;
+    VkSemaphoreCreateInfo sem_info = {0};
+    sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    sem_info.pNext = &type_info;
+    if (vkCreateSemaphore(_sg.vk.dev, &sem_info, NULL, &_sgu_async_vk.timeline) != VK_SUCCESS) {
+        vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.cmd_pool, NULL);
+        _sgu_async_vk.cmd_pool = VK_NULL_HANDLE;
+        return false;
+    }
+
+    _sgu_async_vk.supported = true;
+    return true;
+}
+
+void sg_async_compute_shutdown(void) {
+    if (_sgu_async_vk.in_pass) sg_end_async_compute_pass();
+    if (_sg.vk.dev) {
+        if (_sgu_async_vk.timeline) vkDestroySemaphore(_sg.vk.dev, _sgu_async_vk.timeline, NULL);
+        if (_sgu_async_vk.cmd_pool) vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.cmd_pool, NULL);
+    }
+    memset(&_sgu_async_vk, 0, sizeof(_sgu_async_vk));
+}
+
+bool sg_async_compute_supported(void) {
+    if (!_sgu_async_vk.initialized) sg_async_compute_setup();
+    return _sgu_async_vk.supported;
+}
+
+bool sg_begin_async_compute_pass(const char* label) {
+    (void)label;
+    if (!sg_async_compute_supported()) return false;
+    if (_sgu_async_vk.in_pass || _sg.cur_pass.in_pass) return false;
+    if (!_sgu_async_vk.active_cmd) {
+        VkCommandBuffer cmd = _sgu_async_vk.cmd_buffers[_sgu_async_vk.cmd_cursor % _SGU_ASYNC_VK_CMD_POOL_COUNT];
+        _sgu_async_vk.cmd_cursor++;
+        if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return false;
+        VkCommandBufferBeginInfo begin_info = {0};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) return false;
+        _sgu_async_vk.active_cmd = cmd;
+    }
+    _sgu_async_vk.saved_cmd = _sg.vk.frame.cmd_buf;
+    _sgu_async_vk.saved_pass = _sg.cur_pass;
+    _sgu_async_vk.saved_pip = _sg.cur_pip;
+    _sg.vk.frame.cmd_buf = _sgu_async_vk.active_cmd;
+    memset(&_sg.cur_pass, 0, sizeof(_sg.cur_pass));
+    _sg.cur_pass.in_pass = true;
+    _sg.cur_pass.valid = true;
+    _sg.cur_pass.is_compute = true;
+    _sg.cur_pip.id = SG_INVALID_ID;
+    _sgu_async_vk.in_pass = true;
+    return true;
+}
+
+void sg_end_async_compute_pass(void) {
+    if (!_sgu_async_vk.in_pass) return;
+    _sg.vk.frame.cmd_buf = _sgu_async_vk.saved_cmd;
+    _sg.cur_pass = _sgu_async_vk.saved_pass;
+    _sg.cur_pip = _sgu_async_vk.saved_pip;
+    _sgu_async_vk.in_pass = false;
+}
+
+uint64_t sg_async_compute_commit(void) {
+    if (_sgu_async_vk.in_pass) sg_end_async_compute_pass();
+    if (!_sgu_async_vk.active_cmd) return 0;
+    if (vkEndCommandBuffer(_sgu_async_vk.active_cmd) != VK_SUCCESS) {
+        _sgu_async_vk.active_cmd = VK_NULL_HANDLE;
+        return 0;
+    }
+    const uint64_t token = _sgu_async_vk.next_token++;
+    if (_sgu_async_vk.next_token == 0) _sgu_async_vk.next_token = 1;
+
+    VkSemaphoreSubmitInfo wait_info = {0};
+    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    wait_info.semaphore = _sgu_async_vk.timeline;
+    wait_info.value = _sgu_async_vk.pending_gfx_wait;
+    wait_info.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+
+    VkCommandBufferSubmitInfo cmd_info = {0};
+    cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmd_info.commandBuffer = _sgu_async_vk.active_cmd;
+
+    VkSemaphoreSubmitInfo sig_info = {0};
+    sig_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    sig_info.semaphore = _sgu_async_vk.timeline;
+    sig_info.value = token;
+    sig_info.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+
+    VkSubmitInfo2 submit_info = {0};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit_info.waitSemaphoreInfoCount = (_sgu_async_vk.pending_gfx_wait > 0) ? 1 : 0;
+    submit_info.pWaitSemaphoreInfos = (_sgu_async_vk.pending_gfx_wait > 0) ? &wait_info : NULL;
+    submit_info.commandBufferInfoCount = 1;
+    submit_info.pCommandBufferInfos = &cmd_info;
+    submit_info.signalSemaphoreInfoCount = 1;
+    submit_info.pSignalSemaphoreInfos = &sig_info;
+
+    _sgu_async_vk.pending_gfx_wait = 0;
+    _sgu_async_vk.active_cmd = VK_NULL_HANDLE;
+    if (vkQueueSubmit2(_sgu_async_vk.queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) return 0;
+    return token;
+}
+
+uint64_t sg_graphics_signal_async_compute(void) {
+    if (!sg_async_compute_supported()) return 0;
+    const uint64_t token = _sgu_async_vk.next_token++;
+    if (_sgu_async_vk.next_token == 0) _sgu_async_vk.next_token = 1;
+    VkSemaphoreSubmitInfo sig_info = {0};
+    sig_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    sig_info.semaphore = _sgu_async_vk.timeline;
+    sig_info.value = token;
+    sig_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkSubmitInfo2 submit_info = {0};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit_info.signalSemaphoreInfoCount = 1;
+    submit_info.pSignalSemaphoreInfos = &sig_info;
+    if (vkQueueSubmit2(_sg.vk.queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) return 0;
+    return token;
+}
+
+void sg_async_compute_wait_graphics(uint64_t token) {
+    if (!sg_async_compute_supported() || token == 0) return;
+    if (token > _sgu_async_vk.pending_gfx_wait) _sgu_async_vk.pending_gfx_wait = token;
+}
+
+void sg_graphics_wait_async_compute(uint64_t token) {
+    if (!sg_async_compute_supported() || token == 0) return;
+    VkSemaphoreSubmitInfo wait_info = {0};
+    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    wait_info.semaphore = _sgu_async_vk.timeline;
+    wait_info.value = token;
+    wait_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkSubmitInfo2 submit_info = {0};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit_info.waitSemaphoreInfoCount = 1;
+    submit_info.pWaitSemaphoreInfos = &wait_info;
+    vkQueueSubmit2(_sg.vk.queue, 1, &submit_info, VK_NULL_HANDLE);
+}
+
+#else
+bool sg_async_compute_setup(void) { return false; }
+void sg_async_compute_shutdown(void) {}
+bool sg_async_compute_supported(void) { return false; }
+bool sg_begin_async_compute_pass(const char* label) { (void)label; return false; }
+void sg_end_async_compute_pass(void) {}
+uint64_t sg_async_compute_commit(void) { return 0; }
+uint64_t sg_graphics_signal_async_compute(void) { return 0; }
+void sg_async_compute_wait_graphics(uint64_t token) { (void)token; }
+void sg_graphics_wait_async_compute(uint64_t token) { (void)token; }
+#endif
 
 #endif /* SOKOL_GFX_UTILS_IMPL */
