@@ -509,6 +509,11 @@ SOKOL_GFX_UTILS_API_DECL void sg_graphics_wait_async_compute(uint64_t token);
 #define GFX_READBACK_TIMEOUT_MS (2000)
 #endif
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4505)   // unreferenced local function has been removed
+#endif
+
 #ifndef _SOKOL_PRIVATE
     #if defined(__GNUC__) || defined(__clang__)
         #define _SOKOL_PRIVATE __attribute__((unused)) static
@@ -4904,6 +4909,10 @@ uint64_t sg_async_compute_commit(void) { return 0; }
 uint64_t sg_graphics_signal_async_compute(void) { return 0; }
 void sg_async_compute_wait_graphics(uint64_t token) { (void)token; }
 void sg_graphics_wait_async_compute(uint64_t token) { (void)token; }
+#endif
+
+#ifdef _MSC_VER
+#pragma warning(pop)
 #endif
 
 #endif /* SOKOL_GFX_UTILS_IMPL */
