@@ -3,7 +3,7 @@
 Extension utilities for the [sokol](https://github.com/floooh/sokol) single-header libraries.
 
 - [`sokol_app_utils.h`](sokol_app_utils.h): Window, display, cursor, swap-interval, and macOS background/swapchain helpers for `sokol_app.h`.
-- [`sokol_gfx_utils.h`](sokol_gfx_utils.h): Image readback, indirect commands, GPU pass timings, submission completion receipts, ray-query acceleration structures, fragment-stage storage images, and async compute helpers for `sokol_gfx.h`.
+- [`sokol_gfx_utils.h`](sokol_gfx_utils.h): Image readback, indirect commands, GPU pass timings, submission completion receipts, ray-query acceleration structures, fragment-stage storage images, bindless texture and sampler tables, and async compute helpers for `sokol_gfx.h`.
 
 ## Usage
 
@@ -131,3 +131,33 @@ void sg_accel_shutdown(void);
 - Create vertex/index buffers with `sg_make_accel_input_buffer()` (`usage.storage_buffer`). Build or refit outside passes before the compute pass that traces; refit requires `allow_update` and keeps topology/instance count. Instance masks must be non-zero (`0xFF` hits all).
 - Pass `sokol-slang` reflection indices (`msl_buffer_n`, `spirv_set1_binding_n`, or `-1` for untargeted backends) to `sg_make_shader_accel()`. On Metal, call `sg_accel_bind()` in every compute pass; on Vulkan, call it after `sg_apply_bindings()` with no `sg_dispatch()` or `sg_apply_uniforms()` in between.
 - On Vulkan, the application's `VkDevice` must enable `VK_KHR_acceleration_structure`, `VK_KHR_ray_query`, `VK_KHR_deferred_host_operations`, and the `accelerationStructure` and `rayQuery` features.
+
+```c
+bool sg_blas_set_geometry_vertex_buffer(sg_accel blas, int geometry_index, sg_buffer vertex_buffer, int vertex_offset);
+bool sg_build_tlas_from_buffer(sg_accel tlas, sg_buffer instance_buffer, int instance_offset, int count);
+bool sg_refit_tlas_from_buffer(sg_accel tlas, sg_buffer instance_buffer, int instance_offset, int count);
+```
+
+- Set `sg_blas_desc.geometries` and `geometry_count` to build one BLAS from several meshes; shaders read the mesh with `CommittedGeometryIndex()`. With `geometry_count == 0` the single-geometry fields apply as before.
+- `sg_build_tlas_from_buffer()` reads `count` 64-byte `sg_gpu_accel_instance` records from a storage buffer (16-byte aligned offset), converts them to native instances on the GPU, and builds the TLAS. Compute shaders can write the records, so GPU culling and instancing need no CPU readback. A zero `mask` or out-of-range `blas_index` disables that instance. Every listed BLAS must be built.
+
+#### Bindless texture & sampler tables
+
+```c
+bool sg_bindless_supported(void);
+int sg_bindless_max_capacity(sg_bindless_kind kind);
+sg_bindless_table sg_make_bindless_table(const sg_bindless_table_desc* desc);
+bool sg_bindless_set_texture(sg_bindless_table table, int index, sg_view tex_view);
+bool sg_bindless_set_sampler(sg_bindless_table table, int index, sg_sampler smp);
+bool sg_bindless_clear_entry(sg_bindless_table table, int index);
+bool sg_bindless_prepare_table(sg_bindless_table table);
+sg_shader sg_make_shader_bindless(const sg_shader_desc* desc, const sg_bindless_layout_desc* layout);
+sg_shader sg_make_shader_ext(const sg_shader_desc* desc, const sg_shader_ext_desc* ext);
+bool sg_bindless_bind(sg_bindless_table table, int slot);
+void sg_destroy_bindless_table(sg_bindless_table table);
+void sg_bindless_shutdown(void);
+```
+
+- Lets shaders index runtime-sized `Texture2D heap[]` and `SamplerState samplers[]` arrays past Sokol's 32-view and 16-sampler limits. Supported on Metal (Tier 2 argument buffers) and Vulkan (descriptor indexing); other backends return `false`/`NULL`.
+- Pass `sokol-slang` layout entries from `bindless_textures` and `bindless_samplers` (`msl_buffer_n`, `spirv_set_n`, `spirv_binding_n`) as `sg_bindless_slot_layout`s. Use `sg_make_shader_ext()` to combine bindless tables with acceleration structures or fragment storage images on one shader.
+- Call `sg_bindless_bind()` in a pass after `sg_apply_pipeline()`. On Vulkan, call `sg_bindless_prepare_table()` outside passes when a table's images were rendered to since the last bind; the `VkDevice` must enable `runtimeDescriptorArray`, `descriptorBindingPartiallyBound`, and `shaderSampledImageArrayNonUniformIndexing`.

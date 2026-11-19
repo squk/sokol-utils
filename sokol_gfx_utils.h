@@ -272,6 +272,18 @@ typedef enum sg_accel_index_format {
    offset and stride are multiples of four. The index offset is a multiple of
    the index size (2 or 4). The buffers must come from
    sg_make_accel_input_buffer and be valid when sg_make_blas runs. */
+typedef struct sg_blas_geometry {
+    sg_buffer vertex_buffer;
+    int vertex_offset;
+    int vertex_stride;      /* at least 12 */
+    int vertex_count;
+    sg_buffer index_buffer; /* unused when index_format is NONE */
+    int index_offset;
+    sg_accel_index_format index_format;
+    int index_count;        /* multiple of 3 */
+    bool opaque;            /* skip any-hit tests for this geometry */
+} sg_blas_geometry;
+
 typedef struct sg_blas_desc {
     sg_buffer vertex_buffer;
     int vertex_offset;
@@ -282,6 +294,8 @@ typedef struct sg_blas_desc {
     sg_accel_index_format index_format;
     int index_count;        /* multiple of 3 */
     bool opaque;            /* skip any-hit tests for every triangle */
+    const sg_blas_geometry* geometries; /* optional: geometry_count > 0 overrides the single-geometry fields above */
+    int geometry_count;
     bool allow_update;      /* permit sg_refit_blas */
     const char* label;
 } sg_blas_desc;
@@ -306,6 +320,18 @@ typedef struct sg_accel_instance {
     int blas_index;         /* index into sg_tlas_desc.blas */
 } sg_accel_instance;
 
+/* 64-byte GPU-friendly instance record for sg_build_tlas_from_buffer and
+   sg_refit_tlas_from_buffer (matches std430 / Slang StructuredBuffer layout).
+   Setting mask == 0 or blas_index >= blas_count emits an inactive instance so
+   GPU culling shaders can disable culled slots in place. */
+typedef struct sg_gpu_accel_instance {
+    float transform[12];    /* row-major 3x4 object-to-world matrix */
+    uint32_t id;            /* low 24 bits: InstanceID() */
+    uint32_t mask;          /* low 8 bits: ray mask (0 disables the instance) */
+    uint32_t flags;         /* SG_ACCEL_INSTANCE_* */
+    uint32_t blas_index;    /* index into sg_tlas_desc.blas */
+} sg_gpu_accel_instance;
+
 /* Vulkan: true when the GPU lists and offers what the contract above names.
    The application must have enabled it. */
 SOKOL_GFX_UTILS_API_DECL bool sg_ray_query_supported(void);
@@ -324,15 +350,22 @@ SOKOL_GFX_UTILS_API_DECL void sg_destroy_accel(sg_accel accel);
    count of its last build. */
 SOKOL_GFX_UTILS_API_DECL bool sg_build_blas(sg_accel blas);
 SOKOL_GFX_UTILS_API_DECL bool sg_refit_blas(sg_accel blas);
-/* Points a BLAS at another vertex buffer for its next build or refit. Stride,
-   vertex count and topology stay, so a refit may follow: Unreal patches each
-   skinned segment's vertex buffer to the skin cache's current output, then
+/* Points a BLAS geometry at another vertex buffer for its next build or refit.
+   Stride, vertex count and topology stay, so a refit may follow: Unreal patches
+   each skinned segment's vertex buffer to the skin cache's current output, then
    refits (SkeletalRenderGPUSkin.cpp:1372-1387). The buffer must come from
    sg_make_accel_input_buffer, be sealed and hold every vertex from
    vertex_offset. Returns false and keeps the old buffer otherwise. */
+SOKOL_GFX_UTILS_API_DECL bool sg_blas_set_geometry_vertex_buffer(sg_accel blas, int geometry_index, sg_buffer vertex_buffer, int vertex_offset);
 SOKOL_GFX_UTILS_API_DECL bool sg_blas_set_vertex_buffer(sg_accel blas, sg_buffer vertex_buffer, int vertex_offset);
 SOKOL_GFX_UTILS_API_DECL bool sg_build_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
 SOKOL_GFX_UTILS_API_DECL bool sg_refit_tlas(sg_accel tlas, const sg_accel_instance* instances, int count);
+/* Converts count sg_gpu_accel_instance records on the GPU from instance_buffer
+   (16-byte aligned instance_offset, created with usage.storage_buffer) into
+   backend-native instance descriptors and builds or refits tlas. Every BLAS in
+   tlas must be built. Outside passes only. */
+SOKOL_GFX_UTILS_API_DECL bool sg_build_tlas_from_buffer(sg_accel tlas, sg_buffer instance_buffer, int instance_offset, int count);
+SOKOL_GFX_UTILS_API_DECL bool sg_refit_tlas_from_buffer(sg_accel tlas, sg_buffer instance_buffer, int instance_offset, int count);
 SOKOL_GFX_UTILS_API_DECL bool sg_accel_built(sg_accel accel);
 #define SG_ACCEL_MAX_SLOTS (4)
 
@@ -477,6 +510,83 @@ SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_end(sg_view image);
    sg_apply_bindings failed. Binds nothing on failure. */
 SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_bind(const sg_fragment_storage_bindings* bindings);
 SOKOL_GFX_UTILS_API_DECL void sg_fragment_storage_shutdown(void);
+
+/*
+    Bindless texture and sampler tables.
+
+    sokol_gfx caps each shader stage at SG_MAX_VIEW_BINDSLOTS (32) views and
+    SG_MAX_SAMPLER_BINDSLOTS (16) samplers. Ray-query shading and GPU-driven
+    material passes index scene-wide texture and sampler heaps dynamically
+    (Texture2D heap[], SamplerState samplers[]). sokol-slang reflects those
+    runtime-sized arrays in a program-wide 0..SG_BINDLESS_MAX_SLOTS-1 slot
+    namespace (layout "bindless_textures" and "bindless_samplers"):
+    - Metal: Tier 2 argument buffers (MTLArgumentEncoder, spvDescriptor<T>)
+      bound at msl_buffer_n (19..22 in vertex stages, 23..26 in fragment and
+      compute stages) with batch useResources residency tracking.
+    - Vulkan: descriptor sets 2 + slot, binding 0, with PARTIALLY_BOUND_BIT in
+      sokol_gfx's descriptor buffer (VK_EXT_descriptor_buffer + Vulkan 1.2
+      descriptorIndexing: runtimeDescriptorArray, descriptorBindingPartiallyBound,
+      shaderSampledImageArrayNonUniformIndexing).
+
+    Use sg_make_shader_bindless for shaders with bindless tables alone, or
+    sg_make_shader_ext to combine compute acceleration structures, fragment
+    storage images, and bindless tables on one shader. Call
+    sg_bindless_prepare_table outside passes before binding a texture table in
+    Vulkan render passes if any image in the table was rendered or written since
+    upload. Call sg_bindless_bind inside a render or compute pass after
+    sg_apply_pipeline. Call sg_bindless_shutdown before sg_shutdown on Vulkan
+    (safe before or after sg_shutdown on other backends).
+*/
+#define SG_BINDLESS_MAX_SLOTS (4)
+#define SG_BINDLESS_DEFAULT_VK_TEXTURE_DESCRIPTORS (4096)
+#define SG_BINDLESS_DEFAULT_VK_SAMPLER_DESCRIPTORS (256)
+
+typedef enum sg_bindless_kind {
+    SG_BINDLESS_KIND_TEXTURES = 0,
+    SG_BINDLESS_KIND_SAMPLERS = 1
+} sg_bindless_kind;
+
+typedef struct sg_bindless_table_desc {
+    sg_bindless_kind kind;
+    int capacity;           /* 1..sg_bindless_max_capacity(kind) */
+    const char* label;
+} sg_bindless_table_desc;
+
+typedef struct sg_bindless_table_t* sg_bindless_table;
+
+typedef struct sg_bindless_slot_layout {
+    uint8_t slot;               /* 0..SG_BINDLESS_MAX_SLOTS-1 */
+    sg_bindless_kind kind;
+    sg_shader_stage stage;      /* VERTEX, FRAGMENT, or COMPUTE */
+    int msl_buffer_n;           /* Metal [[buffer(n)]]; -1 when unused */
+    int vk_set_n;               /* Vulkan descriptor set (2 + slot); -1 when unused */
+    int vk_binding_n;           /* Vulkan binding (0); -1 when unused */
+    int vk_descriptor_count;    /* Vulkan array bound (0 uses default 4096/256) */
+} sg_bindless_slot_layout;
+
+typedef struct sg_bindless_layout_desc {
+    int num_slots;              /* 0..SG_BINDLESS_MAX_SLOTS */
+    sg_bindless_slot_layout slots[SG_BINDLESS_MAX_SLOTS];
+} sg_bindless_layout_desc;
+
+typedef struct sg_shader_ext_desc {
+    const sg_accel_layout_desc* accel;
+    const sg_fragment_storage_layout_desc* fragment_storage;
+    const sg_bindless_layout_desc* bindless;
+} sg_shader_ext_desc;
+
+SOKOL_GFX_UTILS_API_DECL bool sg_bindless_supported(void);
+SOKOL_GFX_UTILS_API_DECL int sg_bindless_max_capacity(sg_bindless_kind kind);
+SOKOL_GFX_UTILS_API_DECL sg_bindless_table sg_make_bindless_table(const sg_bindless_table_desc* desc);
+SOKOL_GFX_UTILS_API_DECL void sg_destroy_bindless_table(sg_bindless_table table);
+SOKOL_GFX_UTILS_API_DECL bool sg_bindless_set_texture(sg_bindless_table table, int index, sg_view tex_view);
+SOKOL_GFX_UTILS_API_DECL bool sg_bindless_set_sampler(sg_bindless_table table, int index, sg_sampler smp);
+SOKOL_GFX_UTILS_API_DECL bool sg_bindless_clear_entry(sg_bindless_table table, int index);
+SOKOL_GFX_UTILS_API_DECL bool sg_bindless_prepare_table(sg_bindless_table table);
+SOKOL_GFX_UTILS_API_DECL sg_shader sg_make_shader_bindless(const sg_shader_desc* desc, const sg_bindless_layout_desc* layout);
+SOKOL_GFX_UTILS_API_DECL sg_shader sg_make_shader_ext(const sg_shader_desc* desc, const sg_shader_ext_desc* ext);
+SOKOL_GFX_UTILS_API_DECL bool sg_bindless_bind(sg_bindless_table table, int slot);
+SOKOL_GFX_UTILS_API_DECL void sg_bindless_shutdown(void);
 
 /* Async compute queue and cross-queue timeline synchronization
    (Metal MTLEvent, Vulkan timeline semaphore, D3D11 deferred context). */
@@ -2523,6 +2633,7 @@ typedef struct {
     VkDeviceSize build_scratch;
     VkDeviceSize update_scratch;
     _sgu_vk_mem_t instances[SG_NUM_INFLIGHT_FRAMES];
+    _sgu_vk_mem_t blas_addrs;
 } _sgu_accel_native_t;
 #elif defined(SOKOL_METAL)
 /* Objective-C objects are held as retained void* so the structs stay plain C
@@ -2548,13 +2659,18 @@ struct sg_accel_t {
     bool recorded;              /* a TLAS build or refit ran in last_frame */
     uint32_t last_frame;
     int refs;
-    sg_blas_desc blas;
+    sg_blas_geometry inline_geo;
+    sg_blas_geometry* geometries;
+    int geometry_count;
     sg_accel* blas_list;
     int blas_count;
     int max_instances;
     int built_count;
     _sgu_accel_native_t native;
 };
+
+/* sg_gpu_accel_instance must keep the 64-byte layout the conversion kernels read. */
+typedef char _sgu_gpu_accel_instance_size_check[(sizeof(sg_gpu_accel_instance) == 64) ? 1 : -1];
 
 _SOKOL_PRIVATE _sg_buffer_t* _sgu_accel_input_buffer(sg_buffer id, int offset, int64_t bytes) {
     _sg_buffer_t* buf = _sg_lookup_buffer(id.id);
@@ -2570,23 +2686,45 @@ _SOKOL_PRIVATE int _sgu_accel_index_size(sg_accel_index_format format) {
     return format == SG_ACCEL_INDEXFORMAT_UINT16 ? 2 : (format == SG_ACCEL_INDEXFORMAT_UINT32 ? 4 : 0);
 }
 
-/* Returns the buffers a BLAS reads, or false when one is gone or too small. */
-_SOKOL_PRIVATE bool _sgu_accel_blas_buffers(const sg_accel blas, _sg_buffer_t** vb, _sg_buffer_t** ib) {
-    const sg_blas_desc* d = &blas->blas;
-    const int64_t vbytes = (int64_t)d->vertex_stride * (int64_t)(d->vertex_count - 1) + 12;
-    *vb = _sgu_accel_input_buffer(d->vertex_buffer, d->vertex_offset, vbytes);
+_SOKOL_PRIVATE bool _sgu_accel_validate_geometry(const sg_blas_geometry* g) {
+    if (!g) return false;
+    if ((int)g->index_format < (int)SG_ACCEL_INDEXFORMAT_NONE ||
+        (int)g->index_format > (int)SG_ACCEL_INDEXFORMAT_UINT32) return false;
+    if (g->vertex_count < 3 || g->vertex_stride < 12 || (g->vertex_stride & 3) ||
+        g->vertex_offset < 0 || (g->vertex_offset & 3)) return false;
+    if (g->index_format == SG_ACCEL_INDEXFORMAT_NONE) {
+        if (g->vertex_count % 3) return false;
+    } else if (g->index_count < 3 || (g->index_count % 3) || g->index_offset < 0 ||
+               (g->index_offset % _sgu_accel_index_size(g->index_format))) {
+        return false;
+    }
+    return true;
+}
+
+/* Returns the buffers one BLAS geometry reads, or false when one is gone or too small. */
+_SOKOL_PRIVATE bool _sgu_accel_geo_buffers(const sg_blas_geometry* g, _sg_buffer_t** vb, _sg_buffer_t** ib) {
+    const int64_t vbytes = (int64_t)g->vertex_stride * (int64_t)(g->vertex_count - 1) + 12;
+    *vb = _sgu_accel_input_buffer(g->vertex_buffer, g->vertex_offset, vbytes);
     *ib = 0;
     if (!*vb) return false;
-    if (d->index_format != SG_ACCEL_INDEXFORMAT_NONE) {
-        *ib = _sgu_accel_input_buffer(d->index_buffer, d->index_offset,
-            (int64_t)d->index_count * _sgu_accel_index_size(d->index_format));
+    if (g->index_format != SG_ACCEL_INDEXFORMAT_NONE) {
+        *ib = _sgu_accel_input_buffer(g->index_buffer, g->index_offset,
+            (int64_t)g->index_count * _sgu_accel_index_size(g->index_format));
         if (!*ib) return false;
     }
     return true;
 }
 
-_SOKOL_PRIVATE int _sgu_accel_triangle_count(const sg_accel blas) {
-    return (blas->blas.index_format == SG_ACCEL_INDEXFORMAT_NONE ? blas->blas.vertex_count : blas->blas.index_count) / 3;
+_SOKOL_PRIVATE int _sgu_accel_geo_triangle_count(const sg_blas_geometry* g) {
+    return (g->index_format == SG_ACCEL_INDEXFORMAT_NONE ? g->vertex_count : g->index_count) / 3;
+}
+
+_SOKOL_PRIVATE uint64_t _sgu_accel_total_triangles(const sg_accel blas) {
+    uint64_t total = 0;
+    for (int i = 0; i < blas->geometry_count; i++) {
+        total += (uint64_t)_sgu_accel_geo_triangle_count(&blas->geometries[i]);
+    }
+    return total;
 }
 
 /* Sends text at the caller's level. sokol_gfx has no log item for these
@@ -2679,6 +2817,9 @@ static struct {
     uint64_t max_primitives;
     uint64_t max_instances;
     uint64_t max_geometries;
+    VkShaderModule conv_mod;
+    VkPipelineLayout conv_layout;
+    VkPipeline conv_pip;
     PFN_vkCreateAccelerationStructureKHR create;
     PFN_vkDestroyAccelerationStructureKHR destroy;
     PFN_vkGetAccelerationStructureBuildSizesKHR get_build_sizes;
@@ -2843,76 +2984,116 @@ _SOKOL_PRIVATE void _sgu_vk_accel_barrier(VkCommandBuffer cmd, VkPipelineStageFl
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
-/* Fills the geometry, build info and range for one structure. Mode, source,
+/* Fills the geometries, build info and ranges for one structure. Mode, source,
    destination and scratch are left to the caller. For a TLAS, instance_count
-   and instance_addr describe the instance buffer. */
-_SOKOL_PRIVATE bool _sgu_vk_accel_fill(const sg_accel a, VkAccelerationStructureGeometryKHR* geo,
-    VkAccelerationStructureBuildGeometryInfoKHR* info, VkAccelerationStructureBuildRangeInfoKHR* range,
-    uint32_t instance_count, VkDeviceAddress instance_addr) {
-    geo->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+   and instance_addr describe the instance buffer; geos and ranges hold 1 item.
+   For a BLAS, geos, ranges and opt_prim_counts hold a->geometry_count items. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_fill(const sg_accel a, VkAccelerationStructureGeometryKHR* geos,
+    VkAccelerationStructureBuildGeometryInfoKHR* info, VkAccelerationStructureBuildRangeInfoKHR* ranges,
+    uint32_t* opt_prim_counts, uint32_t instance_count, VkDeviceAddress instance_addr) {
     info->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     info->flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
     if (a->allow_update) info->flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
-    info->geometryCount = 1;
-    info->pGeometries = geo;
+    info->pGeometries = geos;
     if (a->is_tlas) {
-        geo->geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-        geo->geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-        geo->geometry.instances.arrayOfPointers = VK_FALSE;
-        geo->geometry.instances.data.deviceAddress = instance_addr;
+        memset(&geos[0], 0, sizeof(geos[0]));
+        memset(&ranges[0], 0, sizeof(ranges[0]));
+        geos[0].sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        geos[0].geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+        geos[0].geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+        geos[0].geometry.instances.arrayOfPointers = VK_FALSE;
+        geos[0].geometry.instances.data.deviceAddress = instance_addr;
         info->type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-        range->primitiveCount = instance_count;
+        info->geometryCount = 1;
+        ranges[0].primitiveCount = instance_count;
+        if (opt_prim_counts) opt_prim_counts[0] = instance_count;
         return true;
     }
-    _sg_buffer_t* vb = 0;
-    _sg_buffer_t* ib = 0;
-    if (!_sgu_accel_blas_buffers(a, &vb, &ib)) return false;
-    const sg_blas_desc* d = &a->blas;
-    geo->geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-    geo->flags = d->opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
-    VkAccelerationStructureGeometryTrianglesDataKHR* tri = &geo->geometry.triangles;
-    tri->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-    tri->vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-    tri->vertexData.deviceAddress = vb->vk.dev_addr + (VkDeviceAddress)d->vertex_offset;
-    tri->vertexStride = (VkDeviceSize)d->vertex_stride;
-    tri->maxVertex = (uint32_t)(d->vertex_count - 1);
-    tri->indexType = VK_INDEX_TYPE_NONE_KHR;
-    if (ib) {
-        tri->indexType = (d->index_format == SG_ACCEL_INDEXFORMAT_UINT16) ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
-        tri->indexData.deviceAddress = ib->vk.dev_addr + (VkDeviceAddress)d->index_offset;
-    }
     info->type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    range->primitiveCount = (uint32_t)_sgu_accel_triangle_count(a);
+    info->geometryCount = (uint32_t)a->geometry_count;
+    for (int i = 0; i < a->geometry_count; i++) {
+        _sg_buffer_t* vb = 0;
+        _sg_buffer_t* ib = 0;
+        const sg_blas_geometry* g = &a->geometries[i];
+        if (!_sgu_accel_geo_buffers(g, &vb, &ib)) return false;
+        VkAccelerationStructureGeometryKHR* geo = &geos[i];
+        memset(geo, 0, sizeof(*geo));
+        geo->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        geo->geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        geo->flags = g->opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
+        VkAccelerationStructureGeometryTrianglesDataKHR* tri = &geo->geometry.triangles;
+        tri->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        tri->vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        tri->vertexData.deviceAddress = vb->vk.dev_addr + (VkDeviceAddress)g->vertex_offset;
+        tri->vertexStride = (VkDeviceSize)g->vertex_stride;
+        tri->maxVertex = (uint32_t)(g->vertex_count - 1);
+        tri->indexType = VK_INDEX_TYPE_NONE_KHR;
+        if (ib) {
+            tri->indexType = (g->index_format == SG_ACCEL_INDEXFORMAT_UINT16) ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+            tri->indexData.deviceAddress = ib->vk.dev_addr + (VkDeviceAddress)g->index_offset;
+        }
+        memset(&ranges[i], 0, sizeof(ranges[i]));
+        ranges[i].primitiveCount = (uint32_t)_sgu_accel_geo_triangle_count(g);
+        if (opt_prim_counts) opt_prim_counts[i] = ranges[i].primitiveCount;
+    }
     return true;
 }
+
+#define _SGU_VK_ACCEL_STACK_GEOS (8)
 
 _SOKOL_PRIVATE bool _sgu_vk_accel_make(sg_accel a, const char* label) {
     if (!_sgu_vk_accel_supported()) return false;
     VkDevice dev = _sgu_vk_accel_state.device;
     VkDeviceAddress instance_addr = 0;
-    if (_sgu_vk_accel_state.max_geometries < 1) return false;
+    const uint32_t geo_count = a->is_tlas ? 1u : (uint32_t)a->geometry_count;
+    if ((uint64_t)geo_count > _sgu_vk_accel_state.max_geometries) return false;
     if (a->is_tlas ? ((uint64_t)a->max_instances > _sgu_vk_accel_state.max_instances)
-                   : ((uint64_t)_sgu_accel_triangle_count(a) > _sgu_vk_accel_state.max_primitives)) {
+                   : (_sgu_accel_total_triangles(a) > _sgu_vk_accel_state.max_primitives)) {
         return false;
     }
     if (a->is_tlas) {
         const VkDeviceSize bytes = (VkDeviceSize)a->max_instances * sizeof(VkAccelerationStructureInstanceKHR);
         for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) {
             if (!_sgu_vk_accel_alloc(&a->native.instances[i], bytes,
-                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, _SG_VK_MEMTYPE_UNIFORMS)) {
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                _SG_VK_MEMTYPE_UNIFORMS)) {
                 return false;
             }
         }
+        const VkDeviceSize addr_bytes = (VkDeviceSize)a->blas_count * sizeof(uint64_t);
+        if (!_sgu_vk_accel_alloc(&a->native.blas_addrs, addr_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, _SG_VK_MEMTYPE_UNIFORMS)) {
+            return false;
+        }
+        uint64_t* dst_addrs = (uint64_t*)a->native.blas_addrs.map;
+        for (int i = 0; i < a->blas_count; i++) {
+            dst_addrs[i] = (uint64_t)a->blas_list[i]->native.addr;
+        }
         instance_addr = a->native.instances[0].addr;
     }
-    _SG_STRUCT(VkAccelerationStructureGeometryKHR, geo);
+    VkAccelerationStructureGeometryKHR stack_geos[_SGU_VK_ACCEL_STACK_GEOS];
+    VkAccelerationStructureBuildRangeInfoKHR stack_ranges[_SGU_VK_ACCEL_STACK_GEOS];
+    uint32_t stack_prims[_SGU_VK_ACCEL_STACK_GEOS];
+    VkAccelerationStructureGeometryKHR* geos = stack_geos;
+    VkAccelerationStructureBuildRangeInfoKHR* ranges = stack_ranges;
+    uint32_t* prims = stack_prims;
+    void* heap_mem = 0;
+    if (geo_count > _SGU_VK_ACCEL_STACK_GEOS) {
+        const size_t total = (sizeof(*geos) + sizeof(*ranges) + sizeof(*prims)) * (size_t)geo_count;
+        heap_mem = calloc(1, total);
+        if (!heap_mem) return false;
+        geos = (VkAccelerationStructureGeometryKHR*)heap_mem;
+        ranges = (VkAccelerationStructureBuildRangeInfoKHR*)(geos + geo_count);
+        prims = (uint32_t*)(ranges + geo_count);
+    }
     _SG_STRUCT(VkAccelerationStructureBuildGeometryInfoKHR, info);
-    _SG_STRUCT(VkAccelerationStructureBuildRangeInfoKHR, range);
-    if (!_sgu_vk_accel_fill(a, &geo, &info, &range, (uint32_t)a->max_instances, instance_addr)) return false;
+    if (!_sgu_vk_accel_fill(a, geos, &info, ranges, prims, (uint32_t)a->max_instances, instance_addr)) {
+        free(heap_mem);
+        return false;
+    }
     _SG_STRUCT(VkAccelerationStructureBuildSizesInfoKHR, sizes);
     sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-    _sgu_vk_accel_state.get_build_sizes(dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &info,
-        &range.primitiveCount, &sizes);
+    _sgu_vk_accel_state.get_build_sizes(dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &info, prims, &sizes);
+    free(heap_mem);
     a->native.build_scratch = sizes.buildScratchSize;
     a->native.update_scratch = sizes.updateScratchSize;
     if (!_sgu_vk_accel_alloc(&a->native.store, sizes.accelerationStructureSize,
@@ -2943,6 +3124,7 @@ _SOKOL_PRIVATE void _sgu_vk_accel_destroy(sg_accel a) {
         a->native.as = 0;
     }
     _sgu_vk_accel_free(&a->native.store);
+    _sgu_vk_accel_free(&a->native.blas_addrs);
     for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) _sgu_vk_accel_free(&a->native.instances[i]);
 }
 
@@ -2986,6 +3168,191 @@ _SOKOL_PRIVATE VkDeviceAddress _sgu_vk_accel_scratch_alloc(VkDeviceSize size) {
     return _sgu_vk_accel_scratch.mem[slot].addr + _sgu_vk_accel_scratch.pad[slot] + used;
 }
 
+/* Precompiled Vulkan 1.2 SPIR-V compute kernel (local_size_x = 64, BDA +
+   32-byte push constants, zero descriptor sets, no shaderInt64 requirement)
+   converting sg_gpu_accel_instance records into VkAccelerationStructureInstanceKHR. */
+static const uint32_t _sgu_vk_tlas_conv_spv[727] = {
+    0x07230203u, 0x00010500u, 0x0008000bu, 0x000000b9u, 0x00000000u, 0x00020011u, 0x00000001u, 0x00020011u,
+    0x000014e3u, 0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu,
+    0x000014e4u, 0x00000001u, 0x0007000fu, 0x00000005u, 0x00000004u, 0x6e69616du, 0x00000000u, 0x0000000bu,
+    0x00000014u, 0x00060010u, 0x00000004u, 0x00000011u, 0x00000040u, 0x00000001u, 0x00000001u, 0x00040047u,
+    0x0000000bu, 0x0000000bu, 0x0000001cu, 0x00030047u, 0x00000012u, 0x00000002u, 0x00050048u, 0x00000012u,
+    0x00000000u, 0x00000023u, 0x00000000u, 0x00050048u, 0x00000012u, 0x00000001u, 0x00000023u, 0x00000008u,
+    0x00050048u, 0x00000012u, 0x00000002u, 0x00000023u, 0x00000010u, 0x00050048u, 0x00000012u, 0x00000003u,
+    0x00000023u, 0x00000018u, 0x00050048u, 0x00000012u, 0x00000004u, 0x00000023u, 0x0000001cu, 0x00050048u,
+    0x00000028u, 0x00000000u, 0x00000023u, 0x00000000u, 0x00050048u, 0x00000028u, 0x00000001u, 0x00000023u,
+    0x00000010u, 0x00050048u, 0x00000028u, 0x00000002u, 0x00000023u, 0x00000020u, 0x00050048u, 0x00000028u,
+    0x00000003u, 0x00000023u, 0x00000030u, 0x00050048u, 0x00000028u, 0x00000004u, 0x00000023u, 0x00000034u,
+    0x00050048u, 0x00000028u, 0x00000005u, 0x00000023u, 0x00000038u, 0x00050048u, 0x00000028u, 0x00000006u,
+    0x00000023u, 0x0000003cu, 0x00040047u, 0x00000029u, 0x00000006u, 0x00000040u, 0x00030047u, 0x0000002au,
+    0x00000002u, 0x00040048u, 0x0000002au, 0x00000000u, 0x00000018u, 0x00050048u, 0x0000002au, 0x00000000u,
+    0x00000023u, 0x00000000u, 0x00040047u, 0x0000007du, 0x00000006u, 0x00000008u, 0x00030047u, 0x0000007eu,
+    0x00000002u, 0x00040048u, 0x0000007eu, 0x00000000u, 0x00000018u, 0x00050048u, 0x0000007eu, 0x00000000u,
+    0x00000023u, 0x00000000u, 0x00050048u, 0x0000008cu, 0x00000000u, 0x00000023u, 0x00000000u, 0x00050048u,
+    0x0000008cu, 0x00000001u, 0x00000023u, 0x00000010u, 0x00050048u, 0x0000008cu, 0x00000002u, 0x00000023u,
+    0x00000020u, 0x00050048u, 0x0000008cu, 0x00000003u, 0x00000023u, 0x00000030u, 0x00050048u, 0x0000008cu,
+    0x00000004u, 0x00000023u, 0x00000034u, 0x00050048u, 0x0000008cu, 0x00000005u, 0x00000023u, 0x00000038u,
+    0x00040047u, 0x0000008du, 0x00000006u, 0x00000040u, 0x00030047u, 0x0000008eu, 0x00000002u, 0x00040048u,
+    0x0000008eu, 0x00000000u, 0x00000019u, 0x00050048u, 0x0000008eu, 0x00000000u, 0x00000023u, 0x00000000u,
+    0x00040047u, 0x00000096u, 0x0000000bu, 0x00000019u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u,
+    0x00000002u, 0x00040015u, 0x00000006u, 0x00000020u, 0x00000000u, 0x00040017u, 0x00000009u, 0x00000006u,
+    0x00000003u, 0x00040020u, 0x0000000au, 0x00000001u, 0x00000009u, 0x0004003bu, 0x0000000au, 0x0000000bu,
+    0x00000001u, 0x0004002bu, 0x00000006u, 0x0000000cu, 0x00000000u, 0x00040020u, 0x0000000du, 0x00000001u,
+    0x00000006u, 0x00040017u, 0x00000011u, 0x00000006u, 0x00000002u, 0x0007001eu, 0x00000012u, 0x00000011u,
+    0x00000011u, 0x00000011u, 0x00000006u, 0x00000006u, 0x00040020u, 0x00000013u, 0x00000009u, 0x00000012u,
+    0x0004003bu, 0x00000013u, 0x00000014u, 0x00000009u, 0x00040015u, 0x00000015u, 0x00000020u, 0x00000001u,
+    0x0004002bu, 0x00000015u, 0x00000016u, 0x00000003u, 0x00040020u, 0x00000017u, 0x00000009u, 0x00000006u,
+    0x00020014u, 0x0000001au, 0x00040017u, 0x0000001fu, 0x00000006u, 0x00000004u, 0x0009001eu, 0x00000020u,
+    0x0000001fu, 0x0000001fu, 0x0000001fu, 0x00000006u, 0x00000006u, 0x00000006u, 0x00000006u, 0x0004002bu,
+    0x00000015u, 0x00000023u, 0x00000000u, 0x00040020u, 0x00000024u, 0x00000009u, 0x00000011u, 0x00030027u,
+    0x00000027u, 0x000014e5u, 0x0009001eu, 0x00000028u, 0x0000001fu, 0x0000001fu, 0x0000001fu, 0x00000006u,
+    0x00000006u, 0x00000006u, 0x00000006u, 0x0003001du, 0x00000029u, 0x00000028u, 0x0003001eu, 0x0000002au,
+    0x00000029u, 0x00040020u, 0x00000027u, 0x000014e5u, 0x0000002au, 0x00040020u, 0x0000002du, 0x000014e5u,
+    0x00000028u, 0x0004002bu, 0x00000006u, 0x00000035u, 0x00000001u, 0x0004002bu, 0x00000006u, 0x00000038u,
+    0x00000004u, 0x0004002bu, 0x00000006u, 0x0000003cu, 0x00000002u, 0x0004002bu, 0x00000015u, 0x00000043u,
+    0x00000004u, 0x0008001eu, 0x00000050u, 0x0000001fu, 0x0000001fu, 0x0000001fu, 0x00000006u, 0x00000006u,
+    0x00000011u, 0x0004002bu, 0x00000015u, 0x00000057u, 0x00000001u, 0x0004002bu, 0x00000015u, 0x0000005bu,
+    0x00000002u, 0x0004002bu, 0x00000006u, 0x00000061u, 0x00ffffffu, 0x0004002bu, 0x00000006u, 0x00000069u,
+    0x000000ffu, 0x0004002bu, 0x00000006u, 0x0000006du, 0x00000018u, 0x00030027u, 0x0000007cu, 0x000014e5u,
+    0x0003001du, 0x0000007du, 0x00000011u, 0x0003001eu, 0x0000007eu, 0x0000007du, 0x00040020u, 0x0000007cu,
+    0x000014e5u, 0x0000007eu, 0x00040020u, 0x00000082u, 0x000014e5u, 0x00000011u, 0x0005002cu, 0x00000011u,
+    0x00000086u, 0x0000000cu, 0x0000000cu, 0x00030027u, 0x0000008bu, 0x000014e5u, 0x0008001eu, 0x0000008cu,
+    0x0000001fu, 0x0000001fu, 0x0000001fu, 0x00000006u, 0x00000006u, 0x00000011u, 0x0003001du, 0x0000008du,
+    0x0000008cu, 0x0003001eu, 0x0000008eu, 0x0000008du, 0x00040020u, 0x0000008bu, 0x000014e5u, 0x0000008eu,
+    0x00040020u, 0x00000092u, 0x000014e5u, 0x0000008cu, 0x0004002bu, 0x00000006u, 0x00000095u, 0x00000040u,
+    0x0006002cu, 0x00000009u, 0x00000096u, 0x00000095u, 0x00000035u, 0x00000035u, 0x00050036u, 0x00000002u,
+    0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x000300f7u, 0x00000097u, 0x00000000u,
+    0x000300fbu, 0x0000000cu, 0x00000098u, 0x000200f8u, 0x00000098u, 0x00050041u, 0x0000000du, 0x0000000eu,
+    0x0000000bu, 0x0000000cu, 0x0004003du, 0x00000006u, 0x0000000fu, 0x0000000eu, 0x00050041u, 0x00000017u,
+    0x00000018u, 0x00000014u, 0x00000016u, 0x0004003du, 0x00000006u, 0x00000019u, 0x00000018u, 0x000500aeu,
+    0x0000001au, 0x0000001bu, 0x0000000fu, 0x00000019u, 0x000300f7u, 0x0000001du, 0x00000000u, 0x000400fau,
+    0x0000001bu, 0x0000001cu, 0x0000001du, 0x000200f8u, 0x0000001cu, 0x000200f9u, 0x00000097u, 0x000200f8u,
+    0x0000001du, 0x00050041u, 0x00000024u, 0x00000025u, 0x00000014u, 0x00000023u, 0x0004003du, 0x00000011u,
+    0x00000026u, 0x00000025u, 0x0004007cu, 0x00000027u, 0x0000002bu, 0x00000026u, 0x00060041u, 0x0000002du,
+    0x0000002eu, 0x0000002bu, 0x00000023u, 0x0000000fu, 0x0006003du, 0x00000028u, 0x0000002fu, 0x0000002eu,
+    0x00000002u, 0x00000010u, 0x00040190u, 0x00000020u, 0x00000030u, 0x0000002fu, 0x00050051u, 0x0000001fu,
+    0x000000a3u, 0x00000030u, 0x00000000u, 0x00050051u, 0x0000001fu, 0x000000a4u, 0x00000030u, 0x00000001u,
+    0x00050051u, 0x0000001fu, 0x000000a5u, 0x00000030u, 0x00000002u, 0x00050051u, 0x00000006u, 0x000000a6u,
+    0x00000030u, 0x00000003u, 0x00050051u, 0x00000006u, 0x000000a7u, 0x00000030u, 0x00000004u, 0x00050051u,
+    0x00000006u, 0x000000a8u, 0x00000030u, 0x00000005u, 0x00050051u, 0x00000006u, 0x000000a9u, 0x00000030u,
+    0x00000006u, 0x000500c7u, 0x00000006u, 0x00000036u, 0x000000a8u, 0x00000035u, 0x000500abu, 0x0000001au,
+    0x00000037u, 0x00000036u, 0x0000000cu, 0x000600a9u, 0x00000006u, 0x00000039u, 0x00000037u, 0x00000038u,
+    0x0000000cu, 0x000500c7u, 0x00000006u, 0x0000003du, 0x000000a8u, 0x0000003cu, 0x000500abu, 0x0000001au,
+    0x0000003eu, 0x0000003du, 0x0000000cu, 0x000600a9u, 0x00000006u, 0x0000003fu, 0x0000003eu, 0x00000035u,
+    0x0000000cu, 0x000500c5u, 0x00000006u, 0x00000040u, 0x00000039u, 0x0000003fu, 0x000500abu, 0x0000001au,
+    0x00000046u, 0x000000a7u, 0x0000000cu, 0x000300f7u, 0x00000048u, 0x00000000u, 0x000400fau, 0x00000046u,
+    0x00000047u, 0x00000048u, 0x000200f8u, 0x00000047u, 0x00050041u, 0x00000017u, 0x0000004cu, 0x00000014u,
+    0x00000043u, 0x0004003du, 0x00000006u, 0x0000004du, 0x0000004cu, 0x000500b0u, 0x0000001au, 0x0000004eu,
+    0x000000a9u, 0x0000004du, 0x000200f9u, 0x00000048u, 0x000200f8u, 0x00000048u, 0x000700f5u, 0x0000001au,
+    0x0000004fu, 0x00000046u, 0x0000001du, 0x0000004eu, 0x00000047u, 0x000500c7u, 0x00000006u, 0x00000062u,
+    0x000000a6u, 0x00000061u, 0x000300f7u, 0x00000066u, 0x00000000u, 0x000400fau, 0x0000004fu, 0x00000065u,
+    0x0000006bu, 0x000200f8u, 0x00000065u, 0x000500c7u, 0x00000006u, 0x0000006au, 0x000000a7u, 0x00000069u,
+    0x000200f9u, 0x00000066u, 0x000200f8u, 0x0000006bu, 0x000200f9u, 0x00000066u, 0x000200f8u, 0x00000066u,
+    0x000700f5u, 0x00000006u, 0x000000b7u, 0x0000006au, 0x00000065u, 0x0000000cu, 0x0000006bu, 0x000500c4u,
+    0x00000006u, 0x0000006eu, 0x000000b7u, 0x0000006du, 0x000500c5u, 0x00000006u, 0x0000006fu, 0x00000062u,
+    0x0000006eu, 0x000500c7u, 0x00000006u, 0x00000072u, 0x00000040u, 0x00000069u, 0x000500c4u, 0x00000006u,
+    0x00000073u, 0x00000072u, 0x0000006du, 0x000300f7u, 0x00000079u, 0x00000000u, 0x000400fau, 0x0000004fu,
+    0x00000078u, 0x00000085u, 0x000200f8u, 0x00000078u, 0x00050041u, 0x00000024u, 0x0000007au, 0x00000014u,
+    0x0000005bu, 0x0004003du, 0x00000011u, 0x0000007bu, 0x0000007au, 0x0004007cu, 0x0000007cu, 0x0000007fu,
+    0x0000007bu, 0x00060041u, 0x00000082u, 0x00000083u, 0x0000007fu, 0x00000023u, 0x000000a9u, 0x0006003du,
+    0x00000011u, 0x00000084u, 0x00000083u, 0x00000002u, 0x00000008u, 0x000200f9u, 0x00000079u, 0x000200f8u,
+    0x00000085u, 0x000200f9u, 0x00000079u, 0x000200f8u, 0x00000079u, 0x000700f5u, 0x00000011u, 0x000000b8u,
+    0x00000084u, 0x00000078u, 0x00000086u, 0x00000085u, 0x00050041u, 0x00000024u, 0x00000089u, 0x00000014u,
+    0x00000057u, 0x0004003du, 0x00000011u, 0x0000008au, 0x00000089u, 0x0004007cu, 0x0000008bu, 0x0000008fu,
+    0x0000008au, 0x00090050u, 0x00000050u, 0x000000b6u, 0x000000a3u, 0x000000a4u, 0x000000a5u, 0x0000006fu,
+    0x00000073u, 0x000000b8u, 0x00060041u, 0x00000092u, 0x00000093u, 0x0000008fu, 0x00000023u, 0x0000000fu,
+    0x00040190u, 0x0000008cu, 0x00000094u, 0x000000b6u, 0x0005003eu, 0x00000093u, 0x00000094u, 0x00000002u,
+    0x00000010u, 0x000200f9u, 0x00000097u, 0x000200f8u, 0x00000097u, 0x000100fdu, 0x00010038u,
+};
+
+_SOKOL_PRIVATE bool _sgu_vk_accel_ensure_conv_pipeline(void) {
+    if (_sgu_vk_accel_state.conv_pip) return true;
+    VkDevice dev = _sgu_vk_accel_state.device;
+    _SG_STRUCT(VkShaderModuleCreateInfo, sm_info);
+    sm_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    sm_info.codeSize = sizeof(_sgu_vk_tlas_conv_spv);
+    sm_info.pCode = _sgu_vk_tlas_conv_spv;
+    if (vkCreateShaderModule(dev, &sm_info, 0, &_sgu_vk_accel_state.conv_mod) != VK_SUCCESS) return false;
+    _SG_STRUCT(VkPushConstantRange, pc_range);
+    pc_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pc_range.offset = 0;
+    pc_range.size = 32;
+    _SG_STRUCT(VkPipelineLayoutCreateInfo, pl_info);
+    pl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl_info.pushConstantRangeCount = 1;
+    pl_info.pPushConstantRanges = &pc_range;
+    if (vkCreatePipelineLayout(dev, &pl_info, 0, &_sgu_vk_accel_state.conv_layout) != VK_SUCCESS) {
+        vkDestroyShaderModule(dev, _sgu_vk_accel_state.conv_mod, 0);
+        _sgu_vk_accel_state.conv_mod = 0;
+        return false;
+    }
+    _SG_STRUCT(VkComputePipelineCreateInfo, pip_info);
+    pip_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pip_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pip_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pip_info.stage.module = _sgu_vk_accel_state.conv_mod;
+    pip_info.stage.pName = "main";
+    pip_info.layout = _sgu_vk_accel_state.conv_layout;
+    if (vkCreateComputePipelines(dev, 0, 1, &pip_info, 0, &_sgu_vk_accel_state.conv_pip) != VK_SUCCESS) {
+        vkDestroyPipelineLayout(dev, _sgu_vk_accel_state.conv_layout, 0);
+        vkDestroyShaderModule(dev, _sgu_vk_accel_state.conv_mod, 0);
+        _sgu_vk_accel_state.conv_layout = 0;
+        _sgu_vk_accel_state.conv_mod = 0;
+        return false;
+    }
+    return true;
+}
+
+_SOKOL_PRIVATE bool _sgu_vk_accel_encode_build(VkCommandBuffer cmd, sg_accel a, uint32_t instance_count,
+    VkDeviceAddress instance_addr, bool refit) {
+    const uint32_t geo_count = a->is_tlas ? 1u : (uint32_t)a->geometry_count;
+    VkAccelerationStructureGeometryKHR stack_geos[_SGU_VK_ACCEL_STACK_GEOS];
+    VkAccelerationStructureBuildRangeInfoKHR stack_ranges[_SGU_VK_ACCEL_STACK_GEOS];
+    VkAccelerationStructureGeometryKHR* geos = stack_geos;
+    VkAccelerationStructureBuildRangeInfoKHR* ranges = stack_ranges;
+    void* heap_mem = 0;
+    if (geo_count > _SGU_VK_ACCEL_STACK_GEOS) {
+        heap_mem = calloc(1, (sizeof(*geos) + sizeof(*ranges)) * (size_t)geo_count);
+        if (!heap_mem) return false;
+        geos = (VkAccelerationStructureGeometryKHR*)heap_mem;
+        ranges = (VkAccelerationStructureBuildRangeInfoKHR*)(geos + geo_count);
+    }
+    _SG_STRUCT(VkAccelerationStructureBuildGeometryInfoKHR, info);
+    if (!_sgu_vk_accel_fill(a, geos, &info, ranges, 0, instance_count, instance_addr)) {
+        free(heap_mem);
+        return false;
+    }
+    const VkDeviceSize scratch_size = refit ? a->native.update_scratch : a->native.build_scratch;
+    const VkDeviceAddress scratch_addr = _sgu_vk_accel_scratch_alloc(scratch_size);
+    if (!scratch_addr) {
+        free(heap_mem);
+        return false;
+    }
+    info.mode = refit ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    info.srcAccelerationStructure = refit ? a->native.as : VK_NULL_HANDLE;
+    info.dstAccelerationStructure = a->native.as;
+    info.scratchData.deviceAddress = scratch_addr;
+    const VkAccelerationStructureBuildRangeInfoKHR* range_ptr = ranges;
+
+    /* Build inputs are read at the build stage with SHADER_READ. */
+    _sgu_vk_accel_barrier(cmd,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+            VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_2_SHADER_READ_BIT |
+            VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+    _sgu_vk_accel_state.cmd_build(cmd, 1, &info, &range_ptr);
+    _sgu_vk_accel_barrier(cmd, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+    free(heap_mem);
+    return true;
+}
+
 /* Records a build or refit into the frame's command buffer. Barriers on both
    sides order the build against earlier GPU writes (for example compute
    writes to vertex data) and against later ray queries. The first barrier
@@ -3012,35 +3379,38 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_record(sg_accel a, const sg_accel_instance* in
         }
         instance_addr = mem->addr;
     }
-    _SG_STRUCT(VkAccelerationStructureGeometryKHR, geo);
-    _SG_STRUCT(VkAccelerationStructureBuildGeometryInfoKHR, info);
-    _SG_STRUCT(VkAccelerationStructureBuildRangeInfoKHR, range);
-    if (!_sgu_vk_accel_fill(a, &geo, &info, &range, (uint32_t)count, instance_addr)) return false;
-    const VkDeviceSize scratch_size = refit ? a->native.update_scratch : a->native.build_scratch;
-    const VkDeviceAddress scratch_addr = _sgu_vk_accel_scratch_alloc(scratch_size);
-    if (!scratch_addr) return false;
-    info.mode = refit ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-    info.srcAccelerationStructure = refit ? a->native.as : VK_NULL_HANDLE;
-    info.dstAccelerationStructure = a->native.as;
-    info.scratchData.deviceAddress = scratch_addr;
-    const VkAccelerationStructureBuildRangeInfoKHR* range_ptr = &range;
+    return _sgu_vk_accel_encode_build(cmd, a, (uint32_t)count, instance_addr, refit);
+}
 
-    /* Build inputs are read at the build stage with SHADER_READ. */
+_SOKOL_PRIVATE bool _sgu_vk_accel_record_from_buffer(sg_accel a, _sg_buffer_t* src_buf, int offset, int count, bool refit) {
+    if (!_sgu_vk_accel_ensure_conv_pipeline()) return false;
+    _sg_vk_acquire_frame_command_buffers();
+    VkCommandBuffer cmd = _sg.vk.frame.cmd_buf;
+    if (!cmd) return false;
+    /* Refresh BLAS device addresses in case a BLAS was recreated. */
+    uint64_t* blas_addrs = (uint64_t*)a->native.blas_addrs.map;
+    for (int i = 0; i < a->blas_count; i++) {
+        blas_addrs[i] = (uint64_t)a->blas_list[i]->native.addr;
+    }
+    _sgu_vk_mem_t* dst_mem = &a->native.instances[_sg.vk.frame_slot];
+    const uint64_t src_addr = (uint64_t)src_buf->vk.dev_addr + (uint64_t)offset;
+    const uint64_t dst_addr = (uint64_t)dst_mem->addr;
+    const uint64_t addr_table = (uint64_t)a->native.blas_addrs.addr;
+    const uint32_t push[8] = {
+        (uint32_t)(src_addr & 0xFFFFFFFFu), (uint32_t)(src_addr >> 32),
+        (uint32_t)(dst_addr & 0xFFFFFFFFu), (uint32_t)(dst_addr >> 32),
+        (uint32_t)(addr_table & 0xFFFFFFFFu), (uint32_t)(addr_table >> 32),
+        (uint32_t)count, (uint32_t)a->blas_count
+    };
     _sgu_vk_accel_barrier(cmd,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
-            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
-            VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-        VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_ACCESS_2_SHADER_READ_BIT |
-            VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
-    _sgu_vk_accel_state.cmd_build(cmd, 1, &info, &range_ptr);
-    _sgu_vk_accel_barrier(cmd, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-        VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-        VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
-    return true;
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+        VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _sgu_vk_accel_state.conv_pip);
+    vkCmdPushConstants(cmd, _sgu_vk_accel_state.conv_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+    vkCmdDispatch(cmd, ((uint32_t)count + 63u) / 64u, 1u, 1u);
+    return _sgu_vk_accel_encode_build(cmd, a, (uint32_t)count, dst_mem->addr, refit);
 }
 
 /* Checks the Vulkan binding numbers of a layout against the shader desc. fn
@@ -3246,6 +3616,17 @@ _SOKOL_PRIVATE bool _sgu_vk_accel_bind(const sg_accel a, int slot) {
 
 _SOKOL_PRIVATE void _sgu_vk_accel_shutdown(void) {
     for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) _sgu_vk_accel_free(&_sgu_vk_accel_scratch.mem[i]);
+    if (_sgu_vk_accel_state.device) {
+        if (sg_isvalid()) {
+            if (_sgu_vk_accel_state.conv_pip) _sg_vk_delete_queue_add(_sg_vk_pipeline_destructor, (void*)_sgu_vk_accel_state.conv_pip);
+            if (_sgu_vk_accel_state.conv_layout) _sg_vk_delete_queue_add(_sg_vk_pipelinelayout_destructor, (void*)_sgu_vk_accel_state.conv_layout);
+            if (_sgu_vk_accel_state.conv_mod) _sg_vk_delete_queue_add(_sg_vk_shader_module_destructor, (void*)_sgu_vk_accel_state.conv_mod);
+        } else {
+            if (_sgu_vk_accel_state.conv_pip) vkDestroyPipeline(_sgu_vk_accel_state.device, _sgu_vk_accel_state.conv_pip, 0);
+            if (_sgu_vk_accel_state.conv_layout) vkDestroyPipelineLayout(_sgu_vk_accel_state.device, _sgu_vk_accel_state.conv_layout, 0);
+            if (_sgu_vk_accel_state.conv_mod) vkDestroyShaderModule(_sgu_vk_accel_state.device, _sgu_vk_accel_state.conv_mod, 0);
+        }
+    }
     memset(&_sgu_vk_accel_scratch, 0, sizeof(_sgu_vk_accel_scratch));
     memset(&_sgu_vk_accel_state, 0, sizeof(_sgu_vk_accel_state));
 }
@@ -3432,23 +3813,27 @@ _SOKOL_PRIVATE bool _sgu_mtl_accel_acquire_cmd_buffer(void) {
 }
 
 _SOKOL_PRIVATE MTLPrimitiveAccelerationStructureDescriptor* _sgu_mtl_accel_blas_descriptor(const sg_accel a) API_AVAILABLE(macos(12.0), ios(15.0)) {
-    _sg_buffer_t* vb = 0;
-    _sg_buffer_t* ib = 0;
-    if (!_sgu_accel_blas_buffers(a, &vb, &ib)) return nil;
-    const sg_blas_desc* d = &a->blas;
-    MTLAccelerationStructureTriangleGeometryDescriptor* geo = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-    geo.vertexBuffer = _sg_mtl_id(vb->mtl.buf[vb->cmn.active_slot]);
-    geo.vertexBufferOffset = (NSUInteger)d->vertex_offset;
-    geo.vertexStride = (NSUInteger)d->vertex_stride;
-    geo.triangleCount = (NSUInteger)_sgu_accel_triangle_count(a);
-    geo.opaque = d->opaque ? YES : NO;
-    if (ib) {
-        geo.indexBuffer = _sg_mtl_id(ib->mtl.buf[ib->cmn.active_slot]);
-        geo.indexBufferOffset = (NSUInteger)d->index_offset;
-        geo.indexType = (d->index_format == SG_ACCEL_INDEXFORMAT_UINT16) ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+    NSMutableArray* geos = [NSMutableArray arrayWithCapacity:(NSUInteger)a->geometry_count];
+    for (int i = 0; i < a->geometry_count; i++) {
+        _sg_buffer_t* vb = 0;
+        _sg_buffer_t* ib = 0;
+        const sg_blas_geometry* g = &a->geometries[i];
+        if (!_sgu_accel_geo_buffers(g, &vb, &ib)) return nil;
+        MTLAccelerationStructureTriangleGeometryDescriptor* geo = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+        geo.vertexBuffer = _sg_mtl_id(vb->mtl.buf[vb->cmn.active_slot]);
+        geo.vertexBufferOffset = (NSUInteger)g->vertex_offset;
+        geo.vertexStride = (NSUInteger)g->vertex_stride;
+        geo.triangleCount = (NSUInteger)_sgu_accel_geo_triangle_count(g);
+        geo.opaque = g->opaque ? YES : NO;
+        if (ib) {
+            geo.indexBuffer = _sg_mtl_id(ib->mtl.buf[ib->cmn.active_slot]);
+            geo.indexBufferOffset = (NSUInteger)g->index_offset;
+            geo.indexType = (g->index_format == SG_ACCEL_INDEXFORMAT_UINT16) ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+        }
+        [geos addObject:geo];
     }
     MTLPrimitiveAccelerationStructureDescriptor* desc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
-    desc.geometryDescriptors = @[geo];
+    desc.geometryDescriptors = geos;
     desc.usage = a->allow_update ? MTLAccelerationStructureUsageRefit : MTLAccelerationStructureUsageNone;
     return desc;
 }
@@ -3561,12 +3946,13 @@ _SOKOL_PRIVATE void _sgu_mtl_accel_report_build(sg_accel a, int count, uint32_t 
         const sg_accel b = a->blas_list[i];
         _sg_buffer_t* vb = 0;
         _sg_buffer_t* ib = 0;
-        const bool inputs = _sgu_accel_blas_buffers(b, &vb, &ib);
-        _sgu_accel_log_level(3, "accel report: BLAS %d %p size %llu built %d triangles %d vertices %d stride %d offset %d "
+        const sg_blas_geometry* g0 = &b->geometries[0];
+        const bool inputs = _sgu_accel_geo_buffers(g0, &vb, &ib);
+        _sgu_accel_log_level(3, "accel report: BLAS %d %p size %llu built %d geos %d triangles %llu g0 vertices %d stride %d offset %d "
             "index format %d count %d offset %d, inputs %s (vertex buffer %d bytes)", i, b->native.as,
-            (unsigned long long)_SGU_MTL_OBJ(id<MTLAccelerationStructure>, b->native.as).size, (int)b->built,
-            _sgu_accel_triangle_count(b), b->blas.vertex_count, b->blas.vertex_stride, b->blas.vertex_offset,
-            (int)b->blas.index_format, b->blas.index_count, b->blas.index_offset, inputs ? "valid" : "INVALID",
+            (unsigned long long)_SGU_MTL_OBJ(id<MTLAccelerationStructure>, b->native.as).size, (int)b->built, b->geometry_count,
+            (unsigned long long)_sgu_accel_total_triangles(b), g0->vertex_count, g0->vertex_stride, g0->vertex_offset,
+            (int)g0->index_format, g0->index_count, g0->index_offset, inputs ? "valid" : "INVALID",
             vb ? (int)vb->cmn.size : -1);
     }
     const int blas_n = a->blas_count < _SGU_MTL_ACCEL_REPORT_BLAS ? a->blas_count : _SGU_MTL_ACCEL_REPORT_BLAS;
@@ -3687,6 +4073,123 @@ _SOKOL_PRIVATE bool _sgu_mtl_accel_record(sg_accel a, const sg_accel_instance* i
     return false;
 }
 
+static struct {
+    void* conv_pso; /* retained id<MTLComputePipelineState> */
+} _sgu_mtl_accel_conv;
+
+_SOKOL_PRIVATE id<MTLComputePipelineState> _sgu_mtl_accel_ensure_conv_pso(void) API_AVAILABLE(macos(12.0), ios(15.0)) {
+    if (_sgu_mtl_accel_conv.conv_pso) {
+        return _SGU_MTL_OBJ(id<MTLComputePipelineState>, _sgu_mtl_accel_conv.conv_pso);
+    }
+    static NSString* const src =
+        @"#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "struct SguSrcInstance {\n"
+        "    float transform[12];\n"
+        "    uint id;\n"
+        "    uint mask;\n"
+        "    uint flags;\n"
+        "    uint blas_index;\n"
+        "};\n"
+        "struct SguMtlInstance {\n"
+        "    packed_float3 columns[4];\n"
+        "    uint options;\n"
+        "    uint mask;\n"
+        "    uint intersectionFunctionTableOffset;\n"
+        "    uint accelerationStructureIndex;\n"
+        "    uint userID;\n"
+        "};\n"
+        "struct SguConvParams {\n"
+        "    uint count;\n"
+        "    uint blas_count;\n"
+        "    uint opt_opaque;\n"
+        "    uint opt_no_cull;\n"
+        "};\n"
+        "kernel void sgu_convert_instances(\n"
+        "    const device SguSrcInstance* src [[buffer(0)]],\n"
+        "    device SguMtlInstance* dst [[buffer(1)]],\n"
+        "    constant SguConvParams& p [[buffer(2)]],\n"
+        "    uint tid [[thread_position_in_grid]]) {\n"
+        "    if (tid >= p.count) return;\n"
+        "    SguSrcInstance s = src[tid];\n"
+        "    bool valid_blas = (s.mask != 0u) && (s.blas_index < p.blas_count);\n"
+        "    SguMtlInstance d;\n"
+        "    for (uint c = 0u; c < 4u; ++c) {\n"
+        "        d.columns[c] = packed_float3(s.transform[c], s.transform[4u + c], s.transform[8u + c]);\n"
+        "    }\n"
+        "    uint opts = 0u;\n"
+        "    if ((s.flags & 1u) != 0u) opts |= p.opt_opaque;\n"
+        "    if ((s.flags & 2u) != 0u) opts |= p.opt_no_cull;\n"
+        "    d.options = opts;\n"
+        "    d.mask = valid_blas ? (s.mask & 0xFFu) : 0u;\n"
+        "    d.intersectionFunctionTableOffset = 0u;\n"
+        "    d.accelerationStructureIndex = valid_blas ? s.blas_index : 0u;\n"
+        "    d.userID = s.id & 0xFFFFFFu;\n"
+        "    dst[tid] = d;\n"
+        "}\n";
+    NSError* err = nil;
+    id<MTLLibrary> lib = [_sg.mtl.device newLibraryWithSource:src options:nil error:&err];
+    if (nil == lib) return nil;
+    id<MTLFunction> fn = [lib newFunctionWithName:@"sgu_convert_instances"];
+    _SGU_MTL_DROP(lib);
+    if (nil == fn) return nil;
+    id<MTLComputePipelineState> pso = [_sg.mtl.device newComputePipelineStateWithFunction:fn error:&err];
+    _SGU_MTL_DROP(fn);
+    if (nil == pso) return nil;
+    _sgu_mtl_accel_conv.conv_pso = _SGU_MTL_RETAIN(pso);
+    _SGU_MTL_DROP(pso);
+    return _SGU_MTL_OBJ(id<MTLComputePipelineState>, _sgu_mtl_accel_conv.conv_pso);
+}
+
+_SOKOL_PRIVATE bool _sgu_mtl_accel_record_from_buffer(sg_accel a, _sg_buffer_t* src_buf, int offset, int count, bool refit) {
+    if (@available(macOS 12.0, iOS 15.0, *)) @autoreleasepool {
+        _sgu_mtl_accel_collect(false);
+        id<MTLComputePipelineState> pso = _sgu_mtl_accel_ensure_conv_pso();
+        if (nil == pso || !_sgu_mtl_accel_acquire_cmd_buffer()) return false;
+        _sg_mtl_finish_blit_cmd_encoder();
+        const uint32_t ring = _sg.mtl.cur_frame_rotate_index;
+        id<MTLBuffer> mtl_src = _sg_mtl_id(src_buf->mtl.buf[src_buf->cmn.active_slot]);
+        id<MTLBuffer> mtl_dst = _SGU_MTL_OBJ(id<MTLBuffer>, a->native.instances[ring]);
+        if (nil == mtl_src || nil == mtl_dst) return false;
+        const uint32_t params[4] = {
+            (uint32_t)count,
+            (uint32_t)a->blas_count,
+            (uint32_t)MTLAccelerationStructureInstanceOptionOpaque,
+            (uint32_t)MTLAccelerationStructureInstanceOptionDisableTriangleCulling
+        };
+        id<MTLComputeCommandEncoder> conv_enc = [_sg.mtl.cmd_buffer computeCommandEncoder];
+        if (nil == conv_enc) return false;
+        [conv_enc setComputePipelineState:pso];
+        [conv_enc setBuffer:mtl_src offset:(NSUInteger)offset atIndex:0];
+        [conv_enc setBuffer:mtl_dst offset:0 atIndex:1];
+        [conv_enc setBytes:params length:sizeof(params) atIndex:2];
+        [conv_enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)count + 63u) / 64u, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+        [conv_enc endEncoding];
+
+        MTLAccelerationStructureDescriptor* desc = _sgu_mtl_accel_tlas_descriptor(a, ring, count);
+        if (nil == desc) return false;
+        const uint64_t scratch_size = refit ? a->native.refit_scratch : a->native.build_scratch;
+        NSUInteger scratch_offset = 0;
+        id<MTLBuffer> scratch = _sgu_mtl_accel_scratch_alloc(scratch_size, &scratch_offset);
+        if (nil == scratch) return false;
+        id<MTLAccelerationStructure> as = _SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->native.as);
+        id<MTLAccelerationStructureCommandEncoder> encoder = [_sg.mtl.cmd_buffer accelerationStructureCommandEncoder];
+        for (int i = 0; i < a->blas_count; i++) {
+            [encoder useResource:_SGU_MTL_OBJ(id<MTLAccelerationStructure>, a->blas_list[i]->native.as) usage:MTLResourceUsageRead];
+        }
+        if (refit) {
+            [encoder refitAccelerationStructure:as descriptor:desc destination:as scratchBuffer:scratch scratchBufferOffset:scratch_offset];
+        } else {
+            [encoder buildAccelerationStructure:as descriptor:desc scratchBuffer:scratch scratchBufferOffset:scratch_offset];
+        }
+        [encoder endEncoding];
+        return true;
+    }
+    (void)a; (void)src_buf; (void)offset; (void)count; (void)refit;
+    return false;
+}
+
 /* Binds the TLAS at the buffer index recorded for the slot of the current
    pipeline's shader and marks it and its BLASes resident. */
 _SOKOL_PRIVATE bool _sgu_mtl_accel_bind(const sg_accel a, int slot) {
@@ -3724,6 +4227,8 @@ _SOKOL_PRIVATE bool _sgu_mtl_accel_bind(const sg_accel a, int slot) {
 _SOKOL_PRIVATE void _sgu_mtl_accel_shutdown(void) {
     for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) _sgu_mtl_accel_defer(_sgu_mtl_accel_scratch.buf[i]);
     memset(&_sgu_mtl_accel_scratch, 0, sizeof(_sgu_mtl_accel_scratch));
+    _sgu_mtl_accel_defer(_sgu_mtl_accel_conv.conv_pso);
+    memset(&_sgu_mtl_accel_conv, 0, sizeof(_sgu_mtl_accel_conv));
     _sgu_mtl_accel_defer(_sgu_mtl_accel_report.sizes);
     memset(&_sgu_mtl_accel_report, 0, sizeof(_sgu_mtl_accel_report));
     _sgu_mtl_accel_collect(true);
@@ -3739,6 +4244,7 @@ _SOKOL_PRIVATE void _sgu_mtl_accel_shutdown(void) {
 #define _sgu_accel_native_make _sgu_vk_accel_make
 #define _sgu_accel_native_destroy _sgu_vk_accel_destroy
 #define _sgu_accel_native_record _sgu_vk_accel_record
+#define _sgu_accel_native_record_from_buffer _sgu_vk_accel_record_from_buffer
 #define _sgu_accel_native_bind _sgu_vk_accel_bind
 #define _sgu_accel_native_shutdown _sgu_vk_accel_shutdown
 #elif defined(SOKOL_METAL)
@@ -3746,6 +4252,7 @@ _SOKOL_PRIVATE void _sgu_mtl_accel_shutdown(void) {
 #define _sgu_accel_native_make _sgu_mtl_accel_make
 #define _sgu_accel_native_destroy _sgu_mtl_accel_destroy
 #define _sgu_accel_native_record _sgu_mtl_accel_record
+#define _sgu_accel_native_record_from_buffer _sgu_mtl_accel_record_from_buffer
 #define _sgu_accel_native_bind _sgu_mtl_accel_bind
 #define _sgu_accel_native_shutdown _sgu_mtl_accel_shutdown
 #else
@@ -3755,6 +4262,9 @@ _SOKOL_PRIVATE bool _sgu_accel_native_make(sg_accel a, const char* label) { (voi
 _SOKOL_PRIVATE void _sgu_accel_native_destroy(sg_accel a) { (void)a; }
 _SOKOL_PRIVATE bool _sgu_accel_native_record(sg_accel a, const sg_accel_instance* inst, int count, bool refit) {
     (void)a; (void)inst; (void)count; (void)refit; return false;
+}
+_SOKOL_PRIVATE bool _sgu_accel_native_record_from_buffer(sg_accel a, _sg_buffer_t* src_buf, int offset, int count, bool refit) {
+    (void)a; (void)src_buf; (void)offset; (void)count; (void)refit; return false;
 }
 _SOKOL_PRIVATE bool _sgu_accel_native_bind(const sg_accel a, int slot) { (void)a; (void)slot; return false; }
 _SOKOL_PRIVATE void _sgu_accel_native_shutdown(void) {}
@@ -3809,22 +4319,43 @@ SOKOL_API_IMPL sg_buffer sg_make_accel_input_buffer(const sg_buffer_desc* desc) 
 SOKOL_API_IMPL sg_accel sg_make_blas(const sg_blas_desc* desc) {
     if (!desc || !sg_ray_query_supported()) return NULL;
     const sg_blas_desc* d = desc;
-    if ((int)d->index_format < (int)SG_ACCEL_INDEXFORMAT_NONE || (int)d->index_format > (int)SG_ACCEL_INDEXFORMAT_UINT32) return NULL;
-    if (d->vertex_count < 3 || d->vertex_stride < 12 || (d->vertex_stride & 3) ||
-        d->vertex_offset < 0 || (d->vertex_offset & 3)) return NULL;
-    if (d->index_format == SG_ACCEL_INDEXFORMAT_NONE) {
-        if (d->vertex_count % 3) return NULL;
-    } else if (d->index_count < 3 || (d->index_count % 3) || d->index_offset < 0 ||
-               (d->index_offset % _sgu_accel_index_size(d->index_format))) {
-        return NULL;
+    if (d->geometry_count < 0 || (d->geometry_count == 0 && d->geometries != NULL) ||
+        (d->geometry_count > 0 && d->geometries == NULL)) return NULL;
+    sg_blas_geometry single;
+    memset(&single, 0, sizeof(single));
+    const sg_blas_geometry* src_geos = d->geometries;
+    int geo_count = d->geometry_count;
+    if (geo_count == 0) {
+        single.vertex_buffer = d->vertex_buffer;
+        single.vertex_offset = d->vertex_offset;
+        single.vertex_stride = d->vertex_stride;
+        single.vertex_count = d->vertex_count;
+        single.index_buffer = d->index_buffer;
+        single.index_offset = d->index_offset;
+        single.index_format = d->index_format;
+        single.index_count = d->index_count;
+        single.opaque = d->opaque;
+        src_geos = &single;
+        geo_count = 1;
+    }
+    for (int i = 0; i < geo_count; i++) {
+        if (!_sgu_accel_validate_geometry(&src_geos[i])) return NULL;
     }
     sg_accel a = (sg_accel)calloc(1, sizeof(*a));
     if (!a) return NULL;
-    a->blas = *d;
-    a->blas.label = NULL;
+    a->geometry_count = geo_count;
+    if (geo_count == 1) {
+        a->inline_geo = src_geos[0];
+        a->geometries = &a->inline_geo;
+    } else {
+        a->geometries = (sg_blas_geometry*)calloc((size_t)geo_count, sizeof(sg_blas_geometry));
+        if (!a->geometries) { free(a); return NULL; }
+        memcpy(a->geometries, src_geos, sizeof(sg_blas_geometry) * (size_t)geo_count);
+    }
     a->allow_update = d->allow_update;
     if (!_sgu_accel_native_make(a, d->label)) {
         _sgu_accel_native_destroy(a);
+        if (a->geometries != &a->inline_geo) free(a->geometries);
         free(a);
         return NULL;
     }
@@ -3865,6 +4396,8 @@ _SOKOL_PRIVATE void _sgu_accel_release(sg_accel a) {
             if (--blas->refs == 0 && blas->destroy_requested) _sgu_accel_release(blas);
         }
         free(a->blas_list);
+    } else if (a->geometries && a->geometries != &a->inline_geo) {
+        free(a->geometries);
     }
     free(a);
 }
@@ -3896,14 +4429,20 @@ SOKOL_API_IMPL bool sg_refit_blas(sg_accel blas) {
     return _sgu_accel_native_record(blas, 0, 0, true);
 }
 
-SOKOL_API_IMPL bool sg_blas_set_vertex_buffer(sg_accel blas, sg_buffer vertex_buffer, int vertex_offset) {
-    if (!blas || blas->is_tlas || blas->destroy_requested || vertex_offset < 0 || (vertex_offset & 3)) return false;
-    const sg_blas_desc* d = &blas->blas;
-    const int64_t vbytes = (int64_t)d->vertex_stride * (int64_t)(d->vertex_count - 1) + 12;
+SOKOL_API_IMPL bool sg_blas_set_geometry_vertex_buffer(sg_accel blas, int geometry_index, sg_buffer vertex_buffer, int vertex_offset) {
+    if (!blas || blas->is_tlas || blas->destroy_requested ||
+        geometry_index < 0 || geometry_index >= blas->geometry_count ||
+        vertex_offset < 0 || (vertex_offset & 3)) return false;
+    sg_blas_geometry* g = &blas->geometries[geometry_index];
+    const int64_t vbytes = (int64_t)g->vertex_stride * (int64_t)(g->vertex_count - 1) + 12;
     if (!_sgu_accel_input_buffer(vertex_buffer, vertex_offset, vbytes)) return false;
-    blas->blas.vertex_buffer = vertex_buffer;
-    blas->blas.vertex_offset = vertex_offset;
+    g->vertex_buffer = vertex_buffer;
+    g->vertex_offset = vertex_offset;
     return true;
+}
+
+SOKOL_API_IMPL bool sg_blas_set_vertex_buffer(sg_accel blas, sg_buffer vertex_buffer, int vertex_offset) {
+    return sg_blas_set_geometry_vertex_buffer(blas, 0, vertex_buffer, vertex_offset);
 }
 
 /* A TLAS owns one instance buffer slot per frame in flight, so it takes one
@@ -3924,12 +4463,39 @@ _SOKOL_PRIVATE bool _sgu_accel_record_tlas(sg_accel tlas, const sg_accel_instanc
     return true;
 }
 
+_SOKOL_PRIVATE bool _sgu_accel_record_tlas_from_buffer(sg_accel tlas, sg_buffer instance_buffer, int instance_offset, int count, bool refit) {
+    if (!_sgu_accel_can_record(tlas, true) || count < 1 || count > tlas->max_instances) return false;
+    if (instance_offset < 0 || (instance_offset & 15)) return false;
+    if (refit && (!tlas->built || !tlas->allow_update || count != tlas->built_count)) return false;
+    if (tlas->recorded && tlas->last_frame == _sg.frame_index) return false;
+    for (int i = 0; i < tlas->blas_count; i++) {
+        if (!tlas->blas_list[i]->built) return false;
+    }
+    _sg_buffer_t* src_buf = _sgu_accel_input_buffer(
+        instance_buffer, instance_offset, (int64_t)count * (int64_t)sizeof(sg_gpu_accel_instance));
+    if (!src_buf) return false;
+    if (!_sgu_accel_native_record_from_buffer(tlas, src_buf, instance_offset, count, refit)) return false;
+    tlas->built = true;
+    tlas->built_count = count;
+    tlas->recorded = true;
+    tlas->last_frame = _sg.frame_index;
+    return true;
+}
+
 SOKOL_API_IMPL bool sg_build_tlas(sg_accel tlas, const sg_accel_instance* instances, int count) {
     return _sgu_accel_record_tlas(tlas, instances, count, false);
 }
 
 SOKOL_API_IMPL bool sg_refit_tlas(sg_accel tlas, const sg_accel_instance* instances, int count) {
     return _sgu_accel_record_tlas(tlas, instances, count, true);
+}
+
+SOKOL_API_IMPL bool sg_build_tlas_from_buffer(sg_accel tlas, sg_buffer instance_buffer, int instance_offset, int count) {
+    return _sgu_accel_record_tlas_from_buffer(tlas, instance_buffer, instance_offset, count, false);
+}
+
+SOKOL_API_IMPL bool sg_refit_tlas_from_buffer(sg_accel tlas, sg_buffer instance_buffer, int instance_offset, int count) {
+    return _sgu_accel_record_tlas_from_buffer(tlas, instance_buffer, instance_offset, count, true);
 }
 
 SOKOL_API_IMPL bool sg_accel_built(sg_accel accel) {
@@ -4363,6 +4929,1020 @@ SOKOL_API_IMPL void sg_fragment_storage_shutdown(void) {
     #if defined(SOKOL_VULKAN)
     memset(&_sgu_vk_fstore_state, 0, sizeof(_sgu_vk_fstore_state));
     #endif
+}
+
+/*--- Bindless Tables: Common ------------------------------------------------*/
+
+#define _SGU_BINDLESS_MAX_SHADERS (64)
+#define _SGU_BINDLESS_MTL_MAX_TEXTURES (1048576)
+#define _SGU_BINDLESS_MTL_MAX_SAMPLERS (2048)
+
+#if defined(SOKOL_VULKAN)
+typedef struct {
+    uint8_t* shadow;
+    size_t desc_size;
+    uint32_t cached_frame;
+    uint32_t cached_dset_bytes;
+    VkDeviceSize cached_dbuf_offset;
+    bool has_cached;
+    bool dirty;
+} _sgu_bindless_native_t;
+
+typedef struct {
+    VkDescriptorSetLayout dsl[SG_BINDLESS_MAX_SLOTS];
+    VkDeviceSize dset_size[SG_BINDLESS_MAX_SLOTS];
+    int dsl_count;
+} _sgu_bindless_shd_native_t;
+#elif defined(SOKOL_METAL)
+typedef struct {
+    void* encoder;                          /* retained id<MTLArgumentEncoder> */
+    void* staging;                          /* retained id<MTLBuffer> */
+    void* ring[SG_NUM_INFLIGHT_FRAMES];     /* retained id<MTLBuffer> */
+    size_t stride;
+    uint32_t generation;
+    uint32_t synced_gen[SG_NUM_INFLIGHT_FRAMES];
+    uint32_t synced_frame[SG_NUM_INFLIGHT_FRAMES];
+    bool synced_valid[SG_NUM_INFLIGHT_FRAMES];
+} _sgu_bindless_native_t;
+
+typedef struct { int unused; } _sgu_bindless_shd_native_t;
+#else
+typedef struct { int unused; } _sgu_bindless_native_t;
+typedef struct { int unused; } _sgu_bindless_shd_native_t;
+#endif
+
+struct sg_bindless_table_t {
+    sg_bindless_kind kind;
+    int capacity;
+    int high_water;
+    uint32_t* entry_ids;    /* sg_view.id for textures, sg_sampler.id for samplers */
+    _sgu_bindless_native_t native;
+};
+
+static struct {
+    uint32_t id[_SGU_BINDLESS_MAX_SHADERS];
+    sg_bindless_layout_desc layout[_SGU_BINDLESS_MAX_SHADERS];
+    _sgu_bindless_shd_native_t native[_SGU_BINDLESS_MAX_SHADERS];
+    int count;
+} _sgu_bindless_shaders;
+
+static bool _sgu_bindless_down;
+
+_SOKOL_PRIVATE void _sgu_bindless_free_shd_native(_sgu_bindless_shd_native_t* nat) {
+    #if defined(SOKOL_VULKAN)
+    for (int i = 0; i < nat->dsl_count; i++) {
+        if (!nat->dsl[i]) continue;
+        if (sg_isvalid()) {
+            _sg_vk_delete_queue_add(_sg_vk_descriptorsetlayout_destructor, (void*)nat->dsl[i]);
+        } else if (_sg.vk.dev) {
+            vkDestroyDescriptorSetLayout(_sg.vk.dev, nat->dsl[i], 0);
+        }
+        nat->dsl[i] = 0;
+    }
+    #endif
+    memset(nat, 0, sizeof(*nat));
+}
+
+_SOKOL_PRIVATE void _sgu_bindless_prune_shaders(void) {
+    int keep = 0;
+    for (int i = 0; i < _sgu_bindless_shaders.count; i++) {
+        if (!_sg_lookup_shader(_sgu_bindless_shaders.id[i])) {
+            _sgu_bindless_free_shd_native(&_sgu_bindless_shaders.native[i]);
+            continue;
+        }
+        if (keep != i) {
+            _sgu_bindless_shaders.id[keep] = _sgu_bindless_shaders.id[i];
+            _sgu_bindless_shaders.layout[keep] = _sgu_bindless_shaders.layout[i];
+            _sgu_bindless_shaders.native[keep] = _sgu_bindless_shaders.native[i];
+        }
+        keep++;
+    }
+    _sgu_bindless_shaders.count = keep;
+}
+
+_SOKOL_PRIVATE int _sgu_bindless_find_shader(uint32_t shader_id) {
+    for (int i = 0; i < _sgu_bindless_shaders.count; i++) {
+        if (_sgu_bindless_shaders.id[i] == shader_id) return i;
+    }
+    return -1;
+}
+
+_SOKOL_PRIVATE const sg_bindless_slot_layout* _sgu_bindless_find_slot(int shd_idx, int slot) {
+    if (shd_idx < 0) return 0;
+    const sg_bindless_layout_desc* layout = &_sgu_bindless_shaders.layout[shd_idx];
+    for (int i = 0; i < layout->num_slots; i++) {
+        if ((int)layout->slots[i].slot == slot) return &layout->slots[i];
+    }
+    return 0;
+}
+
+_SOKOL_PRIVATE bool _sgu_bindless_validate_slots(const char* fn, const sg_shader_desc* desc, const sg_bindless_layout_desc* layout) {
+    if (layout->num_slots < 0 || layout->num_slots > SG_BINDLESS_MAX_SLOTS) {
+        _sgu_accel_log("%s: num_slots %d is not in 0..%d", fn, layout->num_slots, SG_BINDLESS_MAX_SLOTS);
+        return false;
+    }
+    const bool is_compute = (desc->compute_func.source != 0 || desc->compute_func.bytecode.ptr != 0);
+    for (int i = 0; i < layout->num_slots; i++) {
+        const sg_bindless_slot_layout* s = &layout->slots[i];
+        if ((int)s->slot >= SG_BINDLESS_MAX_SLOTS) {
+            _sgu_accel_log("%s: slot %d is not below %d", fn, (int)s->slot, SG_BINDLESS_MAX_SLOTS);
+            return false;
+        }
+        if ((int)s->kind < (int)SG_BINDLESS_KIND_TEXTURES || (int)s->kind > (int)SG_BINDLESS_KIND_SAMPLERS) {
+            _sgu_accel_log("%s: slot %d has invalid kind %d", fn, (int)s->slot, (int)s->kind);
+            return false;
+        }
+        if (is_compute) {
+            if (s->stage != SG_SHADERSTAGE_COMPUTE) {
+                _sgu_accel_log("%s: slot %d stage must be COMPUTE on a compute shader", fn, (int)s->slot);
+                return false;
+            }
+        } else if (s->stage != SG_SHADERSTAGE_VERTEX && s->stage != SG_SHADERSTAGE_FRAGMENT) {
+            _sgu_accel_log("%s: slot %d stage must be VERTEX or FRAGMENT on a render shader", fn, (int)s->slot);
+            return false;
+        }
+        for (int j = 0; j < i; j++) {
+            if (layout->slots[j].slot == s->slot) {
+                _sgu_accel_log("%s: slot %d is listed twice", fn, (int)s->slot);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+_SOKOL_PRIVATE _sg_view_t* _sgu_bindless_tex_view(sg_view id, _sg_image_t** out_img) {
+    _sg_view_t* view = _sg_lookup_view(id.id);
+    if (!view || view->slot.state != SG_RESOURCESTATE_VALID || view->cmn.type != SG_VIEWTYPE_TEXTURE) return 0;
+    _sg_image_t* img = _sg_image_ref_ptr(&view->cmn.img.ref);
+    if (!img || img->slot.state != SG_RESOURCESTATE_VALID) return 0;
+    if (out_img) *out_img = img;
+    return view;
+}
+
+_SOKOL_PRIVATE sg_view _sgu_bindless_view_id(uint32_t id) {
+    sg_view v;
+    v.id = id;
+    return v;
+}
+
+_SOKOL_PRIVATE _sg_sampler_t* _sgu_bindless_sampler(sg_sampler id) {
+    _sg_sampler_t* smp = _sg_lookup_sampler(id.id);
+    if (!smp || smp->slot.state != SG_RESOURCESTATE_VALID) return 0;
+    return smp;
+}
+
+/*--- Bindless Tables: Vulkan ------------------------------------------------*/
+#if defined(SOKOL_VULKAN)
+
+static struct {
+    bool init;
+    VkDevice device;
+    bool supported;
+    int max_textures;
+    int max_samplers;
+} _sgu_vk_bindless_state;
+
+_SOKOL_PRIVATE void _sgu_vk_bindless_query(void) {
+    if (_sgu_vk_bindless_state.init && _sgu_vk_bindless_state.device == _sg.vk.dev) return;
+    memset(&_sgu_vk_bindless_state, 0, sizeof(_sgu_vk_bindless_state));
+    if (!_sg.vk.valid || !_sg.vk.dev) return;
+    _sgu_vk_bindless_state.init = true;
+    _sgu_vk_bindless_state.device = _sg.vk.dev;
+
+    _SG_STRUCT(VkPhysicalDeviceVulkan12Features, v12_feat);
+    v12_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    _SG_STRUCT(VkPhysicalDeviceFeatures2, feat);
+    feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    feat.pNext = &v12_feat;
+    vkGetPhysicalDeviceFeatures2(_sg.vk.phys_dev, &feat);
+    if (!v12_feat.runtimeDescriptorArray || !v12_feat.descriptorBindingPartiallyBound ||
+        !v12_feat.shaderSampledImageArrayNonUniformIndexing) {
+        return;
+    }
+
+    _SG_STRUCT(VkPhysicalDeviceVulkan12Properties, v12_props);
+    v12_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
+    _SG_STRUCT(VkPhysicalDeviceProperties2, props);
+    props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props.pNext = &v12_props;
+    vkGetPhysicalDeviceProperties2(_sg.vk.phys_dev, &props);
+
+    uint32_t max_tex = props.properties.limits.maxPerStageDescriptorSampledImages;
+    if (v12_props.maxPerStageDescriptorUpdateAfterBindSampledImages > max_tex) {
+        max_tex = v12_props.maxPerStageDescriptorUpdateAfterBindSampledImages;
+    }
+    uint32_t max_smp = props.properties.limits.maxPerStageDescriptorSamplers;
+    if (v12_props.maxPerStageDescriptorUpdateAfterBindSamplers > max_smp) {
+        max_smp = v12_props.maxPerStageDescriptorUpdateAfterBindSamplers;
+    }
+    if (max_tex > (uint32_t)_SGU_BINDLESS_MTL_MAX_TEXTURES) max_tex = (uint32_t)_SGU_BINDLESS_MTL_MAX_TEXTURES;
+    if (max_smp > (uint32_t)_SGU_BINDLESS_MTL_MAX_SAMPLERS) max_smp = (uint32_t)_SGU_BINDLESS_MTL_MAX_SAMPLERS;
+    _sgu_vk_bindless_state.max_textures = (int)max_tex;
+    _sgu_vk_bindless_state.max_samplers = (int)max_smp;
+    _sgu_vk_bindless_state.supported = (max_tex > 0 && max_smp > 0);
+}
+
+_SOKOL_PRIVATE int _sgu_vk_bindless_effective_count(const sg_bindless_slot_layout* s) {
+    if (s->vk_descriptor_count > 0) return s->vk_descriptor_count;
+    const int def = (s->kind == SG_BINDLESS_KIND_TEXTURES)
+        ? SG_BINDLESS_DEFAULT_VK_TEXTURE_DESCRIPTORS
+        : SG_BINDLESS_DEFAULT_VK_SAMPLER_DESCRIPTORS;
+    const int cap = (s->kind == SG_BINDLESS_KIND_TEXTURES)
+        ? _sgu_vk_bindless_state.max_textures
+        : _sgu_vk_bindless_state.max_samplers;
+    return (cap > 0 && def > cap) ? cap : def;
+}
+
+_SOKOL_PRIVATE bool _sgu_vk_bindless_validate(const char* fn, const sg_bindless_layout_desc* layout) {
+    _sgu_vk_bindless_query();
+    for (int i = 0; i < layout->num_slots; i++) {
+        const sg_bindless_slot_layout* s = &layout->slots[i];
+        const int expected_set = 2 + (int)s->slot;
+        if (s->vk_set_n != expected_set || s->vk_binding_n < 0) {
+            _sgu_accel_log("%s: slot %d invalid Vulkan set/binding (%d, %d); expected set %d",
+                fn, (int)s->slot, s->vk_set_n, s->vk_binding_n, expected_set);
+            return false;
+        }
+        const int max_cap = (s->kind == SG_BINDLESS_KIND_TEXTURES)
+            ? _sgu_vk_bindless_state.max_textures
+            : _sgu_vk_bindless_state.max_samplers;
+        if (s->vk_descriptor_count < 0 || (max_cap > 0 && s->vk_descriptor_count > max_cap)) {
+            _sgu_accel_log("%s: slot %d vk_descriptor_count %d out of range 0..%d",
+                fn, (int)s->slot, s->vk_descriptor_count, max_cap);
+            return false;
+        }
+    }
+    return true;
+}
+
+_SOKOL_PRIVATE bool _sgu_vk_bindless_make_table(sg_bindless_table t) {
+    const size_t desc_size = (t->kind == SG_BINDLESS_KIND_TEXTURES)
+        ? _sg.vk.descriptor_buffer_props.sampledImageDescriptorSize
+        : _sg.vk.descriptor_buffer_props.samplerDescriptorSize;
+    if (!desc_size || desc_size > _SG_VK_MAX_DESCRIPTOR_DATA_SIZE) return false;
+    t->native.desc_size = desc_size;
+    t->native.shadow = (uint8_t*)calloc((size_t)t->capacity, desc_size);
+    t->native.dirty = true;
+    return t->native.shadow != 0;
+}
+
+_SOKOL_PRIVATE void _sgu_vk_bindless_destroy_table(sg_bindless_table t) {
+    free(t->native.shadow);
+    memset(&t->native, 0, sizeof(t->native));
+}
+
+_SOKOL_PRIVATE void _sgu_vk_bindless_write_tex(sg_bindless_table t, int index, const _sg_view_t* view) {
+    memcpy(t->native.shadow + (size_t)index * t->native.desc_size, view->vk.descriptor_data, t->native.desc_size);
+    t->native.dirty = true;
+}
+
+_SOKOL_PRIVATE void _sgu_vk_bindless_write_smp(sg_bindless_table t, int index, const _sg_sampler_t* smp) {
+    memcpy(t->native.shadow + (size_t)index * t->native.desc_size, smp->vk.descriptor_data, t->native.desc_size);
+    t->native.dirty = true;
+}
+
+_SOKOL_PRIVATE void _sgu_vk_bindless_clear_entry(sg_bindless_table t, int index) {
+    memset(t->native.shadow + (size_t)index * t->native.desc_size, 0, t->native.desc_size);
+    t->native.dirty = true;
+}
+
+_SOKOL_PRIVATE bool _sgu_vk_bindless_prepare_table(sg_bindless_table t) {
+    if (t->kind != SG_BINDLESS_KIND_TEXTURES || t->high_water == 0) return true;
+    _sg_vk_acquire_frame_command_buffers();
+    VkCommandBuffer cmd = _sg.vk.frame.cmd_buf;
+    if (!cmd) return false;
+    for (int i = 0; i < t->high_water; i++) {
+        if (!t->entry_ids[i]) continue;
+        _sg_image_t* img = 0;
+        if (!_sgu_bindless_tex_view(_sgu_bindless_view_id(t->entry_ids[i]), &img)) continue;
+        const _sg_vk_access_t want = _sg_vk_default_image_access_mask(img);
+        if (img->vk.cur_access == want) continue;
+        _SG_STRUCT(VkImageMemoryBarrier2, b);
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        b.srcStageMask = _sg_vk_src_stage_mask(img->vk.cur_access);
+        b.srcAccessMask = _sg_vk_src_access_mask(img->vk.cur_access);
+        b.dstStageMask = _sg_vk_dst_stage_mask(want);
+        b.dstAccessMask = _sg_vk_dst_access_mask(want);
+        b.oldLayout = _sg_vk_image_layout(img->vk.cur_access);
+        b.newLayout = _sg_vk_image_layout(want);
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img->vk.img;
+        if (_sg_is_depth_or_depth_stencil_format(img->cmn.pixel_format)) {
+            b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (_sg_is_depth_stencil_format(img->cmn.pixel_format)) {
+                b.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            }
+        } else {
+            b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        }
+        b.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+        b.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+        _SG_STRUCT(VkDependencyInfo, dep);
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &dep);
+        img->vk.cur_access = want;
+    }
+    return true;
+}
+
+/* Rebuilds Set 1 (if accel or fstore has slots) and creates Sets 2..2+max_slot
+   (if bindless has slots), then replaces shd->vk.pip_layout in one atomic step. */
+_SOKOL_PRIVATE bool _sgu_vk_patch_shader_ext(sg_shader id,
+    const sg_accel_layout_desc* accel,
+    const sg_fragment_storage_layout_desc* fstore,
+    const sg_bindless_layout_desc* bindless,
+    _sgu_bindless_shd_native_t* out_bindless) {
+    _sg_shader_t* shd = _sg_lookup_shader(id.id);
+    if (!shd || shd->slot.state != SG_RESOURCESTATE_VALID) return false;
+    VkDevice dev = _sg.vk.dev;
+
+    VkDescriptorSetLayout new_set1 = 0;
+    const int accel_n = accel ? accel->num_slots : 0;
+    const int fstore_n = fstore ? fstore->num_slots : 0;
+    if (accel_n + fstore_n > 0) {
+        VkDescriptorSetLayoutBinding entries[SG_MAX_VIEW_BINDSLOTS + SG_MAX_SAMPLER_BINDSLOTS + _SGU_VK_MAX_EXTRA_BINDINGS];
+        memset(entries, 0, sizeof(entries));
+        uint32_t n = 0;
+        for (int i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
+            if (shd->cmn.views[i].stage == SG_SHADERSTAGE_NONE) continue;
+            VkDescriptorSetLayoutBinding* e = &entries[n++];
+            e->binding = shd->vk.view_set1_bnd_n[i];
+            e->descriptorCount = 1;
+            e->stageFlags = _sg_vk_shader_stage(shd->cmn.views[i].stage);
+            e->descriptorType = shd->cmn.views[i].view_type == SG_VIEWTYPE_TEXTURE ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+                : (shd->cmn.views[i].view_type == SG_VIEWTYPE_STORAGEBUFFER ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        }
+        for (int i = 0; i < SG_MAX_SAMPLER_BINDSLOTS; i++) {
+            if (shd->cmn.samplers[i].stage == SG_SHADERSTAGE_NONE) continue;
+            VkDescriptorSetLayoutBinding* e = &entries[n++];
+            e->binding = shd->vk.smp_set1_bnd_n[i];
+            e->descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            e->descriptorCount = 1;
+            e->stageFlags = _sg_vk_shader_stage(shd->cmn.samplers[i].stage);
+        }
+        for (int i = 0; i < accel_n; i++) {
+            VkDescriptorSetLayoutBinding* e = &entries[n++];
+            e->binding = (uint32_t)accel->slots[i].vk_binding_n;
+            e->descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            e->descriptorCount = 1;
+            e->stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        for (int i = 0; i < fstore_n; i++) {
+            VkDescriptorSetLayoutBinding* e = &entries[n++];
+            e->binding = (uint32_t)fstore->slots[i].vk_binding_n;
+            e->descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            e->descriptorCount = 1;
+            e->stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        _SG_STRUCT(VkDescriptorSetLayoutCreateInfo, dsl_info);
+        dsl_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dsl_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+        dsl_info.bindingCount = n;
+        dsl_info.pBindings = entries;
+        if (vkCreateDescriptorSetLayout(dev, &dsl_info, 0, &new_set1) != VK_SUCCESS) {
+            _SG_ERROR(VULKAN_CREATE_DESCRIPTOR_SET_LAYOUT_FAILED);
+            return false;
+        }
+    }
+
+    memset(out_bindless, 0, sizeof(*out_bindless));
+    int max_bindless_slot = -1;
+    if (bindless) {
+        for (int i = 0; i < bindless->num_slots; i++) {
+            if ((int)bindless->slots[i].slot > max_bindless_slot) {
+                max_bindless_slot = (int)bindless->slots[i].slot;
+            }
+        }
+    }
+    const int extra_sets = max_bindless_slot + 1;
+    for (int s = 0; s < extra_sets; s++) {
+        const sg_bindless_slot_layout* found = 0;
+        for (int i = 0; i < bindless->num_slots; i++) {
+            if ((int)bindless->slots[i].slot == s) {
+                found = &bindless->slots[i];
+                break;
+            }
+        }
+        _SG_STRUCT(VkDescriptorSetLayoutBinding, bnd);
+        _SG_STRUCT(VkDescriptorSetLayoutBindingFlagsCreateInfo, flags_info);
+        VkDescriptorBindingFlags bnd_flags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+        _SG_STRUCT(VkDescriptorSetLayoutCreateInfo, dsl_info);
+        dsl_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dsl_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+        if (found) {
+            bnd.binding = (uint32_t)found->vk_binding_n;
+            bnd.descriptorType = (found->kind == SG_BINDLESS_KIND_TEXTURES)
+                ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+                : VK_DESCRIPTOR_TYPE_SAMPLER;
+            bnd.descriptorCount = (uint32_t)_sgu_vk_bindless_effective_count(found);
+            bnd.stageFlags = _sg_vk_shader_stage(found->stage);
+            flags_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+            flags_info.bindingCount = 1;
+            flags_info.pBindingFlags = &bnd_flags;
+            dsl_info.pNext = &flags_info;
+            dsl_info.bindingCount = 1;
+            dsl_info.pBindings = &bnd;
+        }
+        if (vkCreateDescriptorSetLayout(dev, &dsl_info, 0, &out_bindless->dsl[s]) != VK_SUCCESS) {
+            _SG_ERROR(VULKAN_CREATE_DESCRIPTOR_SET_LAYOUT_FAILED);
+            for (int k = 0; k < s; k++) vkDestroyDescriptorSetLayout(dev, out_bindless->dsl[k], 0);
+            if (new_set1) vkDestroyDescriptorSetLayout(dev, new_set1, 0);
+            memset(out_bindless, 0, sizeof(*out_bindless));
+            return false;
+        }
+        _sg.vk.ext.get_descriptor_set_layout_size(dev, out_bindless->dsl[s], &out_bindless->dset_size[s]);
+        out_bindless->dsl_count = s + 1;
+    }
+
+    VkDescriptorSetLayout set_layouts[2 + SG_BINDLESS_MAX_SLOTS];
+    set_layouts[0] = shd->vk.ub_dsl;
+    set_layouts[1] = new_set1 ? new_set1 : shd->vk.view_smp_dsl;
+    for (int s = 0; s < extra_sets; s++) {
+        set_layouts[2 + s] = out_bindless->dsl[s];
+    }
+    _SG_STRUCT(VkPipelineLayoutCreateInfo, pl_info);
+    pl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl_info.setLayoutCount = (uint32_t)(2 + extra_sets);
+    pl_info.pSetLayouts = set_layouts;
+    VkPipelineLayout pipeline_layout = 0;
+    if (vkCreatePipelineLayout(dev, &pl_info, 0, &pipeline_layout) != VK_SUCCESS) {
+        _SG_ERROR(VULKAN_CREATE_PIPELINE_LAYOUT_FAILED);
+        for (int s = 0; s < extra_sets; s++) vkDestroyDescriptorSetLayout(dev, out_bindless->dsl[s], 0);
+        if (new_set1) vkDestroyDescriptorSetLayout(dev, new_set1, 0);
+        memset(out_bindless, 0, sizeof(*out_bindless));
+        return false;
+    }
+
+    vkDestroyPipelineLayout(dev, shd->vk.pip_layout, 0);
+    shd->vk.pip_layout = pipeline_layout;
+    if (new_set1) {
+        vkDestroyDescriptorSetLayout(dev, shd->vk.view_smp_dsl, 0);
+        shd->vk.view_smp_dsl = new_set1;
+        _sg.vk.ext.get_descriptor_set_layout_size(dev, new_set1, &shd->vk.view_smp_dset_size);
+        for (int i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
+            if (shd->cmn.views[i].stage == SG_SHADERSTAGE_NONE) continue;
+            VkDeviceSize offset = 0;
+            _sg.vk.ext.get_descriptor_set_layout_binding_offset(dev, new_set1, shd->vk.view_set1_bnd_n[i], &offset);
+            shd->vk.view_dset_offsets[i] = (uint16_t)offset;
+        }
+        for (int i = 0; i < SG_MAX_SAMPLER_BINDSLOTS; i++) {
+            if (shd->cmn.samplers[i].stage == SG_SHADERSTAGE_NONE) continue;
+            VkDeviceSize offset = 0;
+            _sg.vk.ext.get_descriptor_set_layout_binding_offset(dev, new_set1, shd->vk.smp_set1_bnd_n[i], &offset);
+            shd->vk.smp_dset_offsets[i] = (uint16_t)offset;
+        }
+    }
+    return true;
+}
+
+_SOKOL_PRIVATE bool _sgu_vk_bindless_bind(sg_bindless_table t, int slot) {
+    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+    if (!pip || _sgu_skip_draw()) return false;
+    const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+    if (!shd || !_sg.vk.bind.cur_mem_ptr || _sg.vk.bind.overflown) return false;
+    const int shd_idx = _sgu_bindless_find_shader(shd->slot.id);
+    const sg_bindless_slot_layout* sl = _sgu_bindless_find_slot(shd_idx, slot);
+    if (!sl || sl->kind != t->kind) return false;
+    const _sgu_bindless_shd_native_t* snat = &_sgu_bindless_shaders.native[shd_idx];
+    if (slot >= snat->dsl_count || !snat->dsl[slot]) return false;
+
+    const VkDeviceSize dset_size = snat->dset_size[slot];
+    if (!dset_size || dset_size > UINT32_MAX) return false;
+    VkDeviceSize binding_offset = 0;
+    _sg.vk.ext.get_descriptor_set_layout_binding_offset(
+        _sg.vk.dev, snat->dsl[slot], (uint32_t)sl->vk_binding_n, &binding_offset);
+
+    VkDeviceSize dbuf_offset = 0;
+    if (!t->native.dirty && t->native.has_cached &&
+        t->native.cached_frame == _sg.frame_index &&
+        t->native.cached_dset_bytes >= (uint32_t)dset_size) {
+        dbuf_offset = t->native.cached_dbuf_offset;
+    } else {
+        dbuf_offset = _sg_vk_shared_buffer_alloc(&_sg.vk.bind, (uint32_t)dset_size);
+        if (_sg.vk.bind.overflown) {
+            _SG_ERROR(VULKAN_DESCRIPTOR_BUFFER_OVERFLOW);
+            return false;
+        }
+        uint8_t* dst = _sg_vk_shared_buffer_ptr(&_sg.vk.bind, dbuf_offset);
+        const size_t max_avail = dset_size > binding_offset ? (size_t)(dset_size - binding_offset) : 0;
+        size_t copy_bytes = (size_t)t->high_water * t->native.desc_size;
+        if (copy_bytes > max_avail) copy_bytes = max_avail;
+        if (binding_offset > 0) memset(dst, 0, (size_t)binding_offset);
+        if (copy_bytes > 0) memcpy(dst + binding_offset, t->native.shadow, copy_bytes);
+        if ((size_t)binding_offset + copy_bytes < (size_t)dset_size) {
+            memset(dst + binding_offset + copy_bytes, 0, (size_t)dset_size - ((size_t)binding_offset + copy_bytes));
+        }
+        t->native.cached_frame = _sg.frame_index;
+        t->native.cached_dset_bytes = (uint32_t)dset_size;
+        t->native.cached_dbuf_offset = dbuf_offset;
+        t->native.has_cached = true;
+        t->native.dirty = false;
+    }
+
+    const uint32_t dbuf_index = 0;
+    const VkPipelineBindPoint bp = _sg.cur_pass.is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS;
+    _sg.vk.ext.cmd_set_descriptor_buffer_offsets(
+        _sg.vk.frame.cmd_buf, bp, shd->vk.pip_layout, (uint32_t)sl->vk_set_n, 1, &dbuf_index, &dbuf_offset);
+    return true;
+}
+
+#endif /* SOKOL_VULKAN */
+
+/*--- Bindless Tables: Metal -------------------------------------------------*/
+#if defined(SOKOL_METAL)
+
+_SOKOL_PRIVATE bool _sgu_mtl_bindless_supported(void) {
+    if (!_sg.mtl.device) return false;
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        return [_sg.mtl.device argumentBuffersSupport] == MTLArgumentBuffersTier2;
+    }
+    return false;
+}
+
+_SOKOL_PRIVATE bool _sgu_mtl_bindless_validate(const char* fn, const sg_shader_desc* desc,
+    const sg_accel_layout_desc* opt_accel, const sg_bindless_layout_desc* layout) {
+    for (int i = 0; i < layout->num_slots; i++) {
+        const sg_bindless_slot_layout* s = &layout->slots[i];
+        const int n = s->msl_buffer_n;
+        const int max_n = (s->stage == SG_SHADERSTAGE_VERTEX)
+            ? (_SG_MTL_MAX_STAGE_UB_SBUF_BINDINGS - 1)
+            : _SGU_MTL_MAX_BUFFER_N;
+        if (n < SG_MAX_UNIFORMBLOCK_BINDSLOTS || n > max_n) {
+            _sgu_accel_log("%s: slot %d msl_buffer_n %d is not in %d..%d",
+                fn, (int)s->slot, n, SG_MAX_UNIFORMBLOCK_BINDSLOTS, max_n);
+            return false;
+        }
+        for (int j = 0; j < i; j++) {
+            if (layout->slots[j].stage == s->stage && layout->slots[j].msl_buffer_n == n) {
+                _sgu_accel_log("%s: slots %d and %d share msl_buffer_n %d on stage %d",
+                    fn, (int)layout->slots[j].slot, (int)s->slot, n, (int)s->stage);
+                return false;
+            }
+        }
+        for (int j = 0; j < SG_MAX_UNIFORMBLOCK_BINDSLOTS; j++) {
+            const sg_shader_uniform_block* ub = &desc->uniform_blocks[j];
+            if (ub->stage == s->stage && ub->msl_buffer_n == n) {
+                _sgu_accel_log("%s: slot %d msl_buffer_n %d collides with uniform block %d",
+                    fn, (int)s->slot, n, j);
+                return false;
+            }
+        }
+        for (int j = 0; j < SG_MAX_VIEW_BINDSLOTS; j++) {
+            const sg_shader_storage_buffer_view* sbuf = &desc->views[j].storage_buffer;
+            if (sbuf->stage == s->stage && sbuf->msl_buffer_n == n) {
+                _sgu_accel_log("%s: slot %d msl_buffer_n %d collides with storage buffer view %d",
+                    fn, (int)s->slot, n, j);
+                return false;
+            }
+        }
+        if (opt_accel && s->stage == SG_SHADERSTAGE_COMPUTE) {
+            for (int j = 0; j < opt_accel->num_slots; j++) {
+                if (opt_accel->slots[j].msl_buffer_n == n) {
+                    _sgu_accel_log("%s: bindless slot %d msl_buffer_n %d collides with accel slot %d",
+                        fn, (int)s->slot, n, (int)opt_accel->slots[j].slot);
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+_SOKOL_PRIVATE bool _sgu_mtl_bindless_make_table(sg_bindless_table t, const char* label) {
+    if (@available(macOS 12.0, iOS 15.0, *)) @autoreleasepool {
+        _sgu_mtl_accel_collect(false);
+        MTLArgumentDescriptor* arg = [MTLArgumentDescriptor argumentDescriptor];
+        arg.index = 0;
+        arg.dataType = (t->kind == SG_BINDLESS_KIND_TEXTURES) ? MTLDataTypeTexture : MTLDataTypeSampler;
+        arg.access = MTLBindingAccessReadOnly;
+        arg.arrayLength = 0;
+        if (t->kind == SG_BINDLESS_KIND_TEXTURES) {
+            arg.textureType = MTLTextureType2D;
+        }
+        id<MTLArgumentEncoder> enc = [_sg.mtl.device newArgumentEncoderWithArguments:@[arg]];
+        if (nil == enc) return false;
+        const size_t stride = (size_t)[enc encodedLength];
+        if (stride == 0) {
+            _SGU_MTL_DROP(enc);
+            return false;
+        }
+        NSUInteger total_bytes = (NSUInteger)(stride * (size_t)t->capacity);
+        if (total_bytes < 16u) total_bytes = 16u;
+        id<MTLBuffer> staging = [_sg.mtl.device newBufferWithLength:total_bytes options:MTLResourceStorageModeShared];
+        if (nil == staging) {
+            _SGU_MTL_DROP(enc);
+            return false;
+        }
+        memset([staging contents], 0, total_bytes);
+        t->native.encoder = _SGU_MTL_RETAIN(enc);
+        _SGU_MTL_DROP(enc);
+        t->native.staging = _SGU_MTL_RETAIN(staging);
+        _SGU_MTL_DROP(staging);
+        t->native.stride = stride;
+        t->native.generation = 1;
+        for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) {
+            id<MTLBuffer> rbuf = [_sg.mtl.device newBufferWithLength:total_bytes options:MTLResourceStorageModeShared];
+            if (nil == rbuf) return false;
+            memset([rbuf contents], 0, total_bytes);
+            #if defined(SOKOL_DEBUG)
+            if (label) rbuf.label = [NSString stringWithUTF8String:label];
+            #else
+            (void)label;
+            #endif
+            t->native.ring[i] = _SGU_MTL_RETAIN(rbuf);
+            _SGU_MTL_DROP(rbuf);
+        }
+        return true;
+    }
+    (void)t; (void)label;
+    return false;
+}
+
+_SOKOL_PRIVATE void _sgu_mtl_bindless_destroy_table(sg_bindless_table t) {
+    _sgu_mtl_accel_collect(false);
+    _sgu_mtl_accel_defer(t->native.encoder);
+    _sgu_mtl_accel_defer(t->native.staging);
+    for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) {
+        _sgu_mtl_accel_defer(t->native.ring[i]);
+    }
+    memset(&t->native, 0, sizeof(t->native));
+}
+
+_SOKOL_PRIVATE void _sgu_mtl_bindless_write_tex(sg_bindless_table t, int index, const _sg_view_t* view, const _sg_image_t* img) {
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        id<MTLArgumentEncoder> enc = _SGU_MTL_OBJ(id<MTLArgumentEncoder>, t->native.encoder);
+        id<MTLBuffer> staging = _SGU_MTL_OBJ(id<MTLBuffer>, t->native.staging);
+        id<MTLTexture> tex = _sg_mtl_id(view->mtl.tex_view[img->cmn.active_slot]);
+        [enc setArgumentBuffer:staging startOffset:0 arrayElement:(NSUInteger)index];
+        [enc setTexture:tex atIndex:0];
+        t->native.generation++;
+        if (t->native.generation == 0) t->native.generation = 1;
+    }
+}
+
+_SOKOL_PRIVATE void _sgu_mtl_bindless_write_smp(sg_bindless_table t, int index, const _sg_sampler_t* smp) {
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        id<MTLArgumentEncoder> enc = _SGU_MTL_OBJ(id<MTLArgumentEncoder>, t->native.encoder);
+        id<MTLBuffer> staging = _SGU_MTL_OBJ(id<MTLBuffer>, t->native.staging);
+        id<MTLSamplerState> mtl_smp = _sg_mtl_id(smp->mtl.sampler_state);
+        [enc setArgumentBuffer:staging startOffset:0 arrayElement:(NSUInteger)index];
+        [enc setSamplerState:mtl_smp atIndex:0];
+        t->native.generation++;
+        if (t->native.generation == 0) t->native.generation = 1;
+    }
+}
+
+_SOKOL_PRIVATE void _sgu_mtl_bindless_clear_entry(sg_bindless_table t, int index) {
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        id<MTLBuffer> staging = _SGU_MTL_OBJ(id<MTLBuffer>, t->native.staging);
+        uint8_t* ptr = (uint8_t*)[staging contents];
+        memset(ptr + (size_t)index * t->native.stride, 0, t->native.stride);
+        t->native.generation++;
+        if (t->native.generation == 0) t->native.generation = 1;
+    }
+}
+
+_SOKOL_PRIVATE bool _sgu_mtl_bindless_bind(sg_bindless_table t, int slot) {
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+        if (!pip) return false;
+        const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+        if (!shd) return false;
+        const int shd_idx = _sgu_bindless_find_shader(shd->slot.id);
+        const sg_bindless_slot_layout* sl = _sgu_bindless_find_slot(shd_idx, slot);
+        if (!sl || sl->kind != t->kind || sl->msl_buffer_n < 0) return false;
+        if (_sg.cur_pass.is_compute != (sl->stage == SG_SHADERSTAGE_COMPUTE)) return false;
+
+        _sgu_mtl_accel_collect(false);
+        const uint32_t ring_idx = _sg.mtl.cur_frame_rotate_index;
+        id<MTLBuffer> staging = _SGU_MTL_OBJ(id<MTLBuffer>, t->native.staging);
+        id<MTLBuffer> arg_buf = _SGU_MTL_OBJ(id<MTLBuffer>, t->native.ring[ring_idx]);
+        if (!t->native.synced_valid[ring_idx] || t->native.synced_gen[ring_idx] != t->native.generation) {
+            if (t->native.synced_valid[ring_idx] && t->native.synced_frame[ring_idx] == _sg.frame_index) {
+                /* Table mutated mid-frame after an earlier bind: allocate a new buffer so prior draws stay intact. */
+                id<MTLBuffer> fresh = [_sg.mtl.device newBufferWithLength:staging.length options:MTLResourceStorageModeShared];
+                if (nil == fresh) return false;
+                _sgu_mtl_accel_defer(t->native.ring[ring_idx]);
+                t->native.ring[ring_idx] = _SGU_MTL_RETAIN(fresh);
+                _SGU_MTL_DROP(fresh);
+                arg_buf = _SGU_MTL_OBJ(id<MTLBuffer>, t->native.ring[ring_idx]);
+                memcpy([arg_buf contents], [staging contents], staging.length);
+            } else {
+                const size_t active_bytes = (size_t)t->high_water * t->native.stride;
+                if (active_bytes > 0) {
+                    memcpy([arg_buf contents], [staging contents], active_bytes);
+                }
+            }
+            t->native.synced_gen[ring_idx] = t->native.generation;
+            t->native.synced_valid[ring_idx] = true;
+        }
+        t->native.synced_frame[ring_idx] = _sg.frame_index;
+
+        const NSUInteger buf_n = (NSUInteger)sl->msl_buffer_n;
+        if (sl->stage == SG_SHADERSTAGE_COMPUTE) {
+            id<MTLComputeCommandEncoder> enc = _sg.mtl.compute_cmd_encoder;
+            if (nil == enc) return false;
+            [enc setBuffer:arg_buf offset:0 atIndex:buf_n];
+            memset(&_sg.mtl.cache.cur_csbufs[buf_n], 0, sizeof(_sg.mtl.cache.cur_csbufs[buf_n]));
+            if (t->kind == SG_BINDLESS_KIND_TEXTURES && t->high_water > 0) {
+                #if __has_feature(objc_arc)
+                __unsafe_unretained id<MTLResource> batch[64];
+                #else
+                id<MTLResource> batch[64];
+                #endif
+                NSUInteger count = 0;
+                for (int i = 0; i < t->high_water; i++) {
+                    if (!t->entry_ids[i]) continue;
+                    _sg_image_t* img = 0;
+                    _sg_view_t* view = _sgu_bindless_tex_view(_sgu_bindless_view_id(t->entry_ids[i]), &img);
+                    if (!view) continue;
+                    id<MTLResource> res = _sg_mtl_id(view->mtl.tex_view[img->cmn.active_slot]);
+                    if (nil == res) continue;
+                    batch[count++] = res;
+                    if (count == 64u) {
+                        [enc useResources:batch count:count usage:MTLResourceUsageRead];
+                        count = 0;
+                    }
+                }
+                if (count > 0) [enc useResources:batch count:count usage:MTLResourceUsageRead];
+            }
+        } else {
+            id<MTLRenderCommandEncoder> enc = _sg.mtl.render_cmd_encoder;
+            if (nil == enc || _sgu_skip_draw()) return false;
+            const MTLRenderStages mtl_stage = (sl->stage == SG_SHADERSTAGE_VERTEX) ? MTLRenderStageVertex : MTLRenderStageFragment;
+            if (sl->stage == SG_SHADERSTAGE_VERTEX) {
+                [enc setVertexBuffer:arg_buf offset:0 atIndex:buf_n];
+                memset(&_sg.mtl.cache.cur_vsbufs[buf_n], 0, sizeof(_sg.mtl.cache.cur_vsbufs[buf_n]));
+            } else {
+                [enc setFragmentBuffer:arg_buf offset:0 atIndex:buf_n];
+                memset(&_sg.mtl.cache.cur_fsbufs[buf_n], 0, sizeof(_sg.mtl.cache.cur_fsbufs[buf_n]));
+            }
+            if (t->kind == SG_BINDLESS_KIND_TEXTURES && t->high_water > 0) {
+                #if __has_feature(objc_arc)
+                __unsafe_unretained id<MTLResource> batch[64];
+                #else
+                id<MTLResource> batch[64];
+                #endif
+                NSUInteger count = 0;
+                for (int i = 0; i < t->high_water; i++) {
+                    if (!t->entry_ids[i]) continue;
+                    _sg_image_t* img = 0;
+                    _sg_view_t* view = _sgu_bindless_tex_view(_sgu_bindless_view_id(t->entry_ids[i]), &img);
+                    if (!view) continue;
+                    id<MTLResource> res = _sg_mtl_id(view->mtl.tex_view[img->cmn.active_slot]);
+                    if (nil == res) continue;
+                    batch[count++] = res;
+                    if (count == 64u) {
+                        [enc useResources:batch count:count usage:MTLResourceUsageRead stages:mtl_stage];
+                        count = 0;
+                    }
+                }
+                if (count > 0) [enc useResources:batch count:count usage:MTLResourceUsageRead stages:mtl_stage];
+            }
+        }
+        return true;
+    }
+    (void)t; (void)slot;
+    return false;
+}
+
+#endif /* SOKOL_METAL */
+
+/*--- Bindless Tables: Public API --------------------------------------------*/
+
+SOKOL_API_IMPL bool sg_bindless_supported(void) {
+    if (!sg_isvalid()) return false;
+    #if defined(SOKOL_VULKAN)
+    _sgu_vk_bindless_query();
+    return _sgu_vk_bindless_state.supported;
+    #elif defined(SOKOL_METAL)
+    return _sgu_mtl_bindless_supported();
+    #else
+    return false;
+    #endif
+}
+
+SOKOL_API_IMPL int sg_bindless_max_capacity(sg_bindless_kind kind) {
+    if ((int)kind < (int)SG_BINDLESS_KIND_TEXTURES || (int)kind > (int)SG_BINDLESS_KIND_SAMPLERS) return 0;
+    if (!sg_bindless_supported()) return 0;
+    #if defined(SOKOL_VULKAN)
+    return (kind == SG_BINDLESS_KIND_TEXTURES) ? _sgu_vk_bindless_state.max_textures : _sgu_vk_bindless_state.max_samplers;
+    #elif defined(SOKOL_METAL)
+    return (kind == SG_BINDLESS_KIND_TEXTURES) ? _SGU_BINDLESS_MTL_MAX_TEXTURES : _SGU_BINDLESS_MTL_MAX_SAMPLERS;
+    #else
+    return 0;
+    #endif
+}
+
+SOKOL_API_IMPL sg_bindless_table sg_make_bindless_table(const sg_bindless_table_desc* desc) {
+    if (!desc || !sg_bindless_supported()) return NULL;
+    const int max_cap = sg_bindless_max_capacity(desc->kind);
+    if (desc->capacity < 1 || desc->capacity > max_cap) return NULL;
+    sg_bindless_table t = (sg_bindless_table)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    t->kind = desc->kind;
+    t->capacity = desc->capacity;
+    t->entry_ids = (uint32_t*)calloc((size_t)desc->capacity, sizeof(uint32_t));
+    if (!t->entry_ids) { free(t); return NULL; }
+    bool ok = false;
+    #if defined(SOKOL_VULKAN)
+    (void)desc->label;
+    ok = _sgu_vk_bindless_make_table(t);
+    #elif defined(SOKOL_METAL)
+    ok = _sgu_mtl_bindless_make_table(t, desc->label);
+    #endif
+    if (!ok) {
+        free(t->entry_ids);
+        free(t);
+        return NULL;
+    }
+    _sgu_bindless_down = false;
+    return t;
+}
+
+SOKOL_API_IMPL void sg_destroy_bindless_table(sg_bindless_table table) {
+    if (!table || _sgu_bindless_down) return;
+    #if defined(SOKOL_VULKAN)
+    _sgu_vk_bindless_destroy_table(table);
+    #elif defined(SOKOL_METAL)
+    _sgu_mtl_bindless_destroy_table(table);
+    #endif
+    free(table->entry_ids);
+    free(table);
+}
+
+SOKOL_API_IMPL bool sg_bindless_set_texture(sg_bindless_table table, int index, sg_view tex_view) {
+    if (!table || _sgu_bindless_down || table->kind != SG_BINDLESS_KIND_TEXTURES) return false;
+    if (index < 0 || index >= table->capacity) return false;
+    _sg_image_t* img = 0;
+    _sg_view_t* view = _sgu_bindless_tex_view(tex_view, &img);
+    if (!view) return false;
+    table->entry_ids[index] = tex_view.id;
+    if (index + 1 > table->high_water) table->high_water = index + 1;
+    #if defined(SOKOL_VULKAN)
+    (void)img;
+    _sgu_vk_bindless_write_tex(table, index, view);
+    #elif defined(SOKOL_METAL)
+    _sgu_mtl_bindless_write_tex(table, index, view, img);
+    #endif
+    return true;
+}
+
+SOKOL_API_IMPL bool sg_bindless_set_sampler(sg_bindless_table table, int index, sg_sampler smp) {
+    if (!table || _sgu_bindless_down || table->kind != SG_BINDLESS_KIND_SAMPLERS) return false;
+    if (index < 0 || index >= table->capacity) return false;
+    _sg_sampler_t* s = _sgu_bindless_sampler(smp);
+    if (!s) return false;
+    table->entry_ids[index] = smp.id;
+    if (index + 1 > table->high_water) table->high_water = index + 1;
+    #if defined(SOKOL_VULKAN)
+    _sgu_vk_bindless_write_smp(table, index, s);
+    #elif defined(SOKOL_METAL)
+    _sgu_mtl_bindless_write_smp(table, index, s);
+    #endif
+    return true;
+}
+
+SOKOL_API_IMPL bool sg_bindless_clear_entry(sg_bindless_table table, int index) {
+    if (!table || _sgu_bindless_down || index < 0 || index >= table->capacity) return false;
+    table->entry_ids[index] = 0;
+    while (table->high_water > 0 && table->entry_ids[table->high_water - 1] == 0) {
+        table->high_water--;
+    }
+    #if defined(SOKOL_VULKAN)
+    _sgu_vk_bindless_clear_entry(table, index);
+    #elif defined(SOKOL_METAL)
+    _sgu_mtl_bindless_clear_entry(table, index);
+    #endif
+    return true;
+}
+
+SOKOL_API_IMPL bool sg_bindless_prepare_table(sg_bindless_table table) {
+    if (!table || _sgu_bindless_down || !sg_bindless_supported() || _sg.cur_pass.in_pass) return false;
+    #if defined(SOKOL_VULKAN)
+    return _sgu_vk_bindless_prepare_table(table);
+    #else
+    return true;
+    #endif
+}
+
+SOKOL_API_IMPL sg_shader sg_make_shader_ext(const sg_shader_desc* desc, const sg_shader_ext_desc* ext) {
+    const sg_shader invalid = { SG_INVALID_ID };
+    if (!desc) return invalid;
+    if (!ext) return sg_make_shader(desc);
+
+    const sg_accel_layout_desc* accel = (ext->accel && ext->accel->num_slots > 0) ? ext->accel : 0;
+    const sg_fragment_storage_layout_desc* fstore = (ext->fragment_storage && ext->fragment_storage->num_slots > 0) ? ext->fragment_storage : 0;
+    const sg_bindless_layout_desc* bindless = (ext->bindless && ext->bindless->num_slots > 0) ? ext->bindless : 0;
+
+    if (ext->accel && !_sgu_accel_validate_slots(ext->accel)) return invalid;
+    if (ext->fragment_storage && !_sgu_fstore_validate_slots(ext->fragment_storage)) return invalid;
+    if (ext->bindless && !_sgu_bindless_validate_slots("sg_make_shader_ext", desc, ext->bindless)) return invalid;
+    if (!accel && !fstore && !bindless) return sg_make_shader(desc);
+
+    const bool is_compute = (desc->compute_func.source != 0 || desc->compute_func.bytecode.ptr != 0);
+    if (accel && !is_compute) {
+        _sgu_accel_log("sg_make_shader_ext: acceleration structures require a compute shader");
+        return invalid;
+    }
+    if (fstore && is_compute) {
+        _sgu_accel_log("sg_make_shader_ext: fragment storage images require a render shader");
+        return invalid;
+    }
+    if (accel && !sg_ray_query_supported()) return invalid;
+    if (fstore && !sg_fragment_storage_supported()) return invalid;
+    if (bindless && !sg_bindless_supported()) {
+        _sgu_accel_log("sg_make_shader_ext: bindless tables are not supported on this backend/device");
+        return invalid;
+    }
+
+    #if defined(SOKOL_VULKAN)
+    if (accel && !_sgu_vk_accel_validate("sg_make_shader_ext", desc, accel)) return invalid;
+    if (fstore && !_sgu_vk_fstore_validate(desc, fstore)) return invalid;
+    if (bindless && !_sgu_vk_bindless_validate("sg_make_shader_ext", bindless)) return invalid;
+    #elif defined(SOKOL_METAL)
+    if (accel && !_sgu_mtl_accel_validate(desc, accel)) return invalid;
+    if (fstore && !_sgu_mtl_fstore_validate(desc, fstore)) return invalid;
+    if (bindless && !_sgu_mtl_bindless_validate("sg_make_shader_ext", desc, accel, bindless)) return invalid;
+    #endif
+
+    if (accel) {
+        _sgu_accel_prune_shaders();
+        if (_sgu_accel_shaders.count >= _SGU_ACCEL_MAX_SHADERS) return invalid;
+    }
+    if (fstore) {
+        _sgu_fstore_prune_shaders();
+        if (_sgu_fstore_shaders.count >= _SGU_FSTORE_MAX_SHADERS) return invalid;
+    }
+    if (bindless) {
+        _sgu_bindless_prune_shaders();
+        if (_sgu_bindless_shaders.count >= _SGU_BINDLESS_MAX_SHADERS) return invalid;
+    }
+
+    sg_shader shader = sg_make_shader(desc);
+    if (shader.id == SG_INVALID_ID) return shader;
+
+    _sgu_bindless_shd_native_t bnat;
+    memset(&bnat, 0, sizeof(bnat));
+    #if defined(SOKOL_VULKAN)
+    if (!_sgu_vk_patch_shader_ext(shader, accel, fstore, bindless, &bnat)) {
+        sg_destroy_shader(shader);
+        return invalid;
+    }
+    #endif
+
+    if (accel) {
+        _sgu_accel_shaders.id[_sgu_accel_shaders.count] = shader.id;
+        _sgu_accel_shaders.layout[_sgu_accel_shaders.count] = *accel;
+        _sgu_accel_shaders.count++;
+    }
+    if (fstore) {
+        _sgu_fstore_shaders.id[_sgu_fstore_shaders.count] = shader.id;
+        _sgu_fstore_shaders.layout[_sgu_fstore_shaders.count] = *fstore;
+        _sgu_fstore_shaders.count++;
+    }
+    if (bindless) {
+        _sgu_bindless_shaders.id[_sgu_bindless_shaders.count] = shader.id;
+        _sgu_bindless_shaders.layout[_sgu_bindless_shaders.count] = *bindless;
+        _sgu_bindless_shaders.native[_sgu_bindless_shaders.count] = bnat;
+        _sgu_bindless_shaders.count++;
+    }
+    return shader;
+}
+
+SOKOL_API_IMPL sg_shader sg_make_shader_bindless(const sg_shader_desc* desc, const sg_bindless_layout_desc* layout) {
+    sg_shader_ext_desc ext;
+    memset(&ext, 0, sizeof(ext));
+    ext.bindless = layout;
+    return sg_make_shader_ext(desc, &ext);
+}
+
+SOKOL_API_IMPL bool sg_bindless_bind(sg_bindless_table table, int slot) {
+    if (!table || _sgu_bindless_down || slot < 0 || slot >= SG_BINDLESS_MAX_SLOTS || !sg_bindless_supported()) return false;
+    if (!_sg.cur_pass.valid || !_sg.cur_pass.in_pass) return false;
+    #if defined(SOKOL_VULKAN)
+    return _sgu_vk_bindless_bind(table, slot);
+    #elif defined(SOKOL_METAL)
+    return _sgu_mtl_bindless_bind(table, slot);
+    #else
+    return false;
+    #endif
+}
+
+SOKOL_API_IMPL void sg_bindless_shutdown(void) {
+    for (int i = 0; i < _sgu_bindless_shaders.count; i++) {
+        _sgu_bindless_free_shd_native(&_sgu_bindless_shaders.native[i]);
+    }
+    memset(&_sgu_bindless_shaders, 0, sizeof(_sgu_bindless_shaders));
+    #if defined(SOKOL_VULKAN)
+    memset(&_sgu_vk_bindless_state, 0, sizeof(_sgu_vk_bindless_state));
+    #endif
+    _sgu_bindless_down = true;
 }
 
 /*-- ASYNC COMPUTE QUEUE -----------------------------------------------------*/
