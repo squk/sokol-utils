@@ -3716,10 +3716,13 @@ static struct {
 } _sgu_mtl_accel_garbage;
 
 _SOKOL_PRIVATE void _sgu_mtl_accel_collect(bool all) {
+    /* Callers may run before _sg_mtl_acquire_cmd_buffer() waits on _sg.mtl.sem
+       for the current frame. Keep objects one extra frame so frame item.frame
+       has always finished on the GPU before release. */
     int keep = 0;
     for (int i = 0; i < _sgu_mtl_accel_garbage.count; i++) {
         _sgu_mtl_accel_garbage_t item = _sgu_mtl_accel_garbage.items[i];
-        if (all || (uint32_t)(_sg.frame_index - item.frame) > (uint32_t)SG_NUM_INFLIGHT_FRAMES) {
+        if (all || (uint32_t)(_sg.frame_index - item.frame) > (uint32_t)(SG_NUM_INFLIGHT_FRAMES + 1)) {
             _SGU_MTL_RELEASE(item.obj);
         } else {
             _sgu_mtl_accel_garbage.items[keep++] = item;
@@ -5989,7 +5992,7 @@ void sg_async_compute_shutdown(void) {
     if (_sgu_async_mtl.in_pass) sg_end_async_compute_pass();
     if (_sgu_async_mtl.cmd_buffer) {
         [_sgu_async_mtl.cmd_buffer commit];
-        _sgu_async_mtl.cmd_buffer = nil;
+        _SG_OBJC_RELEASE(_sgu_async_mtl.cmd_buffer);
     }
     _SG_OBJC_RELEASE(_sgu_async_mtl.event);
     _SG_OBJC_RELEASE(_sgu_async_mtl.queue);
@@ -6004,9 +6007,13 @@ bool sg_async_compute_supported(void) {
 bool sg_begin_async_compute_pass(const char* label) {
     if (!sg_async_compute_supported()) return false;
     if (_sgu_async_mtl.in_pass || _sg.cur_pass.in_pass) return false;
+    /* Wait on Sokol's frame semaphore before touching the rotating uniform buffer. */
+    _sg_mtl_acquire_cmd_buffer();
+    if (!_sg.mtl.cmd_buffer) return false;
     if (!_sgu_async_mtl.cmd_buffer) {
         _sgu_async_mtl.cmd_buffer = [_sgu_async_mtl.queue commandBuffer];
         if (!_sgu_async_mtl.cmd_buffer) return false;
+        _SG_OBJC_RETAIN(_sgu_async_mtl.cmd_buffer);
         if (_sgu_async_mtl.pending_gfx_wait > 0) {
             [_sgu_async_mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.event value:_sgu_async_mtl.pending_gfx_wait];
             _sgu_async_mtl.pending_gfx_wait = 0;
@@ -6043,6 +6050,7 @@ void sg_end_async_compute_pass(void) {
     _sg.cur_pip = _sgu_async_mtl.saved_pip;
     _sgu_async_mtl.saved_encoder = nil;
     _sgu_async_mtl.in_pass = false;
+    _sg_mtl_clear_state_cache();
 }
 
 uint64_t sg_async_compute_commit(void) {
@@ -6052,7 +6060,7 @@ uint64_t sg_async_compute_commit(void) {
     if (_sgu_async_mtl.next_token == 0) _sgu_async_mtl.next_token = 1;
     [_sgu_async_mtl.cmd_buffer encodeSignalEvent:_sgu_async_mtl.event value:token];
     [_sgu_async_mtl.cmd_buffer commit];
-    _sgu_async_mtl.cmd_buffer = nil;
+    _SG_OBJC_RELEASE(_sgu_async_mtl.cmd_buffer);
     return token;
 }
 
