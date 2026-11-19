@@ -674,7 +674,11 @@ SOKOL_API_IMPL sg_buffer sg_make_indirect_buffer(const sg_buffer_desc* desc) {
 SOKOL_API_IMPL void sg_indirect_barrier(void) {
     if (!sg_indirect_supported()) return;
     if (_sg.cur_pass.in_pass && !_sg.cur_pass.is_compute) return;
-    #if defined(SOKOL_VULKAN)
+    #if defined(SOKOL_METAL)
+    if (_sg.cur_pass.in_pass && _sg.cur_pass.is_compute && _sg.mtl.compute_cmd_encoder) {
+        [_sg.mtl.compute_cmd_encoder memoryBarrierWithScope:(MTLBarrierScopeBuffers | MTLBarrierScopeTextures)];
+    }
+    #elif defined(SOKOL_VULKAN)
     _sg_vk_acquire_frame_command_buffers();
     if (!_sg.vk.frame.cmd_buf) return;
     _SG_STRUCT(VkMemoryBarrier2, barrier);
