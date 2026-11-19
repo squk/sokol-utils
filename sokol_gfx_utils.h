@@ -808,7 +808,7 @@ SOKOL_API_IMPL void sg_indirect_barrier(void) {
 }
 
 _SOKOL_PRIVATE bool _sgu_skip_draw(void) {
-    return !_sg.cur_pass.valid || !_sg.next_draw_valid;
+    return !_sg.cur_pass.valid || (_sg.skipdraw_flags != 0);
 }
 
 _SOKOL_PRIVATE _sg_buffer_t* _sgu_indirect_args(sg_buffer args, int offset, int size, bool compute) {
