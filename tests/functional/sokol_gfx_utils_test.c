@@ -8,20 +8,222 @@ UTEST(sokol_gfx_utils, flush_commands_without_context) {
     EXPECT_FALSE(sg_flush_commands());
 }
 
-#if defined(SOKOL_METAL)
-#include <time.h>
+#if defined(SOKOL_METAL) || defined(SOKOL_D3D11) || defined(SOKOL_VULKAN)
+#include <stdio.h>
+#if defined(SOKOL_D3D11)
+static ID3D11Device* flush_test_device;
+static ID3D11DeviceContext* flush_test_context;
+#elif defined(SOKOL_VULKAN)
+static struct {
+    VkInstance instance;
+    VkPhysicalDevice physical_device;
+    VkDevice device;
+    VkQueue queue;
+    uint32_t queue_family;
+    VkDebugUtilsMessengerEXT messenger;
+} flush_test_vk;
+/* Validation errors since setup, when VK_LAYER_KHRONOS_validation is installed. */
+static int flush_test_vk_errors;
 
+static VKAPI_ATTR VkBool32 VKAPI_CALL flush_test_vk_message(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT types, const VkDebugUtilsMessengerCallbackDataEXT* data, void* user_data) {
+    (void)types; (void)user_data;
+    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        flush_test_vk_errors++;
+        fprintf(stderr, "vulkan validation: %s\n", data->pMessage);
+    }
+    return VK_FALSE;
+}
+
+static bool flush_test_vk_has_layer(const char* name) {
+    uint32_t count = 0;
+    vkEnumerateInstanceLayerProperties(&count, NULL);
+    VkLayerProperties layers[64];
+    if (count > 64) count = 64;
+    vkEnumerateInstanceLayerProperties(&count, layers);
+    for (uint32_t i = 0; i < count; i++)
+        if (strcmp(layers[i].layerName, name) == 0) return true;
+    return false;
+}
+
+/* A headless device with what sokol_gfx's Vulkan backend needs, as sokol_app
+   creates it (_sapp_vk_create_device) without the swapchain. */
+static bool flush_test_vk_create(void) {
+    memset(&flush_test_vk, 0, sizeof(flush_test_vk));
+    flush_test_vk_errors = 0;
+    const bool validation = flush_test_vk_has_layer("VK_LAYER_KHRONOS_validation");
+    const char* layer = "VK_LAYER_KHRONOS_validation";
+    const char* instance_ext = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    VkApplicationInfo app;
+    memset(&app, 0, sizeof(app));
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo instance_info;
+    memset(&instance_info, 0, sizeof(instance_info));
+    instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    instance_info.pApplicationInfo = &app;
+    if (validation) {
+        instance_info.enabledLayerCount = 1;
+        instance_info.ppEnabledLayerNames = &layer;
+        instance_info.enabledExtensionCount = 1;
+        instance_info.ppEnabledExtensionNames = &instance_ext;
+    }
+    if (vkCreateInstance(&instance_info, NULL, &flush_test_vk.instance) != VK_SUCCESS) return false;
+    if (validation) {
+        PFN_vkCreateDebugUtilsMessengerEXT create_messenger = (PFN_vkCreateDebugUtilsMessengerEXT)
+            vkGetInstanceProcAddr(flush_test_vk.instance, "vkCreateDebugUtilsMessengerEXT");
+        VkDebugUtilsMessengerCreateInfoEXT messenger_info;
+        memset(&messenger_info, 0, sizeof(messenger_info));
+        messenger_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+        messenger_info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        messenger_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                                     VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
+        messenger_info.pfnUserCallback = flush_test_vk_message;
+        if (create_messenger)
+            create_messenger(flush_test_vk.instance, &messenger_info, NULL, &flush_test_vk.messenger);
+    }
+    uint32_t device_count = 8;
+    VkPhysicalDevice devices[8];
+    if (vkEnumeratePhysicalDevices(flush_test_vk.instance, &device_count, devices) < 0 || device_count == 0)
+        return false;
+    for (uint32_t d = 0; d < device_count && !flush_test_vk.physical_device; d++) {
+        uint32_t ext_count = 0;
+        vkEnumerateDeviceExtensionProperties(devices[d], NULL, &ext_count, NULL);
+        VkExtensionProperties* exts = (VkExtensionProperties*)calloc(ext_count, sizeof(VkExtensionProperties));
+        vkEnumerateDeviceExtensionProperties(devices[d], NULL, &ext_count, exts);
+        bool descriptor_buffer = false;
+        for (uint32_t e = 0; e < ext_count; e++)
+            descriptor_buffer |= strcmp(exts[e].extensionName, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) == 0;
+        free(exts);
+        if (!descriptor_buffer) continue;
+        uint32_t family_count = 16;
+        VkQueueFamilyProperties families[16];
+        vkGetPhysicalDeviceQueueFamilyProperties(devices[d], &family_count, families);
+        for (uint32_t f = 0; f < family_count; f++) {
+            if ((families[f].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+                (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
+                flush_test_vk.physical_device = devices[d];
+                flush_test_vk.queue_family = f;
+                break;
+            }
+        }
+    }
+    if (!flush_test_vk.physical_device) return false;
+    const float priority = 0.0f;
+    VkDeviceQueueCreateInfo queue_info;
+    memset(&queue_info, 0, sizeof(queue_info));
+    queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queue_info.queueFamilyIndex = flush_test_vk.queue_family;
+    queue_info.queueCount = 1;
+    queue_info.pQueuePriorities = &priority;
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer;
+    memset(&descriptor_buffer, 0, sizeof(descriptor_buffer));
+    descriptor_buffer.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT;
+    descriptor_buffer.descriptorBuffer = VK_TRUE;
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamic_state;
+    memset(&dynamic_state, 0, sizeof(dynamic_state));
+    dynamic_state.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
+    dynamic_state.pNext = &descriptor_buffer;
+    dynamic_state.extendedDynamicState = VK_TRUE;
+    VkPhysicalDeviceVulkan12Features vk12;
+    memset(&vk12, 0, sizeof(vk12));
+    vk12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    vk12.pNext = &dynamic_state;
+    vk12.bufferDeviceAddress = VK_TRUE;
+    VkPhysicalDeviceVulkan13Features vk13;
+    memset(&vk13, 0, sizeof(vk13));
+    vk13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    vk13.pNext = &vk12;
+    vk13.dynamicRendering = VK_TRUE;
+    vk13.synchronization2 = VK_TRUE;
+    VkPhysicalDeviceFeatures2 features;
+    memset(&features, 0, sizeof(features));
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = &vk13;
+    features.features.samplerAnisotropy = VK_TRUE;
+    features.features.fragmentStoresAndAtomics = VK_TRUE;
+    const char* device_ext = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME;
+    VkDeviceCreateInfo device_info;
+    memset(&device_info, 0, sizeof(device_info));
+    device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    device_info.pNext = &features;
+    device_info.queueCreateInfoCount = 1;
+    device_info.pQueueCreateInfos = &queue_info;
+    device_info.enabledExtensionCount = 1;
+    device_info.ppEnabledExtensionNames = &device_ext;
+    if (vkCreateDevice(flush_test_vk.physical_device, &device_info, NULL, &flush_test_vk.device) != VK_SUCCESS)
+        return false;
+    vkGetDeviceQueue(flush_test_vk.device, flush_test_vk.queue_family, 0, &flush_test_vk.queue);
+    return true;
+}
+
+static void flush_test_vk_destroy(void) {
+    if (flush_test_vk.device) vkDestroyDevice(flush_test_vk.device, NULL);
+    if (flush_test_vk.messenger) {
+        PFN_vkDestroyDebugUtilsMessengerEXT destroy_messenger = (PFN_vkDestroyDebugUtilsMessengerEXT)
+            vkGetInstanceProcAddr(flush_test_vk.instance, "vkDestroyDebugUtilsMessengerEXT");
+        if (destroy_messenger) destroy_messenger(flush_test_vk.instance, flush_test_vk.messenger, NULL);
+    }
+    if (flush_test_vk.instance) vkDestroyInstance(flush_test_vk.instance, NULL);
+    memset(&flush_test_vk, 0, sizeof(flush_test_vk));
+}
+#endif
+
+/* A real device for sg_flush_commands; false, with a note, when the machine has none. */
+static bool flush_test_setup_device(void);
 static bool flush_test_setup(void) {
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    if (!device) return false;
+    if (flush_test_setup_device()) return true;
+    fprintf(stderr, "flush_commands test skipped: no GPU device\n");
+    return false;
+}
+
+static bool flush_test_setup_device(void) {
     sg_desc desc;
     memset(&desc, 0, sizeof(desc));
+#if defined(SOKOL_METAL)
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) return false;
     desc.environment.metal.device = (__bridge const void*)device;
+#elif defined(SOKOL_D3D11)
+    D3D_FEATURE_LEVEL level;
+    HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION,
+                                   &flush_test_device, &level, &flush_test_context);
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0, D3D11_SDK_VERSION,
+                               &flush_test_device, &level, &flush_test_context);
+    }
+    if (FAILED(hr)) return false;
+    desc.environment.d3d11.device = flush_test_device;
+    desc.environment.d3d11.device_context = flush_test_context;
+#else
+    if (!flush_test_vk_create()) {
+        flush_test_vk_destroy();
+        return false;
+    }
+    desc.environment.vulkan.instance = flush_test_vk.instance;
+    desc.environment.vulkan.physical_device = flush_test_vk.physical_device;
+    desc.environment.vulkan.device = flush_test_vk.device;
+    desc.environment.vulkan.queue = flush_test_vk.queue;
+    desc.environment.vulkan.queue_family_index = flush_test_vk.queue_family;
+#endif
     sg_setup(&desc);
     return sg_isvalid();
 }
 
-/* An offscreen target for one clear pass, so a frame has a command buffer to split. */
+static void flush_test_teardown(void) {
+    sg_shutdown();
+#if defined(SOKOL_VULKAN)
+    flush_test_vk_destroy();
+#endif
+#if defined(SOKOL_D3D11)
+    flush_test_context->lpVtbl->Release(flush_test_context);
+    flush_test_device->lpVtbl->Release(flush_test_device);
+    flush_test_context = NULL;
+    flush_test_device = NULL;
+#endif
+}
+
+/* An offscreen target for one clear pass, so a frame has work to split. */
 static sg_image flush_test_target(sg_view* view) {
     sg_image_desc image_desc;
     memset(&image_desc, 0, sizeof(image_desc));
@@ -45,6 +247,66 @@ static void flush_test_pass(sg_view view) {
     sg_begin_pass(&pass);
     sg_end_pass();
 }
+
+/* Splits are refused inside a pass, and a frame keeps recording after them. */
+UTEST(sokol_gfx_utils, flush_commands_continues_frame) {
+    if (!flush_test_setup()) return;
+    sg_view view;
+    sg_image image = flush_test_target(&view);
+    for (int frame = 0; frame < 3; frame++) {
+        for (int split = 0; split < 8; split++) {
+            sg_pass pass;
+            memset(&pass, 0, sizeof(pass));
+            pass.attachments.colors[0] = view;
+            pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
+            sg_begin_pass(&pass);
+            EXPECT_FALSE(sg_flush_commands());
+            sg_end_pass();
+            EXPECT_TRUE(sg_flush_commands());
+        }
+        flush_test_pass(view);
+        sg_commit();
+    }
+#if defined(SOKOL_D3D11)
+    EXPECT_TRUE(flush_test_device->lpVtbl->GetDeviceRemovedReason(flush_test_device) == S_OK);
+#endif
+    sg_destroy_view(view);
+    sg_destroy_image(image);
+    flush_test_teardown();
+}
+#endif
+
+#if defined(SOKOL_VULKAN)
+/* Splits stay in the frame's slot: the slot moves only at sg_commit, spare
+   command buffers grow past their first allocation and are reused by later
+   frames of the slot, and the validation layer reports no error. */
+UTEST(sokol_gfx_utils, flush_commands_vulkan_takes_no_frame_slot) {
+    if (!flush_test_setup()) return;
+    sg_view view;
+    sg_image image = flush_test_target(&view);
+    const int splits = 9;
+    for (int frame = 0; frame < 3 * SG_NUM_INFLIGHT_FRAMES; frame++) {
+        flush_test_pass(view);
+        const uint32_t slot = _sg.vk.frame_slot;
+        for (int split = 0; split < splits; split++) {
+            EXPECT_TRUE(sg_flush_commands());
+            flush_test_pass(view);
+            EXPECT_EQ(_sg.vk.frame_slot, slot);
+        }
+        EXPECT_EQ(_sgu_vk_split.used[slot], splits);
+        EXPECT_GE(_sgu_vk_split.capacity[slot], splits);
+        sg_commit();
+    }
+    vkDeviceWaitIdle(flush_test_vk.device);
+    EXPECT_EQ(flush_test_vk_errors, 0);
+    sg_destroy_view(view);
+    sg_destroy_image(image);
+    flush_test_teardown();
+}
+#endif
+
+#if defined(SOKOL_METAL)
+#include <time.h>
 
 static double flush_test_seconds(void) {
     struct timespec now;
@@ -91,7 +353,7 @@ UTEST(sokol_gfx_utils, flush_commands_metal_splits_frame) {
     EXPECT_TRUE(flush_test_semaphore_balanced());
     sg_destroy_view(view);
     sg_destroy_image(image);
-    sg_shutdown();
+    flush_test_teardown();
 }
 
 /* Many splits per frame over many frames: an extra semaphore wait would block
@@ -116,7 +378,7 @@ UTEST(sokol_gfx_utils, flush_commands_metal_takes_no_frame_slot) {
     EXPECT_TRUE(flush_test_semaphore_balanced());
     sg_destroy_view(view);
     sg_destroy_image(image);
-    sg_shutdown();
+    flush_test_teardown();
 }
 #endif
 
@@ -143,7 +405,8 @@ UTEST(sokol_gfx_utils, accel_invalid_arguments) {
 }
 
 UTEST(sokol_gfx_utils, multi_geometry_blas_invalid_arguments) {
-    sg_blas_geometry geos[2] = { { 0 } };
+    sg_blas_geometry geos[2];
+    memset(geos, 0, sizeof(geos));
     sg_blas_desc desc = { 0 };
     desc.geometries = geos;
     desc.geometry_count = 2;

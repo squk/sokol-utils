@@ -5,7 +5,8 @@
 
 void use_gfx_utils(void) {
     sg_readback_request((sg_image){0});
-    sg_blas_geometry geos[2] = {{0}};
+    sg_blas_geometry geos[2];
+    memset(geos, 0, sizeof(geos));
     sg_blas_desc blas_desc = {0};
     blas_desc.geometries = geos;
     blas_desc.geometry_count = 2;

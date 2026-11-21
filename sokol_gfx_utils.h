@@ -2750,6 +2750,10 @@ typedef struct {
 } _sgu_vk_split_pair_t;
 
 static struct {
+    /* The context the pairs came from. sg_shutdown destroys the pool and its
+       buffers, so pairs of an earlier context are dropped, never reused. */
+    VkDevice device;
+    VkCommandPool pool;
     _sgu_vk_split_pair_t* pairs[SG_NUM_INFLIGHT_FRAMES];
     int capacity[SG_NUM_INFLIGHT_FRAMES];
     int used[SG_NUM_INFLIGHT_FRAMES];
@@ -2759,6 +2763,12 @@ static struct {
 /* A spare pair of the current frame slot, allocated from sokol_gfx's frame
    command pool, which frees it at shutdown. */
 _SOKOL_PRIVATE bool _sgu_vk_split_next_pair(_sgu_vk_split_pair_t* out) {
+    if (_sgu_vk_split.device != _sg.vk.dev || _sgu_vk_split.pool != _sg.vk.frame.cmd_pool) {
+        for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) free(_sgu_vk_split.pairs[i]);
+        memset(&_sgu_vk_split, 0, sizeof(_sgu_vk_split));
+        _sgu_vk_split.device = _sg.vk.dev;
+        _sgu_vk_split.pool = _sg.vk.frame.cmd_pool;
+    }
     const uint32_t slot = _sg.vk.frame_slot;
     if (_sgu_vk_split.frame[slot] != (uint32_t)_sg.frame_index + 1u) {
         _sgu_vk_split.frame[slot] = (uint32_t)_sg.frame_index + 1u;

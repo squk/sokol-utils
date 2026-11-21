@@ -98,6 +98,9 @@ elseif (OSX_MACOS)
 elseif (WINDOWS)
     if (SOKOL_BACKEND STREQUAL SOKOL_VULKAN)
         set(system_libs ${system_libs} vulkan-1)
+    elseif (SOKOL_BACKEND STREQUAL SOKOL_D3D11)
+        # MinGW ignores sokol_gfx.h's #pragma comment(lib, ...).
+        set(system_libs ${system_libs} d3d11 dxgi dxguid)
     endif()
 endif()
 
