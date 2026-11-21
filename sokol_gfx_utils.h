@@ -2573,8 +2573,9 @@ _SOKOL_PRIVATE void _sgu_submission_release_native(sg_submission_receipt receipt
     receipt->native = NULL;
 }
 #if defined(SOKOL_METAL)
-/* Command buffers sg_flush_commands submitted, kept until they finish so a
-   failure is logged (_sgu_mtl_completion_poll logs it). */
+/* Command buffers outside the frame's tracked commit (sg_flush_commands splits
+   and async compute submissions), kept until they finish so a failure is
+   logged (_sgu_mtl_completion_poll logs it). */
 #define _SGU_MTL_FLUSHED_CAPACITY 64
 static struct {
     _sgu_mtl_completion_t items[_SGU_MTL_FLUSHED_CAPACITY];
@@ -2592,6 +2593,26 @@ _SOKOL_PRIVATE void _sgu_mtl_flushed_collect(bool all) {
         }
     }
     _sgu_mtl_flushed.count = keep;
+}
+
+/* Watches `buffer` until it finishes; call before committing it. */
+_SOKOL_PRIVATE void _sgu_mtl_watch(id<MTLCommandBuffer> buffer) {
+    if (nil == buffer) return;
+    _sgu_mtl_flushed_collect(false);
+    if (_sgu_mtl_flushed.count == _SGU_MTL_FLUSHED_CAPACITY) {
+        /* Full of unfinished buffers: stop watching the oldest. */
+        _sgu_mtl_completion_destroy(&_sgu_mtl_flushed.items[0]);
+        memmove(&_sgu_mtl_flushed.items[0], &_sgu_mtl_flushed.items[1],
+                sizeof(_sgu_mtl_flushed.items[0]) * (size_t)(_SGU_MTL_FLUSHED_CAPACITY - 1));
+        --_sgu_mtl_flushed.count;
+    }
+    _sgu_mtl_completion_t* marker = &_sgu_mtl_flushed.items[_sgu_mtl_flushed.count++];
+    memset(marker, 0, sizeof(*marker));
+#if __has_feature(objc_arc)
+    marker->command_buffer = (__bridge_retained void*)buffer;
+#else
+    marker->command_buffer = (void*)[buffer retain];
+#endif
 }
 #endif
 
@@ -2848,15 +2869,7 @@ SOKOL_API_IMPL bool sg_flush_commands(void) {
         }
         /* A copy leaves sokol_gfx's blit encoder open; the buffer cannot commit with it. */
         _sg_mtl_finish_blit_cmd_encoder();
-        _sgu_mtl_flushed_collect(false);
-        if (_sgu_mtl_flushed.count == _SGU_MTL_FLUSHED_CAPACITY) {
-            /* Full of unfinished buffers: stop watching the oldest. */
-            _sgu_mtl_completion_destroy(&_sgu_mtl_flushed.items[0]);
-            memmove(&_sgu_mtl_flushed.items[0], &_sgu_mtl_flushed.items[1],
-                    sizeof(_sgu_mtl_flushed.items[0]) * (size_t)(_SGU_MTL_FLUSHED_CAPACITY - 1));
-            --_sgu_mtl_flushed.count;
-        }
-        if (_sgu_mtl_completion_make(&_sgu_mtl_flushed.items[_sgu_mtl_flushed.count])) ++_sgu_mtl_flushed.count;
+        _sgu_mtl_watch(_sg.mtl.cmd_buffer);
         /* GPU pass timings wait for the frame's last buffer, which finishes last;
            the first buffer stays for the frame's start time. */
         _sgu_mtl_gpu_timing_frame_t* timing = &_sgu_mtl_gpu_timing_state.current;
@@ -6451,8 +6464,16 @@ bool sg_begin_async_compute_pass(const char* label) {
     _sg_mtl_acquire_cmd_buffer();
     if (!_sg.mtl.cmd_buffer) return false;
     if (!_sgu_async_mtl.cmd_buffer) {
-        _sgu_async_mtl.cmd_buffer = [_sgu_async_mtl.queue commandBuffer];
+        /* Encoder status names the faulted or affected pass when the buffer
+           fails, as on the frame's buffers. */
+        MTLCommandBufferDescriptor* cmd_desc = [MTLCommandBufferDescriptor new];
+        cmd_desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+        _sgu_async_mtl.cmd_buffer = [_sgu_async_mtl.queue commandBufferWithDescriptor:cmd_desc];
+#if !__has_feature(objc_arc)
+        [cmd_desc release];
+#endif
         if (!_sgu_async_mtl.cmd_buffer) return false;
+        _sgu_async_mtl.cmd_buffer.label = @"async compute";
         _SG_OBJC_RETAIN(_sgu_async_mtl.cmd_buffer);
         if (_sgu_async_mtl.pending_gfx_wait > 0) {
             [_sgu_async_mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.event value:_sgu_async_mtl.pending_gfx_wait];
@@ -6499,6 +6520,9 @@ uint64_t sg_async_compute_commit(void) {
     const uint64_t token = _sgu_async_mtl.next_token++;
     if (_sgu_async_mtl.next_token == 0) _sgu_async_mtl.next_token = 1;
     [_sgu_async_mtl.cmd_buffer encodeSignalEvent:_sgu_async_mtl.event value:token];
+    /* Nothing else checks this queue: a fault or timeout here would only show
+       as frame buffers timing out while they wait on the event. */
+    _sgu_mtl_watch(_sgu_async_mtl.cmd_buffer);
     [_sgu_async_mtl.cmd_buffer commit];
     _SG_OBJC_RELEASE(_sgu_async_mtl.cmd_buffer);
     return token;
