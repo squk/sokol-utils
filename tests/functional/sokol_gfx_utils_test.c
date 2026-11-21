@@ -35,6 +35,17 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL flush_test_vk_message(VkDebugUtilsMessageS
     return VK_FALSE;
 }
 
+static bool flush_test_vk_has_instance_extension(const char* name) {
+    uint32_t count = 0;
+    vkEnumerateInstanceExtensionProperties(NULL, &count, NULL);
+    VkExtensionProperties exts[128];
+    if (count > 128) count = 128;
+    vkEnumerateInstanceExtensionProperties(NULL, &count, exts);
+    for (uint32_t i = 0; i < count; i++)
+        if (strcmp(exts[i].extensionName, name) == 0) return true;
+    return false;
+}
+
 static bool flush_test_vk_has_layer(const char* name) {
     uint32_t count = 0;
     vkEnumerateInstanceLayerProperties(&count, NULL);
@@ -62,11 +73,14 @@ static bool flush_test_vk_create(void) {
     memset(&instance_info, 0, sizeof(instance_info));
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instance_info.pApplicationInfo = &app;
+    /* sokol_gfx names its objects through VK_EXT_debug_utils and fails setup
+       without it, as sokol_app enables it; the layer is optional. */
+    if (!flush_test_vk_has_instance_extension(instance_ext)) return false;
+    instance_info.enabledExtensionCount = 1;
+    instance_info.ppEnabledExtensionNames = &instance_ext;
     if (validation) {
         instance_info.enabledLayerCount = 1;
         instance_info.ppEnabledLayerNames = &layer;
-        instance_info.enabledExtensionCount = 1;
-        instance_info.ppEnabledExtensionNames = &instance_ext;
     }
     if (vkCreateInstance(&instance_info, NULL, &flush_test_vk.instance) != VK_SUCCESS) return false;
     if (validation) {
