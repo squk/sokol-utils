@@ -4588,12 +4588,30 @@ SOKOL_API_IMPL void sg_accel_shutdown(void) {
 /* The layouts that sg_make_shader_fragment_storage recorded, one entry per
    shader. sg_fragment_storage_bind reads them. Entries of destroyed shaders
    are dropped on the next add. */
-#define _SGU_FSTORE_MAX_SHADERS (64)
+/* Every live shader made with sg_make_shader_fragment_storage and its slot
+   layout. Grows on demand: a scene's material variants can need any number of
+   these shaders, and a fixed table made shader creation fail past it.
+   sg_fragment_storage_shutdown frees it. */
 static struct {
-    uint32_t id[_SGU_FSTORE_MAX_SHADERS];
-    sg_fragment_storage_layout_desc layout[_SGU_FSTORE_MAX_SHADERS];
+    uint32_t* id;
+    sg_fragment_storage_layout_desc* layout;
     int count;
+    int capacity;
 } _sgu_fstore_shaders;
+
+_SOKOL_PRIVATE bool _sgu_fstore_reserve_shader(void) {
+    if (_sgu_fstore_shaders.count < _sgu_fstore_shaders.capacity) return true;
+    const int capacity = _sgu_fstore_shaders.capacity ? _sgu_fstore_shaders.capacity * 2 : 64;
+    uint32_t* id = (uint32_t*) realloc(_sgu_fstore_shaders.id, sizeof(uint32_t) * (size_t)capacity);
+    if (!id) return false;
+    _sgu_fstore_shaders.id = id;
+    sg_fragment_storage_layout_desc* layout = (sg_fragment_storage_layout_desc*)
+        realloc(_sgu_fstore_shaders.layout, sizeof(sg_fragment_storage_layout_desc) * (size_t)capacity);
+    if (!layout) return false;
+    _sgu_fstore_shaders.layout = layout;
+    _sgu_fstore_shaders.capacity = capacity;
+    return true;
+}
 
 _SOKOL_PRIVATE void _sgu_fstore_prune_shaders(void) {
     int keep = 0;
@@ -4891,9 +4909,8 @@ SOKOL_API_IMPL sg_shader sg_make_shader_fragment_storage(const sg_shader_desc* d
     if (!_sgu_mtl_fstore_validate(desc, layout)) return invalid;
     #endif
     _sgu_fstore_prune_shaders();
-    if (_sgu_fstore_shaders.count >= _SGU_FSTORE_MAX_SHADERS) {
-        _sgu_accel_log("sg_make_shader_fragment_storage: more than %d live shaders with fragment storage images",
-            _SGU_FSTORE_MAX_SHADERS);
+    if (!_sgu_fstore_reserve_shader()) {
+        _sgu_accel_log("sg_make_shader_fragment_storage: out of memory for the shader table");
         return invalid;
     }
     sg_shader shader = sg_make_shader(desc);
@@ -4955,6 +4972,8 @@ SOKOL_API_IMPL bool sg_fragment_storage_bind(const sg_fragment_storage_bindings*
 }
 
 SOKOL_API_IMPL void sg_fragment_storage_shutdown(void) {
+    free(_sgu_fstore_shaders.id);
+    free(_sgu_fstore_shaders.layout);
     memset(&_sgu_fstore_shaders, 0, sizeof(_sgu_fstore_shaders));
     #if defined(SOKOL_VULKAN)
     memset(&_sgu_vk_fstore_state, 0, sizeof(_sgu_vk_fstore_state));
@@ -5907,7 +5926,7 @@ SOKOL_API_IMPL sg_shader sg_make_shader_ext(const sg_shader_desc* desc, const sg
     }
     if (fstore) {
         _sgu_fstore_prune_shaders();
-        if (_sgu_fstore_shaders.count >= _SGU_FSTORE_MAX_SHADERS) return invalid;
+        if (!_sgu_fstore_reserve_shader()) return invalid;
     }
     if (bindless) {
         _sgu_bindless_prune_shaders();
