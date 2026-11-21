@@ -172,8 +172,8 @@ SOKOL_GFX_UTILS_API_DECL bool sg_shutdown_submission_receipts(void);
    after every buffer before it, since one queue runs them in order. Metal and
    Vulkan submit the command buffer, WebGPU the command encoder; D3D11 and GL
    flush the driver queue. A failed split buffer on Metal is logged when a later
-   flush or tracked commit polls it, and GPU pass timings then cover only the
-   frame's last buffer. Returns false on a backend that cannot split. */
+   flush or tracked commit polls it. Returns false on a backend that cannot
+   split. */
 SOKOL_GFX_UTILS_API_DECL bool sg_flush_commands(void);
 
 /*
@@ -935,7 +935,11 @@ typedef struct {
 
 typedef struct {
     id<MTLCounterSampleBuffer> sample_buffer;
+    /* The frame's last command buffer, which finishes last; poll waits for it. */
     id<MTLCommandBuffer> command_buffer;
+    /* The frame's first command buffer when sg_flush_commands split the frame;
+       its GPUStartTime starts the frame total. */
+    id<MTLCommandBuffer> first_command_buffer;
     uint64_t frame_index;
     uint32_t pass_count;
     int active_pass;
@@ -961,6 +965,11 @@ _SOKOL_PRIVATE void _sgu_mtl_gpu_timing_release_frame(_sgu_mtl_gpu_timing_frame_
     if (frame->command_buffer) {
 #if !__has_feature(objc_arc)
         [frame->command_buffer release];
+#endif
+    }
+    if (frame->first_command_buffer) {
+#if !__has_feature(objc_arc)
+        [frame->first_command_buffer release];
 #endif
     }
     memset(frame, 0, sizeof(*frame));
@@ -1155,7 +1164,8 @@ _SOKOL_PRIVATE int _sgu_mtl_gpu_timing_poll(sg_gpu_pass_timing* timings, int max
         return 0;
     }
     int result_count = 0;
-    const CFTimeInterval start = oldest->command_buffer.GPUStartTime;
+    const CFTimeInterval start = oldest->first_command_buffer ? oldest->first_command_buffer.GPUStartTime
+                                                              : oldest->command_buffer.GPUStartTime;
     const CFTimeInterval end = oldest->command_buffer.GPUEndTime;
     if (start > 0.0 && end >= start) {
         strncpy(timings[0].label, "Frame", SG_GPU_PASS_TIMING_LABEL_SIZE);
@@ -2829,12 +2839,17 @@ SOKOL_API_IMPL bool sg_flush_commands(void) {
             --_sgu_mtl_flushed.count;
         }
         if (_sgu_mtl_completion_make(&_sgu_mtl_flushed.items[_sgu_mtl_flushed.count])) ++_sgu_mtl_flushed.count;
-        /* GPU pass timings follow the frame's last buffer, which finishes last. */
+        /* GPU pass timings wait for the frame's last buffer, which finishes last;
+           the first buffer stays for the frame's start time. */
         _sgu_mtl_gpu_timing_frame_t* timing = &_sgu_mtl_gpu_timing_state.current;
         if (timing->command_buffer == _sg.mtl.cmd_buffer) {
+            if (!timing->first_command_buffer) {
+                timing->first_command_buffer = timing->command_buffer;
+            } else {
 #if !__has_feature(objc_arc)
-            [timing->command_buffer release];
+                [timing->command_buffer release];
 #endif
+            }
             timing->command_buffer = nil;
         }
         [_sg.mtl.cmd_buffer commit];

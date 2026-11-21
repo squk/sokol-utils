@@ -1,4 +1,6 @@
 #define SOKOL_IMPL
+/* GPU pass timings hook sokol_gfx through its trace hooks. */
+#define SOKOL_TRACE_HOOKS
 #include "sokol_gfx.h"
 #define SOKOL_GFX_UTILS_IMPL
 #include "sokol_gfx_utils.h"
@@ -321,6 +323,7 @@ UTEST(sokol_gfx_utils, flush_commands_vulkan_takes_no_frame_slot) {
 
 #if defined(SOKOL_METAL)
 #include <time.h>
+#include <unistd.h>
 
 static double flush_test_seconds(void) {
     struct timespec now;
@@ -374,6 +377,46 @@ UTEST(sokol_gfx_utils, flush_commands_metal_splits_frame) {
    the frame (deadlocking it once SG_NUM_INFLIGHT_FRAMES buffers are pending),
    and an extra signal would let a frame start before its uniform ring slot is
    free. After each commit the frame that last used the next slot has finished. */
+/* Timings of a split frame wait for its last command buffer and keep the first
+   for the frame's start, and the "Frame" total still arrives. */
+UTEST(sokol_gfx_utils, flush_commands_metal_timings_cover_split_frame) {
+    if (!flush_test_setup()) return;
+    if (!sg_gpu_pass_timings_setup()) {
+        fprintf(stderr, "flush_commands timing test skipped: no GPU timestamps\n");
+        flush_test_teardown();
+        return;
+    }
+    sg_gpu_pass_timings_set_enabled(true);
+    sg_view view;
+    sg_image image = flush_test_target(&view);
+    flush_test_pass(view);
+    id<MTLCommandBuffer> first = _sg.mtl.cmd_buffer;
+    EXPECT_TRUE(_sgu_mtl_gpu_timing_state.current.command_buffer == first);
+    EXPECT_TRUE(sg_flush_commands());
+    flush_test_pass(view);
+    EXPECT_TRUE(_sgu_mtl_gpu_timing_state.current.first_command_buffer == first);
+    EXPECT_TRUE(_sgu_mtl_gpu_timing_state.current.command_buffer == _sg.mtl.cmd_buffer);
+    EXPECT_TRUE(_sg.mtl.cmd_buffer != first);
+    sg_commit();
+    EXPECT_TRUE(flush_test_semaphore_balanced());
+    sg_gpu_pass_timing timings[SG_GPU_PASS_TIMING_MAX_PASSES + 1];
+    int count = 0;
+    for (int attempt = 0; attempt < 100 && count == 0; attempt++) {
+        count = sg_gpu_pass_timings_poll(timings, SG_GPU_PASS_TIMING_MAX_PASSES + 1);
+        if (count == 0) usleep(10000);
+    }
+    EXPECT_GE(count, 1);
+    if (count >= 1) {
+        EXPECT_STREQ(timings[0].label, "Frame");
+        EXPECT_GT(timings[0].milliseconds, 0.0);
+    }
+    sg_gpu_pass_timings_set_enabled(false);
+    sg_destroy_view(view);
+    sg_destroy_image(image);
+    flush_test_teardown();
+    sg_gpu_pass_timings_shutdown();
+}
+
 UTEST(sokol_gfx_utils, flush_commands_metal_takes_no_frame_slot) {
     if (!flush_test_setup()) return;
     sg_view view;
