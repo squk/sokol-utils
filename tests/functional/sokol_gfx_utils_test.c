@@ -193,9 +193,17 @@ static bool flush_test_setup(void) {
     return false;
 }
 
+/* sokol_gfx reports validation and backend errors here; without a logger they are silent. */
+static void flush_test_log(const char* tag, uint32_t level, uint32_t id, const char* message, uint32_t line,
+                           const char* file, void* user_data) {
+    (void)file; (void)user_data;
+    fprintf(stderr, "[%s] level %u id %u line %u: %s\n", tag ? tag : "", level, id, line, message ? message : "");
+}
+
 static bool flush_test_setup_device(void) {
     sg_desc desc;
     memset(&desc, 0, sizeof(desc));
+    desc.logger.func = flush_test_log;
 #if defined(SOKOL_METAL)
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) return false;
@@ -289,6 +297,123 @@ UTEST(sokol_gfx_utils, flush_commands_continues_frame) {
     sg_destroy_view(view);
     sg_destroy_image(image);
     flush_test_teardown();
+}
+#endif
+
+#if defined(SOKOL_D3D11)
+/* Copies a 2D R32UI image into a staging texture and reads texel (x, y). */
+static uint32_t fstore_test_read_texel(sg_image image, int x, int y) {
+    _sg_image_t* img = _sg_lookup_image(image.id);
+    if (!img) return 0xFFFFFFFFu;
+    D3D11_TEXTURE2D_DESC desc;
+    memset(&desc, 0, sizeof(desc));
+    img->d3d11.tex2d->lpVtbl->GetDesc(img->d3d11.tex2d, &desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    ID3D11Texture2D* staging = 0;
+    if (FAILED(flush_test_device->lpVtbl->CreateTexture2D(flush_test_device, &desc, 0, &staging))) return 0xFFFFFFFFu;
+    flush_test_context->lpVtbl->CopyResource(flush_test_context, (ID3D11Resource*)staging, img->d3d11.res);
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    uint32_t value = 0xFFFFFFFFu;
+    if (SUCCEEDED(flush_test_context->lpVtbl->Map(flush_test_context, (ID3D11Resource*)staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+        value = ((const uint32_t*)((const uint8_t*)mapped.pData + (size_t)y * mapped.RowPitch))[x];
+        flush_test_context->lpVtbl->Unmap(flush_test_context, (ID3D11Resource*)staging, 0);
+    }
+    staging->lpVtbl->Release(staging);
+    return value;
+}
+
+/* A pixel shader writes a storage image at register u4 next to its render
+   target; every texel holds its own coordinates afterwards, and the image can
+   be read once sg_fragment_storage_end unbinds the UAV. A register past the
+   UAV slots is refused when the shader is made. */
+UTEST(sokol_gfx_utils, fragment_storage_d3d11_writes_image) {
+    if (!flush_test_setup()) return;
+    EXPECT_TRUE(sg_fragment_storage_supported());
+    EXPECT_FALSE(sg_fragment_storage_raster_order_supported());
+    sg_view color_view;
+    sg_image color = flush_test_target(&color_view);
+    sg_image_desc storage_desc;
+    memset(&storage_desc, 0, sizeof(storage_desc));
+    storage_desc.usage.storage_image = true;
+    storage_desc.width = 64;
+    storage_desc.height = 64;
+    storage_desc.pixel_format = SG_PIXELFORMAT_R32UI;
+    sg_image storage = sg_make_image(&storage_desc);
+    sg_view_desc storage_view_desc;
+    memset(&storage_view_desc, 0, sizeof(storage_view_desc));
+    storage_view_desc.storage_image.image = storage;
+    sg_view storage_view = sg_make_view(&storage_view_desc);
+
+    sg_shader_desc shader_desc;
+    memset(&shader_desc, 0, sizeof(shader_desc));
+    shader_desc.vertex_func.source =
+        "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+        "    return float4(id == 1 ? 3.0 : -1.0, id == 2 ? 3.0 : -1.0, 0.0, 1.0);\n"
+        "}\n";
+    shader_desc.vertex_func.d3d11_target = "vs_5_0";
+    shader_desc.fragment_func.source =
+        "RWTexture2D<uint> marks : register(u4);\n"
+        "float4 main(float4 position : SV_Position) : SV_Target0 {\n"
+        "    uint2 pixel = uint2(position.xy);\n"
+        "    marks[pixel] = pixel.y * 1000u + pixel.x + 1u;\n"
+        "    return float4(1.0, 0.0, 0.0, 1.0);\n"
+        "}\n";
+    shader_desc.fragment_func.d3d11_target = "ps_5_0";
+    sg_fragment_storage_layout_desc layout;
+    memset(&layout, 0, sizeof(layout));
+    layout.num_slots = 1;
+    layout.slots[0].slot = 0;
+    layout.slots[0].msl_texture_n = -1;
+    layout.slots[0].vk_binding_n = -1;
+    layout.slots[0].hlsl_register_u_n = 4;
+    sg_shader shader = sg_make_shader_fragment_storage(&shader_desc, &layout);
+    EXPECT_NE(shader.id, (uint32_t)SG_INVALID_ID);
+    sg_pipeline_desc pipeline_desc;
+    memset(&pipeline_desc, 0, sizeof(pipeline_desc));
+    pipeline_desc.shader = shader;
+    pipeline_desc.colors[0].pixel_format = SG_PIXELFORMAT_RGBA8;
+    pipeline_desc.depth.pixel_format = SG_PIXELFORMAT_NONE;
+    sg_pipeline pipeline = sg_make_pipeline(&pipeline_desc);
+
+    /* A register past the output merger's UAV slots is refused. */
+    sg_fragment_storage_layout_desc low = layout;
+    low.slots[0].hlsl_register_u_n = SG_MAX_VIEW_BINDSLOTS;
+    sg_shader rejected = sg_make_shader_fragment_storage(&shader_desc, &low);
+    EXPECT_EQ(rejected.id, (uint32_t)SG_INVALID_ID);
+
+    EXPECT_TRUE(sg_fragment_storage_begin(storage_view));
+    sg_pass pass;
+    memset(&pass, 0, sizeof(pass));
+    pass.attachments.colors[0] = color_view;
+    pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
+    sg_begin_pass(&pass);
+    sg_apply_pipeline(pipeline);
+    /* The shader has no sokol_gfx resources, so there is no sg_apply_bindings. */
+    sg_fragment_storage_bindings fstore;
+    memset(&fstore, 0, sizeof(fstore));
+    fstore.images[0] = storage_view;
+    EXPECT_TRUE(sg_fragment_storage_bind(&fstore));
+    sg_draw(0, 3, 1);
+    sg_end_pass();
+    EXPECT_TRUE(sg_fragment_storage_end(storage_view));
+    sg_commit();
+
+    EXPECT_EQ(fstore_test_read_texel(storage, 0, 0), 1u);
+    EXPECT_EQ(fstore_test_read_texel(storage, 5, 3), 3006u);
+    EXPECT_EQ(fstore_test_read_texel(storage, 63, 63), 63064u);
+    EXPECT_TRUE(flush_test_device->lpVtbl->GetDeviceRemovedReason(flush_test_device) == S_OK);
+
+    sg_destroy_pipeline(pipeline);
+    sg_destroy_shader(shader);
+    sg_destroy_view(storage_view);
+    sg_destroy_image(storage);
+    sg_destroy_view(color_view);
+    sg_destroy_image(color);
+    flush_test_teardown();
+    sg_fragment_storage_shutdown();
 }
 #endif
 

@@ -415,8 +415,8 @@ SOKOL_GFX_UTILS_API_DECL void sg_accel_shutdown(void);
     Per-pixel order-independent transparency writes a sample list from the
     translucent pixel shader through raster-ordered images (Unreal:
     Engine/Shaders/Private/OITCommon.ush, AddOITSample_MLAB). This section adds
-    fragment-stage storage images to render passes. Metal and Vulkan support
-    it. D3D11, WebGPU and GL report no support. Read-write storage buffers need
+    fragment-stage storage images to render passes. Metal, Vulkan and D3D11
+    support it. WebGPU and GL report no support. Read-write storage buffers need
     none of this: sokol_gfx already binds them on the fragment stage.
 
     Raster order. The shader decides it, not the runtime: Slang lowers
@@ -429,6 +429,8 @@ SOKOL_GFX_UTILS_API_DECL void sg_accel_shutdown(void);
     - Vulkan: VK_EXT_fragment_shader_interlock with
       fragmentShaderPixelInterlock. The application must enable both when it
       creates the VkDevice.
+    - D3D11: never. Rasterizer-ordered views need shader model 5.1 and
+      ID3D11Device3; sokol-slang rejects raster-ordered programs for hlsl5.
     Without raster order, fragments of overlapping draws write in no fixed
     order; only atomics keep such writes well defined.
 
@@ -441,7 +443,8 @@ SOKOL_GFX_UTILS_API_DECL void sg_accel_shutdown(void);
     Binding. sokol-slang reflects fragment storage images as a separate slot
     namespace 0..SG_FRAGMENT_STORAGE_MAX_SLOTS-1 (layout
     "fragment_storage_images") with the native index of each slot:
-    msl_texture_n and spirv_set1_binding_n. They are not in the sg_shader_desc,
+    msl_texture_n, spirv_set1_binding_n and hlsl_register_u_n. They are not in
+    the sg_shader_desc,
     so sokol_gfx does not reject them. Pass the numbers unchanged in an
     sg_fragment_storage_layout_desc to sg_make_shader_fragment_storage, which
     records them per shader until the shader is destroyed.
@@ -455,7 +458,13 @@ SOKOL_GFX_UTILS_API_DECL void sg_accel_shutdown(void);
       and up, past every sokol_gfx view index;
     - Vulkan: a vk_binding_n breaks the rules of sg_make_shader_accel above
       (negative, repeated, below SG_MAX_VIEW_BINDSLOTS +
-      SG_MAX_SAMPLER_BINDSLOTS, or equal to a view or sampler binding).
+      SG_MAX_SAMPLER_BINDSLOTS, or equal to a view or sampler binding);
+    - D3D11: a hlsl_register_u_n is negative, repeated, not below
+      sg_limits.d3d11_max_unordered_access_views (8 on feature level 11_0, 64
+      on 11_1), or equal to the hlsl_register_u_n of a fragment storage buffer
+      or storage image of the shader. Pixel shader UAVs share the output merger
+      slots with the render targets; sokol-slang places these slots at u4..u7,
+      the top of the eight that every D3D11 device has.
 
     Image state. Storage image views come from sg_make_view with .storage_image
     and an image made with usage.storage_image. Formats follow the backend's
@@ -471,6 +480,9 @@ SOKOL_GFX_UTILS_API_DECL void sg_accel_shutdown(void);
     - Metal tracks hazards between encoders itself; begin and end only check
       the view. Inside one render pass, writes reach later draws in order only
       with raster order groups.
+    - D3D11 orders UAV writes between draws itself. begin only checks the view;
+      end unbinds the output merger's UAVs, so the image can be read as a
+      texture without the runtime forcing the UAV off.
 
     Draw. Call sg_fragment_storage_bind in a render pass after sg_apply_pipeline
     and sg_apply_bindings, with a view for every slot the shader's layout
@@ -482,6 +494,11 @@ SOKOL_GFX_UTILS_API_DECL void sg_accel_shutdown(void);
       chunk of the last sg_apply_bindings, found as in sg_accel_bind. A shader
       without sokol_gfx views and samplers gets a chunk of its own, bound at
       the graphics bind point.
+    - D3D11: OMSetRenderTargetsAndUnorderedAccessViews keeps the render
+      targets and sets the UAVs from the pipeline's color count up, as
+      sg_apply_bindings does for fragment storage buffers: its UAVs stay, and
+      each slot's view goes to its register. A register below the pipeline's
+      color count fails the bind, since the render targets hold those slots.
     Call sg_fragment_storage_shutdown after sg_shutdown.
 */
 #define SG_FRAGMENT_STORAGE_MAX_SLOTS (4)
@@ -493,6 +510,7 @@ typedef struct sg_fragment_storage_slot_layout {
     uint8_t slot;       /* fragment storage slot index, < SG_FRAGMENT_STORAGE_MAX_SLOTS */
     int msl_texture_n;  /* Metal: [[texture(n)]] index of the fragment function; -1 when unused */
     int vk_binding_n;   /* Vulkan: binding number in descriptor set 1; -1 when unused */
+    int hlsl_register_u_n; /* D3D11: pixel shader register(un); -1 when unused */
 } sg_fragment_storage_slot_layout;
 
 typedef struct sg_fragment_storage_layout_desc {
@@ -506,7 +524,7 @@ typedef struct sg_fragment_storage_bindings {
     sg_view images[SG_FRAGMENT_STORAGE_MAX_SLOTS];
 } sg_fragment_storage_bindings;
 
-/* Metal: always. Vulkan: the GPU offers fragmentStoresAndAtomics. */
+/* Metal and D3D11: always. Vulkan: the GPU offers fragmentStoresAndAtomics. */
 SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_supported(void);
 /* See Raster order above. False when sg_fragment_storage_supported is false. */
 SOKOL_GFX_UTILS_API_DECL bool sg_fragment_storage_raster_order_supported(void);
@@ -5163,6 +5181,73 @@ _SOKOL_PRIVATE bool _sgu_mtl_fstore_bind(const sg_fragment_storage_layout_desc* 
 
 #endif /* SOKOL_METAL */
 
+/*--- Fragment Storage Images: D3D11 -----------------------------------------*/
+#if defined(SOKOL_D3D11)
+
+_SOKOL_PRIVATE bool _sgu_d3d11_fstore_validate(const sg_shader_desc* desc, const sg_fragment_storage_layout_desc* layout) {
+    const int limit = _sg.limits.d3d11_max_unordered_access_views;
+    for (int i = 0; i < layout->num_slots; i++) {
+        const int n = layout->slots[i].hlsl_register_u_n;
+        if (n < 0 || n >= limit) {
+            _sgu_accel_log("sg_make_shader_fragment_storage: slot %d hlsl_register_u_n %d is not in 0..%d",
+                layout->slots[i].slot, n, limit - 1);
+            return false;
+        }
+        for (int j = 0; j < i; j++) {
+            if (layout->slots[j].hlsl_register_u_n == n) {
+                _sgu_accel_log("sg_make_shader_fragment_storage: slots %d and %d share hlsl_register_u_n %d",
+                    layout->slots[j].slot, layout->slots[i].slot, n);
+                return false;
+            }
+        }
+        for (int j = 0; j < SG_MAX_VIEW_BINDSLOTS; j++) {
+            const sg_shader_view* v = &desc->views[j];
+            const bool hit =
+                (v->storage_buffer.stage == SG_SHADERSTAGE_FRAGMENT && !v->storage_buffer.readonly &&
+                 v->storage_buffer.hlsl_register_u_n == n) ||
+                (v->storage_image.stage == SG_SHADERSTAGE_FRAGMENT && v->storage_image.hlsl_register_u_n == n);
+            if (hit) {
+                _sgu_accel_log("sg_make_shader_fragment_storage: slot %d hlsl_register_u_n %d collides with view %d",
+                    layout->slots[i].slot, n, j);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* Pixel shader UAVs live in the output merger after the render targets. Sets
+   them from the pipeline's color count up, as _sg_d3d11_apply_bindings does:
+   the fragment UAVs of the last sg_apply_bindings stay, and each slot's view
+   goes to its register. */
+_SOKOL_PRIVATE bool _sgu_d3d11_fstore_bind(const _sg_pipeline_t* pip, const sg_fragment_storage_layout_desc* layout,
+                                           _sg_view_t* const* views) {
+    const int start = pip->cmn.color_count;
+    const int limit = _sg.limits.d3d11_max_unordered_access_views;
+    ID3D11UnorderedAccessView* uavs[_SG_D3D11_MAX_STAGE_UAV_BINDINGS];
+    memcpy(uavs, _sg.d3d11.bnd.fs_uavs, sizeof(uavs));
+    for (int i = 0; i < layout->num_slots; i++) {
+        const int n = layout->slots[i].hlsl_register_u_n;
+        if (n < start || n >= limit || !views[i]->d3d11.uav) return false;
+        uavs[n] = views[i]->d3d11.uav;
+    }
+    _sg_d3d11_OMSetRenderTargetsAndUnorderedAccessViews(_sg.d3d11.ctx,
+        D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, 0, 0,
+        (UINT)start, (UINT)(limit - start), &uavs[start], 0);
+    return true;
+}
+
+/* Outside passes: unbinds the render targets and every UAV of the output
+   merger. sokol_gfx sets the render targets again at the next pass. */
+_SOKOL_PRIVATE void _sgu_d3d11_fstore_unbind(void) {
+    ID3D11UnorderedAccessView* uavs[_SG_D3D11_MAX_STAGE_UAV_BINDINGS];
+    memset(uavs, 0, sizeof(uavs));
+    _sg_d3d11_OMSetRenderTargetsAndUnorderedAccessViews(_sg.d3d11.ctx, 0, 0, 0,
+        0, (UINT)_sg.limits.d3d11_max_unordered_access_views, uavs, 0);
+}
+
+#endif /* SOKOL_D3D11 */
+
 /*--- Fragment Storage Images: Public API ------------------------------------*/
 
 SOKOL_API_IMPL bool sg_fragment_storage_supported(void) {
@@ -5170,7 +5255,7 @@ SOKOL_API_IMPL bool sg_fragment_storage_supported(void) {
     #if defined(SOKOL_VULKAN)
     _sgu_vk_fstore_query();
     return _sgu_vk_fstore_state.supported;
-    #elif defined(SOKOL_METAL)
+    #elif defined(SOKOL_METAL) || defined(SOKOL_D3D11)
     return true;
     #else
     return false;
@@ -5207,6 +5292,8 @@ SOKOL_API_IMPL sg_shader sg_make_shader_fragment_storage(const sg_shader_desc* d
     if (!_sgu_vk_fstore_validate(desc, layout)) return invalid;
     #elif defined(SOKOL_METAL)
     if (!_sgu_mtl_fstore_validate(desc, layout)) return invalid;
+    #elif defined(SOKOL_D3D11)
+    if (!_sgu_d3d11_fstore_validate(desc, layout)) return invalid;
     #endif
     _sgu_fstore_prune_shaders();
     if (!_sgu_fstore_reserve_shader()) {
@@ -5233,6 +5320,9 @@ _SOKOL_PRIVATE bool _sgu_fstore_transition(sg_view image, bool begin) {
     if (!_sgu_fstore_view(image, &img)) return false;
     #if defined(SOKOL_VULKAN)
     return _sgu_vk_fstore_barrier(img, begin);
+    #elif defined(SOKOL_D3D11)
+    if (!begin) _sgu_d3d11_fstore_unbind();
+    return true;
     #else
     (void)begin;
     return true;
@@ -5265,6 +5355,8 @@ SOKOL_API_IMPL bool sg_fragment_storage_bind(const sg_fragment_storage_bindings*
     return _sgu_vk_fstore_bind(shd, layout, views);
     #elif defined(SOKOL_METAL)
     return _sgu_mtl_fstore_bind(layout, views);
+    #elif defined(SOKOL_D3D11)
+    return _sgu_d3d11_fstore_bind(pip, layout, views);
     #else
     (void)views;
     return false;
@@ -6218,6 +6310,8 @@ SOKOL_API_IMPL sg_shader sg_make_shader_ext(const sg_shader_desc* desc, const sg
     if (accel && !_sgu_mtl_accel_validate(desc, accel)) return invalid;
     if (fstore && !_sgu_mtl_fstore_validate(desc, fstore)) return invalid;
     if (bindless && !_sgu_mtl_bindless_validate("sg_make_shader_ext", desc, accel, bindless)) return invalid;
+    #elif defined(SOKOL_D3D11)
+    if (fstore && !_sgu_d3d11_fstore_validate(desc, fstore)) return invalid;
     #endif
 
     if (accel) {

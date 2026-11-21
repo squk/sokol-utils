@@ -105,11 +105,18 @@ for backend in "${backends[@]}"; do
         out="$dir/$test.out.txt"
         err="$dir/$test.err.txt"
         rm -f "$out" "$err"
-        code=$(vm_ps "
-            Set-Location '$(vm_path "$dir")'
-            \$p = Start-Process -FilePath '.\\$test.exe' -NoNewWindow -Wait -PassThru \`
-                -RedirectStandardOutput '$(vm_path "$out")' -RedirectStandardError '$(vm_path "$err")'
-            \$p.ExitCode" | tr -d '\r' | tail -1)
+        # prlctl sometimes rejects a call ("Invalid argument") and runs nothing; retry it, and count a
+        # run that left no output file as failed rather than passed.
+        code=""
+        for attempt in 1 2 3; do
+            code=$(vm_ps "
+                Set-Location '$(vm_path "$dir")'
+                \$p = Start-Process -FilePath '.\\$test.exe' -NoNewWindow -Wait -PassThru \`
+                    -RedirectStandardOutput '$(vm_path "$out")' -RedirectStandardError '$(vm_path "$err")'
+                \$p.ExitCode" | tr -d '\r' | tail -1) && [ -f "$out" ] && break
+            code="no run"
+            sleep 2
+        done
         cat "$out" "$err" 2>/dev/null || true
         if [ "$code" != 0 ]; then
             echo "$backend $test failed with exit code $code" >&2
