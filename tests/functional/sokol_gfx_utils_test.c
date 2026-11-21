@@ -562,6 +562,50 @@ UTEST(sokol_gfx_utils, flush_commands_metal_takes_no_frame_slot) {
     sg_destroy_image(image);
     flush_test_teardown();
 }
+
+/* Two rounds of graphics signal, async wait and async commit before graphics
+   waits, as two FrameGraphs record them in one frame. Each signal submits the
+   graphics buffer that holds it: an async buffer waiting on a signal still in
+   an uncommitted buffer times out once the frame takes several seconds. */
+UTEST(sokol_gfx_utils, async_compute_metal_interleaved_signals_finish) {
+    if (!flush_test_setup()) return;
+    if (!sg_async_compute_supported()) {
+        fprintf(stderr, "async compute test skipped: no async queue\n");
+        flush_test_teardown();
+        return;
+    }
+    sg_view view;
+    sg_image image = flush_test_target(&view);
+    const double start = flush_test_seconds();
+    id<MTLCommandBuffer> last = nil;
+    for (int frame = 0; frame < 4; frame++) {
+        uint64_t async_token = 0;
+        for (int round = 0; round < 2; round++) {
+            flush_test_pass(view);
+            id<MTLCommandBuffer> holder = _sg.mtl.cmd_buffer;
+            const uint64_t graphics_token = sg_graphics_signal_async_compute();
+            EXPECT_NE(graphics_token, 0u);
+            EXPECT_GE((int)holder.status, (int)MTLCommandBufferStatusCommitted);
+            sg_async_compute_wait_graphics(graphics_token);
+            EXPECT_TRUE(sg_begin_async_compute_pass("interleaved"));
+            sg_end_async_compute_pass();
+            last = _sgu_async_mtl.cmd_buffer;
+            async_token = sg_async_compute_commit();
+            EXPECT_NE(async_token, 0u);
+        }
+        sg_graphics_wait_async_compute(async_token);
+        flush_test_pass(view);
+        sg_commit();
+    }
+    [last waitUntilCompleted];
+    EXPECT_EQ((int)last.status, (int)MTLCommandBufferStatusCompleted);
+    EXPECT_TRUE(flush_test_semaphore_balanced());
+    EXPECT_LT(flush_test_seconds() - start, 2.0);
+    sg_destroy_view(view);
+    sg_destroy_image(image);
+    sg_async_compute_shutdown();
+    flush_test_teardown();
+}
 #endif
 
 UTEST(sokol_gfx_utils, readback_request_null) {

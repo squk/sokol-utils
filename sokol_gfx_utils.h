@@ -621,7 +621,16 @@ SOKOL_GFX_UTILS_API_DECL bool sg_bindless_bind(sg_bindless_table table, int slot
 SOKOL_GFX_UTILS_API_DECL void sg_bindless_shutdown(void);
 
 /* Async compute queue and cross-queue timeline synchronization
-   (Metal MTLEvent, Vulkan timeline semaphore, D3D11 deferred context). */
+   (Metal MTLEvent, Vulkan timeline semaphore, D3D11 deferred context).
+   Each queue signals only its own timeline: sg_graphics_signal_async_compute
+   returns a graphics token for sg_async_compute_wait_graphics, and
+   sg_async_compute_commit returns an async token for
+   sg_graphics_wait_async_compute. On a timeline shared by both queues, one
+   queue's higher token satisfies a wait for the other queue's lower token
+   before that work finishes, and Vulkan forbids signaling a timeline
+   semaphore with a value at or below its current one.
+   sg_graphics_signal_async_compute submits the graphics work recorded so far
+   (sg_flush_commands on Metal), so an async wait never outlasts a slow frame. */
 SOKOL_GFX_UTILS_API_DECL bool sg_async_compute_setup(void);
 SOKOL_GFX_UTILS_API_DECL void sg_async_compute_shutdown(void);
 SOKOL_GFX_UTILS_API_DECL bool sg_async_compute_supported(void);
@@ -6409,13 +6418,15 @@ typedef struct _sgu_async_compute_mtl_state {
     bool supported;
     bool in_pass;
     id<MTLCommandQueue> queue;
-    id<MTLEvent> event;
+    id<MTLEvent> event;      /* signaled by the async queue only */
+    id<MTLEvent> gfx_event;  /* signaled by the graphics queue only */
     id<MTLCommandBuffer> cmd_buffer;
     id<MTLComputeCommandEncoder> saved_encoder;
     /* Sokol keeps cur_pass anonymous; preserve its bytes without a second layout. */
     unsigned char saved_pass[sizeof(_sg.cur_pass)];
     _sg_pipeline_ref_t saved_pip;
     uint64_t next_token;
+    uint64_t next_gfx_token;
     uint64_t pending_gfx_wait;
 } _sgu_async_compute_mtl_state;
 
@@ -6426,16 +6437,19 @@ bool sg_async_compute_setup(void) {
     _sgu_async_mtl.initialized = true;
     _sgu_async_mtl.supported = false;
     _sgu_async_mtl.next_token = 1;
+    _sgu_async_mtl.next_gfx_token = 1;
     if (!_sg.valid || !_sg.mtl.device) return false;
     if (@available(macOS 10.14, iOS 12.0, *)) {
         _sgu_async_mtl.queue = [_sg.mtl.device newCommandQueue];
         _sgu_async_mtl.event = [_sg.mtl.device newEvent];
-        if (_sgu_async_mtl.queue && _sgu_async_mtl.event) {
+        _sgu_async_mtl.gfx_event = [_sg.mtl.device newEvent];
+        if (_sgu_async_mtl.queue && _sgu_async_mtl.event && _sgu_async_mtl.gfx_event) {
             _sgu_async_mtl.queue.label = @"sg-async-compute-queue";
             _sgu_async_mtl.supported = true;
         } else {
             _SG_OBJC_RELEASE(_sgu_async_mtl.queue);
             _SG_OBJC_RELEASE(_sgu_async_mtl.event);
+            _SG_OBJC_RELEASE(_sgu_async_mtl.gfx_event);
         }
     }
     return _sgu_async_mtl.supported;
@@ -6448,6 +6462,7 @@ void sg_async_compute_shutdown(void) {
         _SG_OBJC_RELEASE(_sgu_async_mtl.cmd_buffer);
     }
     _SG_OBJC_RELEASE(_sgu_async_mtl.event);
+    _SG_OBJC_RELEASE(_sgu_async_mtl.gfx_event);
     _SG_OBJC_RELEASE(_sgu_async_mtl.queue);
     memset(&_sgu_async_mtl, 0, sizeof(_sgu_async_mtl));
 }
@@ -6476,7 +6491,7 @@ bool sg_begin_async_compute_pass(const char* label) {
         _sgu_async_mtl.cmd_buffer.label = @"async compute";
         _SG_OBJC_RETAIN(_sgu_async_mtl.cmd_buffer);
         if (_sgu_async_mtl.pending_gfx_wait > 0) {
-            [_sgu_async_mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.event value:_sgu_async_mtl.pending_gfx_wait];
+            [_sgu_async_mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.gfx_event value:_sgu_async_mtl.pending_gfx_wait];
             _sgu_async_mtl.pending_gfx_wait = 0;
         }
     }
@@ -6535,16 +6550,21 @@ uint64_t sg_graphics_signal_async_compute(void) {
     _sg_mtl_acquire_cmd_buffer();
     if (!_sg.mtl.cmd_buffer) return 0;
     _sg_mtl_finish_blit_cmd_encoder();
-    const uint64_t token = _sgu_async_mtl.next_token++;
-    if (_sgu_async_mtl.next_token == 0) _sgu_async_mtl.next_token = 1;
-    [_sg.mtl.cmd_buffer encodeSignalEvent:_sgu_async_mtl.event value:token];
+    const uint64_t token = _sgu_async_mtl.next_gfx_token++;
+    [_sg.mtl.cmd_buffer encodeSignalEvent:_sgu_async_mtl.gfx_event value:token];
+    /* Submit the signal now, as the Vulkan path does. An async buffer that
+       waits on it may commit long before sg_commit; Metal times out a buffer
+       whose event wait stays unsignaled for several seconds, so a slow frame
+       (scene loading, blocking compiles) would fail the async work and every
+       graphics buffer that waits on it. */
+    if (!sg_flush_commands()) return 0;
     return token;
 }
 
 void sg_async_compute_wait_graphics(uint64_t token) {
     if (!sg_async_compute_supported() || token == 0) return;
     if (_sgu_async_mtl.cmd_buffer && !_sgu_async_mtl.in_pass) {
-        [_sgu_async_mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.event value:token];
+        [_sgu_async_mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.gfx_event value:token];
     } else if (token > _sgu_async_mtl.pending_gfx_wait) {
         _sgu_async_mtl.pending_gfx_wait = token;
     }
@@ -6579,8 +6599,10 @@ typedef struct _sgu_async_compute_vk_state {
     VkCommandBuffer saved_cmd;
     uint8_t saved_pass[sizeof(_sg.cur_pass)];
     _sg_pipeline_ref_t saved_pip;
-    VkSemaphore timeline;
+    VkSemaphore timeline;      /* signaled by the async queue only */
+    VkSemaphore gfx_timeline;  /* signaled by the graphics queue only */
     uint64_t next_token;
+    uint64_t next_gfx_token;
     uint64_t pending_gfx_wait;
 } _sgu_async_compute_vk_state;
 
@@ -6591,6 +6613,7 @@ bool sg_async_compute_setup(void) {
     _sgu_async_vk.initialized = true;
     _sgu_async_vk.supported = false;
     _sgu_async_vk.next_token = 1;
+    _sgu_async_vk.next_gfx_token = 1;
     if (!_sg.valid || !_sg.vk.dev || !_sg.vk.phys_dev) return false;
 
     uint32_t count = 0;
@@ -6670,8 +6693,13 @@ bool sg_async_compute_setup(void) {
     _SG_STRUCT(VkSemaphoreCreateInfo, sem_info);
     sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     sem_info.pNext = &type_info;
-    if (vkCreateSemaphore(_sg.vk.dev, &sem_info, NULL, &_sgu_async_vk.timeline) != VK_SUCCESS) {
+    if (vkCreateSemaphore(_sg.vk.dev, &sem_info, NULL, &_sgu_async_vk.timeline) != VK_SUCCESS ||
+        vkCreateSemaphore(_sg.vk.dev, &sem_info, NULL, &_sgu_async_vk.gfx_timeline) != VK_SUCCESS) {
+        if (_sgu_async_vk.timeline) vkDestroySemaphore(_sg.vk.dev, _sgu_async_vk.timeline, NULL);
+        vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.gfx_cmd_pool, NULL);
         vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.cmd_pool, NULL);
+        _sgu_async_vk.timeline = VK_NULL_HANDLE;
+        _sgu_async_vk.gfx_cmd_pool = VK_NULL_HANDLE;
         _sgu_async_vk.cmd_pool = VK_NULL_HANDLE;
         return false;
     }
@@ -6684,6 +6712,7 @@ void sg_async_compute_shutdown(void) {
     if (_sgu_async_vk.in_pass) sg_end_async_compute_pass();
     if (_sg.vk.dev) {
         if (_sgu_async_vk.timeline) vkDestroySemaphore(_sg.vk.dev, _sgu_async_vk.timeline, NULL);
+        if (_sgu_async_vk.gfx_timeline) vkDestroySemaphore(_sg.vk.dev, _sgu_async_vk.gfx_timeline, NULL);
         if (_sgu_async_vk.gfx_cmd_pool) vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.gfx_cmd_pool, NULL);
         if (_sgu_async_vk.cmd_pool) vkDestroyCommandPool(_sg.vk.dev, _sgu_async_vk.cmd_pool, NULL);
     }
@@ -6753,7 +6782,7 @@ uint64_t sg_async_compute_commit(void) {
 
     _SG_STRUCT(VkSemaphoreSubmitInfo, wait_info);
     wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    wait_info.semaphore = _sgu_async_vk.timeline;
+    wait_info.semaphore = _sgu_async_vk.gfx_timeline;
     wait_info.value = _sgu_async_vk.pending_gfx_wait;
     wait_info.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
 
@@ -6816,11 +6845,10 @@ static bool _sgu_vk_flush_graphics_cmd(VkSemaphoreSubmitInfo* wait_info, VkSemap
 
 uint64_t sg_graphics_signal_async_compute(void) {
     if (!sg_async_compute_supported()) return 0;
-    const uint64_t token = _sgu_async_vk.next_token++;
-    if (_sgu_async_vk.next_token == 0) _sgu_async_vk.next_token = 1;
+    const uint64_t token = _sgu_async_vk.next_gfx_token++;
     _SG_STRUCT(VkSemaphoreSubmitInfo, sig_info);
     sig_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    sig_info.semaphore = _sgu_async_vk.timeline;
+    sig_info.semaphore = _sgu_async_vk.gfx_timeline;
     sig_info.value = token;
     sig_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     if (!_sgu_vk_flush_graphics_cmd(NULL, &sig_info)) return 0;
