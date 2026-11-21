@@ -166,12 +166,14 @@ SOKOL_GFX_UTILS_API_DECL bool sg_shutdown_submission_receipts(void);
    a new command buffer, as Unreal flushes the command list between path tracing
    dispatches (r.PathTracing.FlushDispatch, PathTracing.cpp:291-299). On Metal
    the GPU watchdog limits each command buffer, so heavy work split across
-   buffers no longer times out the whole frame. Call outside passes. Frame
-   resources (uniform ring slot, frame index) do not change; sg_commit still
-   ends the frame and its receipt completes after every buffer before it, since
-   one queue runs them in order. A failed split buffer is logged when a later
-   flush or tracked commit polls it. GPU pass timings then cover only the last
-   buffer of the frame. Returns false outside Metal, where it does nothing. */
+   buffers no longer times out the whole frame. Call outside passes. A split
+   takes no frame slot and never waits for the GPU: the frame keeps its uniform
+   ring slot and frame index, and sg_commit still ends it. Its receipt completes
+   after every buffer before it, since one queue runs them in order. Metal and
+   Vulkan submit the command buffer, WebGPU the command encoder; D3D11 and GL
+   flush the driver queue. A failed split buffer on Metal is logged when a later
+   flush or tracked commit polls it, and GPU pass timings then cover only the
+   frame's last buffer. Returns false on a backend that cannot split. */
 SOKOL_GFX_UTILS_API_DECL bool sg_flush_commands(void);
 
 /*
@@ -2680,12 +2682,132 @@ SOKOL_API_IMPL bool sg_shutdown_submission_receipts(void) {
     return true;
 }
 
+/* Split submissions must not cost a frame slot: sokol_gfx waits for the oldest
+   frame in flight whenever it starts a command buffer, so a split that started
+   its next buffer the same way would make the CPU wait for the GPU mid-frame.
+
+   Metal: a split buffer is made here without waiting on _sg.mtl.sem and adds no
+   signal, so the frame still makes one wait and one signal. That signal comes
+   from the frame's first buffer, which can finish before the rest of the frame.
+   The frame's last split buffer is kept per uniform ring slot, and the commit
+   listener waits for it before the next frame that reuses the slot records, the
+   point at which sokol_gfx's own wait would have covered an unsplit frame.
+
+   Vulkan: a split submits the frame slot's command buffers without a fence and
+   continues in spare buffers of the same slot. The uniform, descriptor and
+   staging rings keep their offsets. The slot's fence, signalled by the frame's
+   last submission, covers every earlier one in queue order, so the spare
+   buffers are reused only after sokol_gfx waits on it. */
+#if defined(SOKOL_METAL)
+static struct {
+    void* tail;                                 /* retained: last split buffer of the frame being recorded */
+    void* slot_tail[SG_NUM_INFLIGHT_FRAMES];    /* retained: last split buffer of the frame that used the slot */
+} _sgu_mtl_split;
+
+_SOKOL_PRIVATE void* _sgu_mtl_split_retain(id<MTLCommandBuffer> buffer) {
+#if __has_feature(objc_arc)
+    return (__bridge_retained void*)buffer;
+#else
+    return (void*)[buffer retain];
+#endif
+}
+
+_SOKOL_PRIVATE void _sgu_mtl_split_release(void** slot) {
+    if (!*slot) return;
+#if __has_feature(objc_arc)
+    CFRelease((CFTypeRef)*slot);
+#else
+    [(id<MTLCommandBuffer>)*slot release];
+#endif
+    *slot = NULL;
+}
+
+/* Runs in sg_commit after the frame's last buffer was committed and the uniform
+   ring slot rotated. */
+_SOKOL_PRIVATE void _sgu_mtl_split_on_commit(void* user_data) {
+    _SOKOL_UNUSED(user_data);
+    const uint32_t next = (uint32_t)_sg.mtl.cur_frame_rotate_index;
+    const uint32_t done = (next + SG_NUM_INFLIGHT_FRAMES - 1) % SG_NUM_INFLIGHT_FRAMES;
+    _sgu_mtl_split_release(&_sgu_mtl_split.slot_tail[done]);
+    _sgu_mtl_split.slot_tail[done] = _sgu_mtl_split.tail;
+    _sgu_mtl_split.tail = NULL;
+    if (_sgu_mtl_split.slot_tail[next]) {
+#if __has_feature(objc_arc)
+        id<MTLCommandBuffer> last = (__bridge id<MTLCommandBuffer>)_sgu_mtl_split.slot_tail[next];
+#else
+        id<MTLCommandBuffer> last = (id<MTLCommandBuffer>)_sgu_mtl_split.slot_tail[next];
+#endif
+        [last waitUntilCompleted];
+        _sgu_mtl_split_release(&_sgu_mtl_split.slot_tail[next]);
+    }
+}
+#endif
+
+#if defined(SOKOL_VULKAN)
+typedef struct {
+    VkCommandBuffer cmd;
+    VkCommandBuffer stream;
+} _sgu_vk_split_pair_t;
+
+static struct {
+    _sgu_vk_split_pair_t* pairs[SG_NUM_INFLIGHT_FRAMES];
+    int capacity[SG_NUM_INFLIGHT_FRAMES];
+    int used[SG_NUM_INFLIGHT_FRAMES];
+    uint32_t frame[SG_NUM_INFLIGHT_FRAMES];     /* _sg.frame_index + 1 of the last split in the slot */
+} _sgu_vk_split;
+
+/* A spare pair of the current frame slot, allocated from sokol_gfx's frame
+   command pool, which frees it at shutdown. */
+_SOKOL_PRIVATE bool _sgu_vk_split_next_pair(_sgu_vk_split_pair_t* out) {
+    const uint32_t slot = _sg.vk.frame_slot;
+    if (_sgu_vk_split.frame[slot] != (uint32_t)_sg.frame_index + 1u) {
+        _sgu_vk_split.frame[slot] = (uint32_t)_sg.frame_index + 1u;
+        _sgu_vk_split.used[slot] = 0;
+    }
+    if (_sgu_vk_split.used[slot] == _sgu_vk_split.capacity[slot]) {
+        const int capacity = _sgu_vk_split.capacity[slot] ? _sgu_vk_split.capacity[slot] * 2 : 4;
+        _sgu_vk_split_pair_t* pairs = (_sgu_vk_split_pair_t*)realloc(_sgu_vk_split.pairs[slot],
+            sizeof(_sgu_vk_split_pair_t) * (size_t)capacity);
+        if (!pairs) return false;
+        _sgu_vk_split.pairs[slot] = pairs;
+        for (int i = _sgu_vk_split.capacity[slot]; i < capacity; i++) {
+            VkCommandBufferAllocateInfo info;
+            memset(&info, 0, sizeof(info));
+            info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            info.commandPool = _sg.vk.frame.cmd_pool;
+            info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            info.commandBufferCount = 2;
+            VkCommandBuffer buffers[2] = { 0, 0 };
+            if (vkAllocateCommandBuffers(_sg.vk.dev, &info, buffers) != VK_SUCCESS) return false;
+            pairs[i].cmd = buffers[0];
+            pairs[i].stream = buffers[1];
+            _sgu_vk_split.capacity[slot] = i + 1;
+        }
+    }
+    *out = _sgu_vk_split.pairs[slot][_sgu_vk_split.used[slot]++];
+    return true;
+}
+#endif
+
 SOKOL_API_IMPL bool sg_flush_commands(void) {
     if (!sg_isvalid() || _sg.cur_pass.in_pass) return false;
 #if defined(SOKOL_METAL)
-    @autoreleasepool {
+    /* No autorelease pool here: like sokol_gfx's own, the next command buffer
+       is autoreleased into the caller's frame pool. */
+    {
         /* Nothing recorded since the last flush or commit. */
         if (nil == _sg.mtl.cmd_buffer) return true;
+        /* Registered with the current context; sg_shutdown drops it. Without the
+           listener a split frame's ring slot could be reused too early. */
+        bool listening = false;
+        for (int i = 0; i < _sg.commit_listeners.upper && !listening; i++)
+            listening = _sg.commit_listeners.items[i].func == _sgu_mtl_split_on_commit;
+        if (!listening) {
+            sg_commit_listener listener;
+            memset(&listener, 0, sizeof(listener));
+            listener.func = _sgu_mtl_split_on_commit;
+            if (!sg_add_commit_listener(listener)) return false;
+        }
         /* A copy leaves sokol_gfx's blit encoder open; the buffer cannot commit with it. */
         _sg_mtl_finish_blit_cmd_encoder();
         _sgu_mtl_flushed_collect(false);
@@ -2705,27 +2827,69 @@ SOKOL_API_IMPL bool sg_flush_commands(void) {
 #endif
             timing->command_buffer = nil;
         }
-        /* The completed handler added when the buffer was acquired signals the
-           frame semaphore, so the next acquire waits as for a new frame. */
         [_sg.mtl.cmd_buffer commit];
-        _sg.mtl.cmd_buffer = nil;
+        /* The next buffer of the frame, made as sokol_gfx makes one but without
+           the frame semaphore (see _sgu_mtl_split). Setting it now keeps the
+           next pass from acquiring a buffer of its own. */
+        MTLCommandBufferDescriptor* cmd_desc = [MTLCommandBufferDescriptor new];
+        cmd_desc.retainedReferences = _sg.desc.metal.use_command_buffer_with_retained_references;
+        cmd_desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+        _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBufferWithDescriptor:cmd_desc];
+#if !__has_feature(objc_arc)
+        [cmd_desc release];
+#endif
+        [_sg.mtl.cmd_buffer enqueue];
+        _sgu_mtl_split_release(&_sgu_mtl_split.tail);
+        _sgu_mtl_split.tail = _sgu_mtl_split_retain(_sg.mtl.cmd_buffer);
     }
     return true;
 #elif defined(SOKOL_VULKAN)
     /* Nothing recorded since the last flush or commit. */
     if (0 == _sg.vk.frame.cmd_buf) return true;
-    /* The swapchain semaphores belong to the frame's last submission; this one
-       neither waits for the image nor signals presentation. */
-    VkSemaphore present_complete = _sg.vk.present_complete_sem;
-    VkSemaphore render_finished = _sg.vk.render_finished_sem;
-    _sg.vk.present_complete_sem = 0;
-    _sg.vk.render_finished_sem = 0;
-    /* Submits under the current frame slot's fence. The next pass acquires the
-       following slot, waiting on its fence and rewinding its uniform, bind and
-       staging rings, as a new frame would. */
-    _sg_vk_submit_frame_command_buffers();
-    _sg.vk.present_complete_sem = present_complete;
-    _sg.vk.render_finished_sem = render_finished;
+    _sgu_vk_split_pair_t next;
+    if (!_sgu_vk_split_next_pair(&next)) return false;
+    VkResult res = vkEndCommandBuffer(_sg.vk.frame.stream_cmd_buf);
+    if (res == VK_SUCCESS) res = vkEndCommandBuffer(_sg.vk.frame.cmd_buf);
+    if (res != VK_SUCCESS) return false;
+    /* Stream copies first, as _sg_vk_submit_frame_command_buffers orders them.
+       No fence and no swapchain semaphores: those belong to the frame's last
+       submission. */
+    VkSubmitInfo submits[2];
+    memset(submits, 0, sizeof(submits));
+    submits[0].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submits[0].commandBufferCount = 1;
+    submits[0].pCommandBuffers = &_sg.vk.frame.stream_cmd_buf;
+    submits[1].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submits[1].commandBufferCount = 1;
+    submits[1].pCommandBuffers = &_sg.vk.frame.cmd_buf;
+    res = vkQueueSubmit(_sg.vk.queue, 2, submits, VK_NULL_HANDLE);
+    if (res != VK_SUCCESS) return false;
+    VkCommandBufferBeginInfo begin;
+    memset(&begin, 0, sizeof(begin));
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandBuffer(next.cmd, 0);
+    vkResetCommandBuffer(next.stream, 0);
+    vkBeginCommandBuffer(next.cmd, &begin);
+    vkBeginCommandBuffer(next.stream, &begin);
+    _sg.vk.frame.cmd_buf = next.cmd;
+    _sg.vk.frame.stream_cmd_buf = next.stream;
+    /* A new command buffer has no bound state: bind the frame's descriptor
+       buffer again (_sg_vk_bind_after_acquire) and drop the cached uniform
+       addresses (_sg_vk_uniform_after_acquire), without rewinding either ring. */
+    if (_sg.vk.bind.cur_dev_addr) {
+        VkDescriptorBufferBindingInfoEXT bind_info;
+        memset(&bind_info, 0, sizeof(bind_info));
+        bind_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT;
+        bind_info.address = _sg.vk.bind.cur_dev_addr;
+        bind_info.usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+                          VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT;
+        _sg.vk.ext.cmd_bind_descriptor_buffers(_sg.vk.frame.cmd_buf, 1, &bind_info);
+    }
+    for (size_t i = 0; i < SG_MAX_UNIFORMBLOCK_BINDSLOTS; i++) {
+        _sg.vk.uniforms.addr_info[i].address = 0;
+        _sg.vk.uniforms.addr_info[i].range = 0;
+    }
     return true;
 #elif defined(SOKOL_WGPU)
     /* Writes the uniforms recorded so far and submits the encoder. Queue order
