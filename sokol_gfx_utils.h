@@ -162,6 +162,18 @@ SOKOL_GFX_UTILS_API_DECL void sg_destroy_submission_receipt(sg_submission_receip
 /* False leaves Vulkan receipts intact: retry before graphics teardown. */
 SOKOL_GFX_UTILS_API_DECL bool sg_shutdown_submission_receipts(void);
 
+/* Submits the commands recorded so far this frame and lets the next pass start
+   a new command buffer, as Unreal flushes the command list between path tracing
+   dispatches (r.PathTracing.FlushDispatch, PathTracing.cpp:291-299). On Metal
+   the GPU watchdog limits each command buffer, so heavy work split across
+   buffers no longer times out the whole frame. Call outside passes. Frame
+   resources (uniform ring slot, frame index) do not change; sg_commit still
+   ends the frame and its receipt completes after every buffer before it, since
+   one queue runs them in order. A failed split buffer is logged when a later
+   flush or tracked commit polls it. GPU pass timings then cover only the last
+   buffer of the frame. Returns false outside Metal, where it does nothing. */
+SOKOL_GFX_UTILS_API_DECL bool sg_flush_commands(void);
+
 /*
     Acceleration structures and ray queries for compute shaders.
 
@@ -2530,7 +2542,33 @@ _SOKOL_PRIVATE void _sgu_submission_release_native(sg_submission_receipt receipt
     free(receipt->native);
     receipt->native = NULL;
 }
+#if defined(SOKOL_METAL)
+/* Command buffers sg_flush_commands submitted, kept until they finish so a
+   failure is logged (_sgu_mtl_completion_poll logs it). */
+#define _SGU_MTL_FLUSHED_CAPACITY 64
+static struct {
+    _sgu_mtl_completion_t items[_SGU_MTL_FLUSHED_CAPACITY];
+    int count;
+} _sgu_mtl_flushed;
+
+_SOKOL_PRIVATE void _sgu_mtl_flushed_collect(bool all) {
+    int keep = 0;
+    for (int i = 0; i < _sgu_mtl_flushed.count; i++) {
+        _sgu_mtl_completion_t item = _sgu_mtl_flushed.items[i];
+        if (all || _sgu_mtl_completion_poll(&item) != SG_SUBMISSION_PENDING) {
+            _sgu_mtl_completion_destroy(&item);
+        } else {
+            _sgu_mtl_flushed.items[keep++] = item;
+        }
+    }
+    _sgu_mtl_flushed.count = keep;
+}
+#endif
+
 _SOKOL_PRIVATE void _sgu_submission_collect(void) {
+#if defined(SOKOL_METAL)
+    _sgu_mtl_flushed_collect(false);
+#endif
     sg_submission_receipt* link = &_sgu_submission_owner.head;
     while (*link) {
         sg_submission_receipt receipt = *link;
@@ -2636,7 +2674,80 @@ SOKOL_API_IMPL bool sg_shutdown_submission_receipts(void) {
     _sgu_submission_owner.head = NULL;
     _sgu_submission_owner.count = 0;
     ++_sgu_submission_owner.generation;
+#if defined(SOKOL_METAL)
+    if (sg_isvalid()) _sgu_mtl_flushed_collect(true);
+#endif
     return true;
+}
+
+SOKOL_API_IMPL bool sg_flush_commands(void) {
+    if (!sg_isvalid() || _sg.cur_pass.in_pass) return false;
+#if defined(SOKOL_METAL)
+    @autoreleasepool {
+        /* Nothing recorded since the last flush or commit. */
+        if (nil == _sg.mtl.cmd_buffer) return true;
+        /* A copy leaves sokol_gfx's blit encoder open; the buffer cannot commit with it. */
+        _sg_mtl_finish_blit_cmd_encoder();
+        _sgu_mtl_flushed_collect(false);
+        if (_sgu_mtl_flushed.count == _SGU_MTL_FLUSHED_CAPACITY) {
+            /* Full of unfinished buffers: stop watching the oldest. */
+            _sgu_mtl_completion_destroy(&_sgu_mtl_flushed.items[0]);
+            memmove(&_sgu_mtl_flushed.items[0], &_sgu_mtl_flushed.items[1],
+                    sizeof(_sgu_mtl_flushed.items[0]) * (size_t)(_SGU_MTL_FLUSHED_CAPACITY - 1));
+            --_sgu_mtl_flushed.count;
+        }
+        if (_sgu_mtl_completion_make(&_sgu_mtl_flushed.items[_sgu_mtl_flushed.count])) ++_sgu_mtl_flushed.count;
+        /* GPU pass timings follow the frame's last buffer, which finishes last. */
+        _sgu_mtl_gpu_timing_frame_t* timing = &_sgu_mtl_gpu_timing_state.current;
+        if (timing->command_buffer == _sg.mtl.cmd_buffer) {
+#if !__has_feature(objc_arc)
+            [timing->command_buffer release];
+#endif
+            timing->command_buffer = nil;
+        }
+        /* The completed handler added when the buffer was acquired signals the
+           frame semaphore, so the next acquire waits as for a new frame. */
+        [_sg.mtl.cmd_buffer commit];
+        _sg.mtl.cmd_buffer = nil;
+    }
+    return true;
+#elif defined(SOKOL_VULKAN)
+    /* Nothing recorded since the last flush or commit. */
+    if (0 == _sg.vk.frame.cmd_buf) return true;
+    /* The swapchain semaphores belong to the frame's last submission; this one
+       neither waits for the image nor signals presentation. */
+    VkSemaphore present_complete = _sg.vk.present_complete_sem;
+    VkSemaphore render_finished = _sg.vk.render_finished_sem;
+    _sg.vk.present_complete_sem = 0;
+    _sg.vk.render_finished_sem = 0;
+    /* Submits under the current frame slot's fence. The next pass acquires the
+       following slot, waiting on its fence and rewinding its uniform, bind and
+       staging rings, as a new frame would. */
+    _sg_vk_submit_frame_command_buffers();
+    _sg.vk.present_complete_sem = present_complete;
+    _sg.vk.render_finished_sem = render_finished;
+    return true;
+#elif defined(SOKOL_WGPU)
+    /* Writes the uniforms recorded so far and submits the encoder. Queue order
+       keeps this submission's uniforms apart from later writes to the same
+       buffer. The next pass makes a new encoder. */
+    _sg_wgpu_commit();
+    return true;
+#elif defined(SOKOL_D3D11)
+    /* The driver splits its command buffer at a flush. */
+#if defined(__cplusplus)
+    _sg.d3d11.ctx->Flush();
+#else
+    _sg.d3d11.ctx->lpVtbl->Flush(_sg.d3d11.ctx);
+#endif
+    return true;
+#elif defined(_SOKOL_ANY_GL)
+    if (!_sgu_gl_completion_supported()) return false;
+    _sgu_gl_flush();
+    return true;
+#else
+    return false;
+#endif
 }
 
 /*--- Acceleration Structures ------------------------------------------------*/
