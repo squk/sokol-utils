@@ -2072,9 +2072,35 @@ _SOKOL_PRIVATE sg_submission_status _sgu_mtl_completion_poll(const _sgu_mtl_comp
         /* Poll on the caller's thread. Collection releases this marker after
            failure, so the native error is logged once for each failed buffer. */
         if (_sg.desc.logger.func) {
-            NSString* message = [NSString stringWithFormat:@"Metal command buffer '%@' failed: %@",
+            /* Encoder info is present only when the buffer was made with
+               MTLCommandBufferErrorOptionEncoderExecutionStatus. List the encoders
+               that faulted or were affected, so a GPU timeout names its pass. */
+            NSMutableString* encoders = [NSMutableString string];
+            NSArray<id<MTLCommandBufferEncoderInfo>>* infos =
+                command_buffer.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+            for (id<MTLCommandBufferEncoderInfo> info in infos) {
+                const char* state = NULL;
+                switch (info.errorState) {
+                    case MTLCommandEncoderErrorStateFaulted: state = "FAULTED"; break;
+                    case MTLCommandEncoderErrorStateAffected: state = "affected"; break;
+                    case MTLCommandEncoderErrorStatePending: state = "pending"; break;
+                    default: break;
+                }
+                if (!state) continue;
+                [encoders appendFormat:@"\n    encoder %s: '%@'", state,
+                    info.label.length ? info.label : @"<unlabeled>"];
+                if (info.debugSignposts.count) {
+                    [encoders appendFormat:@" signposts=%@",
+                        [info.debugSignposts componentsJoinedByString:@" > "]];
+                }
+            }
+            if (infos.count && encoders.length == 0) {
+                [encoders appendFormat:@"\n    %lu encoders, none faulted or affected", (unsigned long)infos.count];
+            }
+            NSString* message = [NSString stringWithFormat:@"Metal command buffer '%@' failed: %@%@",
                 command_buffer.label ? command_buffer.label : @"<unlabeled>",
-                command_buffer.error ? command_buffer.error.description : @"no native error supplied"];
+                command_buffer.error ? command_buffer.error.description : @"no native error supplied",
+                encoders];
             _sg.desc.logger.func("sg_gfx_utils", 1, 0, message.UTF8String,
                 __LINE__, __FILE__, _sg.desc.logger.user_data);
         }
@@ -3800,11 +3826,12 @@ _SOKOL_PRIVATE bool _sgu_mtl_accel_acquire_cmd_buffer(void) {
     if (!_sg.mtl.cmd_queue) return false;
     if (nil == _sg.mtl.cmd_buffer) {
         dispatch_semaphore_wait(_sg.mtl.sem, DISPATCH_TIME_FOREVER);
-        if (_sg.desc.metal.use_command_buffer_with_retained_references) {
-            _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBuffer];
-        } else {
-            _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBufferWithUnretainedReferences];
-        }
+        /* Encoder execution status makes a failed buffer's error list each
+           encoder's label and whether it faulted, so a GPU timeout names its pass. */
+        MTLCommandBufferDescriptor* cmd_desc = [MTLCommandBufferDescriptor new];
+        cmd_desc.retainedReferences = _sg.desc.metal.use_command_buffer_with_retained_references;
+        cmd_desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+        _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBufferWithDescriptor:cmd_desc];
         [_sg.mtl.cmd_buffer enqueue];
         [_sg.mtl.cmd_buffer addCompletedHandler:^(id<MTLCommandBuffer> cmd_buf) {
             /* This block runs on another thread. */
