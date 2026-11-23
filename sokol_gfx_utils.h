@@ -34,21 +34,11 @@
 extern "C" {
 #endif
 
-/* Indirect commands live in storage buffers created by this factory. The
-   caller owns the returned sg_buffer and destroys it with sg_destroy_buffer.
-   Transient, unsealed, injected and staging buffers are not accepted. */
-SOKOL_GFX_UTILS_API_DECL sg_buffer sg_make_indirect_buffer(const sg_buffer_desc* desc);
-SOKOL_GFX_UTILS_API_DECL bool sg_indirect_supported(void);
-/* Call outside a render pass after GPU writes or copies that produce command
-   arguments. Dispatch also inserts this barrier within a compute pass. */
+/* Indirect draw and dispatch come from upstream sokol_gfx (usage.indirect_buffer,
+   sg_draw_indirect, sg_dispatch_indirect), which tracks its own barriers.
+   This is a full memory barrier for work upstream does not track. Call it
+   outside a render pass; inside a compute pass it orders dispatches. */
 SOKOL_GFX_UTILS_API_DECL void sg_indirect_barrier(void);
-/* Offsets are four-byte aligned. Draw arguments are four uint32_t values:
-   count, instance count, first vertex, first instance. Indexed draws insert
-   int32_t base_vertex before first instance. Dispatch uses three uint32_t
-   group counts. Apply the pipeline, bindings and uniforms before these calls.
-   Argument buffers must come from sg_make_indirect_buffer. */
-SOKOL_GFX_UTILS_API_DECL void sg_draw_indirect(sg_buffer args, int offset);
-SOKOL_GFX_UTILS_API_DECL void sg_dispatch_indirect(sg_buffer args, int offset);
 
 /*
     sg_readback_request
@@ -349,7 +339,7 @@ typedef struct sg_gpu_accel_instance {
 /* Vulkan: true when the GPU lists and offers what the contract above names.
    The application must have enabled it. */
 SOKOL_GFX_UTILS_API_DECL bool sg_ray_query_supported(void);
-/* Like sg_make_indirect_buffer: needs usage.storage_buffer, returns an invalid
+/* Needs usage.storage_buffer, returns an invalid
    buffer when ray queries are unsupported. On Vulkan the buffer also gets
    build-input usage. usage.write_unsealed is accepted without initial data:
    the buffer then starts UNSEALED, as from sg_make_buffer, and is ready for a
@@ -673,30 +663,14 @@ SOKOL_GFX_UTILS_API_DECL void sg_graphics_wait_async_compute(uint64_t token);
     #endif
 #endif
 
-#if defined(_SOKOL_GL_HAS_COMPUTE)
-#ifndef GL_COMMAND_BARRIER_BIT
+#if defined(_SOKOL_GL_HAS_COMPUTE) && !defined(GL_COMMAND_BARRIER_BIT)
 #define GL_COMMAND_BARRIER_BIT 0x00000040
-#define GL_DRAW_INDIRECT_BUFFER 0x8F3F
-#define GL_DISPATCH_INDIRECT_BUFFER 0x90EE
-#endif
-#if defined(_SOKOL_USE_WIN32_GL_LOADER)
-typedef void (GL_APIENTRY* _sgu_draw_arrays_indirect_fn)(GLenum, const void*);
-typedef void (GL_APIENTRY* _sgu_draw_elements_indirect_fn)(GLenum, GLenum, const void*);
-typedef void (GL_APIENTRY* _sgu_dispatch_indirect_fn)(GLintptr);
-static _sgu_draw_arrays_indirect_fn _sgu_draw_arrays_indirect;
-static _sgu_draw_elements_indirect_fn _sgu_draw_elements_indirect;
-static _sgu_dispatch_indirect_fn _sgu_dispatch_indirect;
-#else
-#define _sgu_draw_arrays_indirect glDrawArraysIndirect
-#define _sgu_draw_elements_indirect glDrawElementsIndirect
-#define _sgu_dispatch_indirect glDispatchComputeIndirect
-#endif
 #endif
 
 #if defined(SOKOL_VULKAN)
-/* Creates a storage buffer with extra Vulkan usage bits. Used for indirect
-   argument buffers and for acceleration structure build inputs. */
-_SOKOL_PRIVATE sg_resource_state _sgu_vk_create_indirect_buffer(_sg_buffer_t* buf, const sg_buffer_desc* desc, VkBufferUsageFlags extra_usage) {
+/* Creates a storage buffer with extra Vulkan usage bits. Used for
+   acceleration structure build inputs. */
+_SOKOL_PRIVATE sg_resource_state _sgu_vk_create_buffer_with_usage(_sg_buffer_t* buf, const sg_buffer_desc* desc, VkBufferUsageFlags extra_usage) {
     SOKOL_ASSERT(_sg.vk.dev);
     SOKOL_ASSERT(buf && desc);
     SOKOL_ASSERT(buf->cmn.size > 0);
@@ -748,82 +722,8 @@ _SOKOL_PRIVATE sg_resource_state _sgu_vk_create_indirect_buffer(_sg_buffer_t* bu
 
 #endif
 
-SOKOL_API_IMPL bool sg_indirect_supported(void) {
-    if (!sg_isvalid() || !sg_query_features().compute) return false;
-    #if defined(_SOKOL_ANY_GL) && !defined(_SOKOL_GL_HAS_COMPUTE)
-    return false;
-    #else
-    #if defined(_SOKOL_USE_WIN32_GL_LOADER)
-    _sg_wglGetProcAddress get_proc = (_sg_wglGetProcAddress)GetProcAddress(_sg.gl.opengl32_dll, "wglGetProcAddress");
-    if (!get_proc) return false;
-    _sgu_draw_arrays_indirect = (_sgu_draw_arrays_indirect_fn)_sg_gl_getprocaddr("glDrawArraysIndirect", get_proc);
-    _sgu_draw_elements_indirect = (_sgu_draw_elements_indirect_fn)_sg_gl_getprocaddr("glDrawElementsIndirect", get_proc);
-    _sgu_dispatch_indirect = (_sgu_dispatch_indirect_fn)_sg_gl_getprocaddr("glDispatchComputeIndirect", get_proc);
-    return _sgu_draw_arrays_indirect && _sgu_draw_elements_indirect && _sgu_dispatch_indirect;
-    #else
-    return true;
-    #endif
-    #endif
-}
-
-SOKOL_API_IMPL sg_buffer sg_make_indirect_buffer(const sg_buffer_desc* desc) {
-    sg_buffer invalid = { SG_INVALID_ID };
-    if (!desc || !sg_indirect_supported() || _sg.cur_pass.in_pass) return invalid;
-    sg_buffer_desc d = sg_query_buffer_defaults(desc);
-    if (!d.usage.storage_buffer || d.usage.write_transient || d.usage.write_unsealed ||
-        d.usage.staging_buffer || d.usage.staging_index_buffer || d.gl_buffer ||
-        d.mtl_buffer || d.d3d11_buffer || d.wgpu_buffer || !d.size || d.size > INT32_MAX ||
-        (d.size & 3) || (d.data.ptr && d.data.size != d.size)) return invalid;
-    #if defined(SOKOL_VULKAN)
-    sg_buffer result = sg_alloc_buffer();
-    _sg_buffer_t* buf = _sg_lookup_buffer(result.id);
-    if (!buf) return result;
-    _sg_buffer_common_init(&buf->cmn, &d);
-    buf->slot.state = _sgu_vk_create_indirect_buffer(buf, &d, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
-    _sg_resource_stats_inc(buffers.inited);
-    _SG_TRACE_ARGS(init_buffer, result, &d);
-    return result;
-    #elif defined(SOKOL_D3D11)
-    _SG_STRUCT(D3D11_BUFFER_DESC, native_desc);
-    native_desc.ByteWidth = (UINT)d.size;
-    native_desc.Usage = D3D11_USAGE_DEFAULT;
-    native_desc.BindFlags = _sg_d3d11_buffer_bind_flags(&d.usage);
-    native_desc.MiscFlags = _sg_d3d11_buffer_misc_flags(&d.usage) | D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
-    _SG_STRUCT(D3D11_SUBRESOURCE_DATA, initial);
-    initial.pSysMem = d.data.ptr;
-    ID3D11Buffer* native = 0;
-    HRESULT hr = _sg_d3d11_CreateBuffer(_sg.d3d11.dev, &native_desc, d.data.ptr ? &initial : 0, &native);
-    if (FAILED(hr) || !native) return invalid;
-    d.d3d11_buffer = native;
-    d.data.ptr = 0; d.data.size = 0;
-    sg_buffer result = sg_make_buffer(&d);
-    _sg_d3d11_Release(native);
-    return result;
-    #elif defined(SOKOL_WGPU)
-    _SG_STRUCT(WGPUBufferDescriptor, native_desc);
-    native_desc.size = d.size;
-    native_desc.usage = _sg_wgpu_buffer_usage(&d.usage) | WGPUBufferUsage_Indirect;
-    native_desc.mappedAtCreation = d.data.ptr != 0;
-    WGPUBuffer native = wgpuDeviceCreateBuffer(_sg.wgpu.dev, &native_desc);
-    if (!native) return invalid;
-    if (d.data.ptr) {
-        void* mapped = wgpuBufferGetMappedRange(native, 0, d.size);
-        if (!mapped) { wgpuBufferRelease(native); return invalid; }
-        memcpy(mapped, d.data.ptr, d.size);
-        wgpuBufferUnmap(native);
-    }
-    d.wgpu_buffer = native;
-    d.data.ptr = 0; d.data.size = 0;
-    sg_buffer result = sg_make_buffer(&d);
-    wgpuBufferRelease(native);
-    return result;
-    #else
-    return sg_make_buffer(&d);
-    #endif
-}
-
 SOKOL_API_IMPL void sg_indirect_barrier(void) {
-    if (!sg_indirect_supported()) return;
+    if (!sg_isvalid() || !sg_query_features().compute) return;
     if (_sg.cur_pass.in_pass && !_sg.cur_pass.is_compute) return;
     #if defined(SOKOL_METAL)
     if (_sg.cur_pass.in_pass && _sg.cur_pass.is_compute && _sg.mtl.compute_cmd_encoder) {
@@ -850,88 +750,6 @@ SOKOL_API_IMPL void sg_indirect_barrier(void) {
 
 _SOKOL_PRIVATE bool _sgu_skip_draw(void) {
     return !_sg.cur_pass.valid || (_sg.skipdraw_flags != 0);
-}
-
-_SOKOL_PRIVATE _sg_buffer_t* _sgu_indirect_args(sg_buffer args, int offset, int size, bool compute) {
-    if (!sg_indirect_supported() || !_sg.cur_pass.valid || !_sg.cur_pass.in_pass ||
-        _sg.cur_pass.is_compute != compute || _sgu_skip_draw() || offset < 0 || (offset & 3)) return 0;
-    _sg_buffer_t* buf = _sg_lookup_buffer(args.id);
-    if (!buf || buf->slot.state != SG_RESOURCESTATE_VALID || !buf->cmn.usage.storage_buffer ||
-        size > buf->cmn.size || offset > buf->cmn.size - size) return 0;
-    #if defined(SOKOL_DEBUG)
-    if (!(compute ? _sg_validate_dispatch(1, 1, 1) : _sg_validate_draw(0, 1, 1))) return 0;
-    #endif
-    return buf;
-}
-
-SOKOL_API_IMPL void sg_draw_indirect(sg_buffer args, int offset) {
-    _sg_buffer_t* buf = _sgu_indirect_args(args, offset, _sg.use_indexed_draw ? 20 : 16, false);
-    if (!buf) return;
-    #if defined(SOKOL_METAL)
-    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
-    id<MTLBuffer> native = _sg_mtl_id(buf->mtl.buf[buf->cmn.active_slot]);
-    if (_sg.use_indexed_draw) {
-        const _sg_buffer_t* ib = _sg_buffer_ref_ptr(&_sg.mtl.cache.cur_ibuf);
-        [_sg.mtl.render_cmd_encoder drawIndexedPrimitives:pip->mtl.prim_type
-            indexType:pip->mtl.index_type indexBuffer:_sg_mtl_id(ib->mtl.buf[ib->cmn.active_slot])
-            indexBufferOffset:(NSUInteger)_sg.mtl.cache.cur_ibuf_offset
-            indirectBuffer:native indirectBufferOffset:(NSUInteger)offset];
-    } else {
-        [_sg.mtl.render_cmd_encoder drawPrimitives:pip->mtl.prim_type
-            indirectBuffer:native indirectBufferOffset:(NSUInteger)offset];
-    }
-    #elif defined(SOKOL_VULKAN)
-    VkCommandBuffer cmd = _sg.vk.frame.cmd_buf;
-    if (_sg.vk.uniforms.dirty && !_sg_vk_bind_uniform_descriptor_set(cmd)) return;
-    if (_sg.use_indexed_draw) vkCmdDrawIndexedIndirect(cmd, buf->vk.buf, (VkDeviceSize)offset, 1, 0);
-    else vkCmdDrawIndirect(cmd, buf->vk.buf, (VkDeviceSize)offset, 1, 0);
-    #elif defined(SOKOL_D3D11)
-    #if defined(__cplusplus)
-    if (_sg.use_indexed_draw) _sg.d3d11.ctx->DrawIndexedInstancedIndirect(buf->d3d11.buf, (UINT)offset);
-    else _sg.d3d11.ctx->DrawInstancedIndirect(buf->d3d11.buf, (UINT)offset);
-    #else
-    if (_sg.use_indexed_draw) _sg.d3d11.ctx->lpVtbl->DrawIndexedInstancedIndirect(_sg.d3d11.ctx, buf->d3d11.buf, (UINT)offset);
-    else _sg.d3d11.ctx->lpVtbl->DrawInstancedIndirect(_sg.d3d11.ctx, buf->d3d11.buf, (UINT)offset);
-    #endif
-    #elif defined(SOKOL_WGPU)
-    if (_sg.wgpu.uniform.dirty) _sg_wgpu_uniform_system_set_bindgroup();
-    if (_sg.use_indexed_draw) wgpuRenderPassEncoderDrawIndexedIndirect(_sg.wgpu.rpass_enc, buf->wgpu.buf, (uint64_t)offset);
-    else wgpuRenderPassEncoderDrawIndirect(_sg.wgpu.rpass_enc, buf->wgpu.buf, (uint64_t)offset);
-    #elif defined(_SOKOL_GL_HAS_COMPUTE)
-    glMemoryBarrier(GL_COMMAND_BARRIER_BIT);
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, buf->gl.buf[buf->cmn.active_slot]);
-    if (_sg.use_indexed_draw) _sgu_draw_elements_indirect(_sg.gl.cache.cur_primitive_type, _sg.gl.cache.cur_index_type, (const void*)(intptr_t)offset);
-    else _sgu_draw_arrays_indirect(_sg.gl.cache.cur_primitive_type, (const void*)(intptr_t)offset);
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
-    #endif
-}
-
-SOKOL_API_IMPL void sg_dispatch_indirect(sg_buffer args, int offset) {
-    _sg_buffer_t* buf = _sgu_indirect_args(args, offset, 12, true);
-    if (!buf) return;
-    sg_indirect_barrier();
-    #if defined(SOKOL_METAL)
-    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
-    [_sg.mtl.compute_cmd_encoder dispatchThreadgroupsWithIndirectBuffer:_sg_mtl_id(buf->mtl.buf[buf->cmn.active_slot])
-        indirectBufferOffset:(NSUInteger)offset threadsPerThreadgroup:pip->mtl.threads_per_threadgroup];
-    #elif defined(SOKOL_VULKAN)
-    VkCommandBuffer cmd = _sg.vk.frame.cmd_buf;
-    if (_sg.vk.uniforms.dirty && !_sg_vk_bind_uniform_descriptor_set(cmd)) return;
-    vkCmdDispatchIndirect(cmd, buf->vk.buf, (VkDeviceSize)offset);
-    #elif defined(SOKOL_D3D11)
-    #if defined(__cplusplus)
-    _sg.d3d11.ctx->DispatchIndirect(buf->d3d11.buf, (UINT)offset);
-    #else
-    _sg.d3d11.ctx->lpVtbl->DispatchIndirect(_sg.d3d11.ctx, buf->d3d11.buf, (UINT)offset);
-    #endif
-    #elif defined(SOKOL_WGPU)
-    if (_sg.wgpu.uniform.dirty) _sg_wgpu_uniform_system_set_bindgroup();
-    wgpuComputePassEncoderDispatchWorkgroupsIndirect(_sg.wgpu.cpass_enc, buf->wgpu.buf, (uint64_t)offset);
-    #elif defined(_SOKOL_GL_HAS_COMPUTE)
-    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, buf->gl.buf[buf->cmn.active_slot]);
-    _sgu_dispatch_indirect((GLintptr)offset);
-    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
-    #endif
 }
 
 typedef struct {
@@ -4671,7 +4489,7 @@ SOKOL_API_IMPL sg_buffer sg_make_accel_input_buffer(const sg_buffer_desc* desc) 
        SHADER_DEVICE_ADDRESS (_sg_vk_buffer_usage). Unreal gives every buffer
        both bits when the device has ray tracing
        (Engine/Source/Runtime/VulkanRHI/Private/VulkanBuffer.cpp:110-120). */
-    buf->slot.state = _sgu_vk_create_indirect_buffer(buf, &d, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
+    buf->slot.state = _sgu_vk_create_buffer_with_usage(buf, &d, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
     /* Same state change as sokol_gfx's _sg_init_buffer: sg_write_buffer_unsealed
        and sg_seal_buffer accept only UNSEALED buffers. Vulkan sealing records
        nothing (_sg_vk_seal_buffer), so this buffer needs no extra step there. */
