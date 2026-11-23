@@ -6239,6 +6239,13 @@ typedef struct _sgu_async_compute_mtl_state {
     id<MTLEvent> event;      /* signaled by the async queue only */
     id<MTLEvent> gfx_event;  /* signaled by the graphics queue only */
     id<MTLCommandBuffer> cmd_buffer;
+    /* Consecutive async passes share one encoder: opening one costs several
+       microseconds, and Viagara opens hundreds a frame. It stays open between
+       passes until the buffer commits, waits on an event, or the uniform
+       buffer rotates. Each reuse begins with a full memory barrier, so a pass
+       sees the writes of the one before as it would across encoders. */
+    id<MTLComputeCommandEncoder> encoder;
+    uint32_t encoder_rotate_index;
     id<MTLComputeCommandEncoder> saved_encoder;
     /* Sokol keeps cur_pass anonymous; preserve its bytes without a second layout. */
     unsigned char saved_pass[sizeof(_sg.cur_pass)];
@@ -6249,6 +6256,12 @@ typedef struct _sgu_async_compute_mtl_state {
 } _sgu_async_compute_mtl_state;
 
 static _sgu_async_compute_mtl_state _sgu_async_mtl;
+
+static void _sgu_async_mtl_close_encoder(void) {
+    if (!_sgu_async_mtl.encoder) return;
+    [_sgu_async_mtl.encoder endEncoding];
+    _SG_OBJC_RELEASE(_sgu_async_mtl.encoder);
+}
 
 bool sg_async_compute_setup(void) {
     if (_sgu_async_mtl.initialized) return _sgu_async_mtl.supported;
@@ -6275,6 +6288,7 @@ bool sg_async_compute_setup(void) {
 
 void sg_async_compute_shutdown(void) {
     if (_sgu_async_mtl.in_pass) sg_end_async_compute_pass();
+    _sgu_async_mtl_close_encoder();
     if (_sgu_async_mtl.cmd_buffer) {
         [_sgu_async_mtl.cmd_buffer commit];
         _SG_OBJC_RELEASE(_sgu_async_mtl.cmd_buffer);
@@ -6313,9 +6327,21 @@ bool sg_begin_async_compute_pass(const char* label) {
             _sgu_async_mtl.pending_gfx_wait = 0;
         }
     }
-    id<MTLComputeCommandEncoder> encoder = [_sgu_async_mtl.cmd_buffer computeCommandEncoder];
-    if (!encoder) return false;
-    if (label && label[0]) encoder.label = [NSString stringWithUTF8String:label];
+    if (_sgu_async_mtl.encoder && _sgu_async_mtl.encoder_rotate_index != _sg.mtl.cur_frame_rotate_index) {
+        _sgu_async_mtl_close_encoder();
+    }
+    id<MTLComputeCommandEncoder> encoder = _sgu_async_mtl.encoder;
+    if (encoder) {
+        [encoder memoryBarrierWithScope:(MTLBarrierScopeBuffers | MTLBarrierScopeTextures)];
+    } else {
+        encoder = [_sgu_async_mtl.cmd_buffer computeCommandEncoder];
+        if (!encoder) return false;
+        /* The label names the first pass of a shared encoder. */
+        if (label && label[0]) encoder.label = [NSString stringWithUTF8String:label];
+        _sgu_async_mtl.encoder = encoder;
+        _SG_OBJC_RETAIN(_sgu_async_mtl.encoder);
+        _sgu_async_mtl.encoder_rotate_index = _sg.mtl.cur_frame_rotate_index;
+    }
     if (!_sg.mtl.cur_ub_base_ptr && _sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index]) {
         _sg.mtl.cur_ub_base_ptr = (uint8_t*)[_sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index] contents];
     }
@@ -6336,9 +6362,7 @@ bool sg_begin_async_compute_pass(const char* label) {
 
 void sg_end_async_compute_pass(void) {
     if (!_sgu_async_mtl.in_pass) return;
-    if (_sg.mtl.compute_cmd_encoder) {
-        [_sg.mtl.compute_cmd_encoder endEncoding];
-    }
+    /* The encoder stays open for the next async pass (_sgu_async_mtl.encoder). */
     _sg.mtl.compute_cmd_encoder = _sgu_async_mtl.saved_encoder;
     memcpy(&_sg.cur_pass, _sgu_async_mtl.saved_pass, sizeof(_sg.cur_pass));
     _sg.cur_pip = _sgu_async_mtl.saved_pip;
@@ -6349,6 +6373,7 @@ void sg_end_async_compute_pass(void) {
 
 uint64_t sg_async_compute_commit(void) {
     if (_sgu_async_mtl.in_pass) sg_end_async_compute_pass();
+    _sgu_async_mtl_close_encoder();
     if (!_sgu_async_mtl.cmd_buffer) return 0;
     const uint64_t token = _sgu_async_mtl.next_token++;
     if (_sgu_async_mtl.next_token == 0) _sgu_async_mtl.next_token = 1;
@@ -6382,6 +6407,7 @@ uint64_t sg_graphics_signal_async_compute(void) {
 void sg_async_compute_wait_graphics(uint64_t token) {
     if (!sg_async_compute_supported() || token == 0) return;
     if (_sgu_async_mtl.cmd_buffer && !_sgu_async_mtl.in_pass) {
+        _sgu_async_mtl_close_encoder();
         [_sgu_async_mtl.cmd_buffer encodeWaitForEvent:_sgu_async_mtl.gfx_event value:token];
     } else if (token > _sgu_async_mtl.pending_gfx_wait) {
         _sgu_async_mtl.pending_gfx_wait = token;
