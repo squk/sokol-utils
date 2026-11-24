@@ -6246,6 +6246,12 @@ typedef struct _sgu_async_compute_mtl_state {
        sees the writes of the one before as it would across encoders. */
     id<MTLComputeCommandEncoder> encoder;
     uint32_t encoder_rotate_index;
+    /* Sokol's Metal binding cache for encoder, carried from one async pass to
+       the next, so a pass that uses the previous pass's pipeline or buffers
+       does not bind them again. encoder_cache_valid also means the uniform
+       buffers are bound on encoder. A new encoder starts invalid. */
+    unsigned char encoder_cache[sizeof(_sg.mtl.cache)];
+    bool encoder_cache_valid;
     id<MTLComputeCommandEncoder> saved_encoder;
     /* Sokol keeps cur_pass anonymous; preserve its bytes without a second layout. */
     unsigned char saved_pass[sizeof(_sg.cur_pass)];
@@ -6258,6 +6264,7 @@ typedef struct _sgu_async_compute_mtl_state {
 static _sgu_async_compute_mtl_state _sgu_async_mtl;
 
 static void _sgu_async_mtl_close_encoder(void) {
+    _sgu_async_mtl.encoder_cache_valid = false;
     if (!_sgu_async_mtl.encoder) return;
     [_sgu_async_mtl.encoder endEncoding];
     _SG_OBJC_RELEASE(_sgu_async_mtl.encoder);
@@ -6341,6 +6348,7 @@ bool sg_begin_async_compute_pass(const char* label) {
         _sgu_async_mtl.encoder = encoder;
         _SG_OBJC_RETAIN(_sgu_async_mtl.encoder);
         _sgu_async_mtl.encoder_rotate_index = _sg.mtl.cur_frame_rotate_index;
+        _sgu_async_mtl.encoder_cache_valid = false;
     }
     if (!_sg.mtl.cur_ub_base_ptr && _sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index]) {
         _sg.mtl.cur_ub_base_ptr = (uint8_t*)[_sg.mtl.uniform_buffers[_sg.mtl.cur_frame_rotate_index] contents];
@@ -6354,15 +6362,23 @@ bool sg_begin_async_compute_pass(const char* label) {
     _sg.cur_pass.valid = true;
     _sg.cur_pass.is_compute = true;
     memset(&_sg.cur_pip, 0, sizeof(_sg.cur_pip));
-    _sg_mtl_clear_state_cache();
-    _sg_mtl_bind_uniform_buffers();
+    if (_sgu_async_mtl.encoder_cache_valid) {
+        /* The encoder still holds what the last async pass bound. */
+        memcpy(&_sg.mtl.cache, _sgu_async_mtl.encoder_cache, sizeof(_sg.mtl.cache));
+    } else {
+        _sg_mtl_clear_state_cache();
+        _sg_mtl_bind_uniform_buffers();
+        _sgu_async_mtl.encoder_cache_valid = true;
+    }
     _sgu_async_mtl.in_pass = true;
     return true;
 }
 
 void sg_end_async_compute_pass(void) {
     if (!_sgu_async_mtl.in_pass) return;
-    /* The encoder stays open for the next async pass (_sgu_async_mtl.encoder). */
+    /* The encoder stays open for the next async pass (_sgu_async_mtl.encoder),
+       and so does its binding cache. */
+    memcpy(_sgu_async_mtl.encoder_cache, &_sg.mtl.cache, sizeof(_sg.mtl.cache));
     _sg.mtl.compute_cmd_encoder = _sgu_async_mtl.saved_encoder;
     memcpy(&_sg.cur_pass, _sgu_async_mtl.saved_pass, sizeof(_sg.cur_pass));
     _sg.cur_pip = _sgu_async_mtl.saved_pip;
